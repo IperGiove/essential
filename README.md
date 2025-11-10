@@ -1,40 +1,27 @@
 # Essential
 
-A modular Python utility library for async database operations, HTTP requests, and parallel execution utilities.
+A Python utility library for async database operations, HTTP requests, and parallel execution utilities.
 
 ## Features
 
-- **Modular installation** - Install only what you need
 - **AsyncDB** - Type-safe async SQLite with dataclass schemas
 - **Async HTTP client** - High-performance HTTP client with retry logic and connection pooling
 - **Parallel utilities** - Async parallel execution with concurrency control
-- **No mandatory dependencies** - Core utils work without any external packages
+- **CloudFlare bypass** - curl-cffi integration for bypassing protections
 
 ## Installation
 
-### Base installation (utils only)
 ```bash
+# With pip
 pip install essential
-```
 
-### With database support
-```bash
-pip install essential[database]
-```
-
-### With HTTP request support
-```bash
-pip install essential[requests]
-```
-
-### Install everything
-```bash
-pip install essential[all]
+# With uv
+uv pip install essential
 ```
 
 ## Usage
 
-### Parallel Execution (No dependencies required)
+### Parallel Execution
 
 ```python
 import asyncio
@@ -145,8 +132,9 @@ async def example2():
         max_attempt=5,
         force_response=True  # Return response even on error
     )
-    print(response.status_code)
-    print(response.text)
+    if response:
+        print(response.status_code)
+        print(response.text)
 
 asyncio.run(example1())
 ```
@@ -172,6 +160,7 @@ asyncio.run(example1())
 ### CloudFlare Bypass
 
 ```python
+import asyncio
 from essential import make_request_cffi
 
 async def fetch_protected_page():
@@ -190,6 +179,7 @@ asyncio.run(fetch_protected_page())
 utils/
 ├── pyproject.toml
 ├── README.md
+├── LICENSE
 └── src/
     └── essential/
         ├── __init__.py
@@ -204,24 +194,23 @@ utils/
 # Navigate to the project
 cd utils
 
-# Install in editable mode with all extras
-pip install -e .[all]
+# Install in editable mode with uv
+uv pip install -e .
 
-# Or just specific extras
-pip install -e .[database]
-pip install -e .[requests]
+# Or with pip
+pip install -e .
 ```
 
 ### Building and Publishing
 
 ```bash
-# Install build tools
+# With uv
+uv build
+twine upload dist/*
+
+# Or with traditional tools
 pip install build twine
-
-# Build the package
 python -m build
-
-# Upload to PyPI
 twine upload dist/*
 ```
 
