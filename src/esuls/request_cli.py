@@ -365,7 +365,7 @@ async def make_request_cffi(url: str) -> Optional[str]:
 
 
 async def test_proxy():
-    async with httpx.AsyncClient(proxy="http://0ce896d23159e7829ffc__cr.us:e4ada3ce93ad55ca@gw.dataimpulse.com:823", timeout=10, verify=False) as client:
+    async with httpx.AsyncClient(proxy="http://0ce896d23159e7829ffc__cr.us:e4ada3ce93ad55ca@gw.dataimpesulse.com:823", timeout=10, verify=False) as client:
         try:
             r = await client.get("https://api.geckoterminal.com/api/v2/networks/zora-network/trending_pools?include=base_token%2C%20quote_token%2C%20dex&page=1")
             print(f"Proxy test: {r.status_code} {r.text}")

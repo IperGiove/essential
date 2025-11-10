@@ -1,5 +1,5 @@
 """
-Essential - Utility library for async database operations, HTTP requests, and parallel execution
+esuls - Utility library for async database operations, HTTP requests, and parallel execution
 """
 
 __version__ = "0.1.0"

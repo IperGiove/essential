@@ -1,4 +1,4 @@
-# Essential
+# esuls
 
 A Python utility library for async database operations, HTTP requests, and parallel execution utilities.
 
@@ -13,10 +13,10 @@ A Python utility library for async database operations, HTTP requests, and paral
 
 ```bash
 # With pip
-pip install essential
+pip install esuls
 
 # With uv
-uv pip install essential
+uv pip install esuls
 ```
 
 ## Usage
@@ -25,7 +25,7 @@ uv pip install essential
 
 ```python
 import asyncio
-from essential import run_parallel
+from esuls import run_parallel
 
 async def fetch_data(id):
     await asyncio.sleep(1)
@@ -49,7 +49,7 @@ asyncio.run(main())
 ```python
 import asyncio
 from dataclasses import dataclass, field
-from essential import AsyncDB, BaseModel
+from esuls import AsyncDB, BaseModel
 
 # Define your schema
 @dataclass
@@ -106,7 +106,7 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from essential import AsyncRequest, make_request
+from esuls import AsyncRequest, make_request
 
 # Using context manager (recommended for multiple requests)
 async def example1():
@@ -161,7 +161,7 @@ asyncio.run(example1())
 
 ```python
 import asyncio
-from essential import make_request_cffi
+from esuls import make_request_cffi
 
 async def fetch_protected_page():
     html = await make_request_cffi("https://protected-site.com")
@@ -181,7 +181,7 @@ utils/
 ├── README.md
 ├── LICENSE
 └── src/
-    └── essential/
+    └── esuls/
         ├── __init__.py
         ├── utils.py          # Parallel execution utilities
         ├── db_cli.py         # AsyncDB with dataclass schemas
@@ -220,7 +220,7 @@ twine upload dist/*
 
 ```python
 from dataclasses import dataclass, field
-from essential import BaseModel
+from esuls import BaseModel
 from datetime import datetime
 from typing import Optional, List
 import enum

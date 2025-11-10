@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "essential"
-version = "0.1.0"
-description = "Essential library for database, requests, and general utilities"
+name = "esuls"
+version = "0.1.1"
+description = "Utility library for async database operations, HTTP requests, and parallel execution"
 readme = "README.md"
 requires-python = ">=3.14"
 authors = [
@@ -28,5 +28,5 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ipergiove/essential"
-Repository = "https://github.com/ipergiove/essential"
+Homepage = "https://github.com/ipergiove/esuls"
+Repository = "https://github.com/ipergiove/esuls"
