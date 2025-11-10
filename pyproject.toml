@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "essential"
+version = "0.1.0"
+description = "Essential library for database, requests, and general utilities"
+readme = "README.md"
+requires-python = ">=3.14"
+authors = [
+    {name = "IperGiove", email = "ipergiove@gmail.com"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+# All dependencies (always installed)
+dependencies = [
+    "aiosqlite>=0.21.0",
+    "curl-cffi>=0.13.0",
+    "fake-useragent>=2.2.0",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/ipergiove/essential"
+Repository = "https://github.com/ipergiove/essential"
