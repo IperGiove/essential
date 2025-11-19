@@ -8,6 +8,8 @@ __version__ = "0.1.0"
 from .utils import run_parallel
 from .db_cli import AsyncDB, BaseModel
 from .request_cli import AsyncRequest, make_request, make_request_cffi, Response
+from .download_icon import download_icon
+
 
 __all__ = [
     '__version__',
@@ -18,4 +20,5 @@ __all__ = [
     'make_request',
     'make_request_cffi',
     'Response',
+    'download_icon'
 ]
