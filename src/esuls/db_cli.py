@@ -9,6 +9,7 @@ from functools import lru_cache
 import uuid
 import contextlib
 import enum
+from loguru import logger
 
 T = TypeVar('T')
 SchemaType = TypeVar('SchemaType', bound='BaseModel')
@@ -64,7 +65,7 @@ class AsyncDB(Generic[SchemaType]):
     
     async def _init_schema(self, db: aiosqlite.Connection) -> None:
         """Generate schema from dataclass structure with support for field additions."""
-        print(f"Initializing schema for {self.schema_class.__name__} in table {self.table_name}")
+        logger.debug(f"Initializing schema for {self.schema_class.__name__} in table {self.table_name}")
         
         field_defs = []
         indexes = []
@@ -85,12 +86,12 @@ class AsyncDB(Generic[SchemaType]):
         
         # Process all fields in the dataclass - ONLY THIS SCHEMA CLASS
         schema_fields = fields(self.schema_class)
-        print(f"Processing {len(schema_fields)} fields for {self.schema_class.__name__}")
+        logger.debug(f"Processing {len(schema_fields)} fields for {self.schema_class.__name__}")
         
         for f in schema_fields:
             field_name = f.name
             field_type = self._type_hints.get(field_name)
-            print(f"  Field: {field_name} -> {field_type}")
+            logger.debug(f"  Field: {field_name} -> {field_type}")
             
             # Map Python types to SQLite types
             if field_type in (int, bool):
@@ -123,7 +124,7 @@ class AsyncDB(Generic[SchemaType]):
             elif field_name not in existing_columns:
                 # Alter table to add the new column without NOT NULL constraint
                 alter_sql = f"ALTER TABLE {self.table_name} ADD COLUMN {field_name} {sql_type}"
-                print(f"  Adding new column: {alter_sql}")
+                logger.debug(f"  Adding new column: {alter_sql}")
                 await db.execute(alter_sql)
                 await db.commit()
                 
@@ -147,7 +148,7 @@ class AsyncDB(Generic[SchemaType]):
                     {', '.join(field_defs)}{constraints_sql}
                 )
             """
-            print(f"Creating table: {create_sql}")
+            logger.debug(f"Creating table: {create_sql}")
             await db.execute(create_sql)
         
         # Create indexes
@@ -155,7 +156,7 @@ class AsyncDB(Generic[SchemaType]):
             await db.execute(idx_stmt)
             
         await db.commit()
-        print(f"Schema initialization complete for {self.schema_class.__name__}")
+        logger.debug(f"Schema initialization complete for {self.schema_class.__name__}")
     
     @contextlib.asynccontextmanager
     async def transaction(self):
@@ -279,8 +280,7 @@ class AsyncDB(Generic[SchemaType]):
 
                     except Exception as e:
                         if skip_errors:
-                            # Optionally log the error for debugging
-                            # print(f"Save error (skipped): {e}")
+                            logger.warning(f"Save error (skipped): {e}")
                             continue
                         raise
 
@@ -327,8 +327,7 @@ class AsyncDB(Generic[SchemaType]):
 
         except Exception as e:
             if skip_errors:
-                # Optionally log the error for debugging
-                # print(f"Save error (skipped): {e}")
+                logger.warning(f"Save error (skipped): {e}")
                 return False
             raise
     
