@@ -98,6 +98,8 @@ class AsyncDB(Generic[SchemaType]):
                 sql_type = "INTEGER"
             elif field_type in (float,):
                 sql_type = "REAL"
+            elif field_type == bytes:
+                sql_type = "BLOB"
             elif field_type in (str, enum.EnumType):
                 sql_type = "TEXT"
             elif field_type in (datetime,):
@@ -176,6 +178,8 @@ class AsyncDB(Generic[SchemaType]):
         """Fast value serialization with type-based optimization."""
         if value is None or isinstance(value, (int, float, bool, str)):
             return value
+        if isinstance(value, bytes):
+            return value 
         if isinstance(value, datetime):
             return value.isoformat()
         if isinstance(value, enum.Enum):
@@ -190,6 +194,18 @@ class AsyncDB(Generic[SchemaType]):
             return value
 
         field_type = self._type_hints.get(field_name)
+
+        # Handle bytes fields - keep as bytes
+        if field_type == bytes:
+            if isinstance(value, bytes):
+                return value
+            # If somehow stored as string, convert back
+            if isinstance(value, str):
+                import ast
+                try:
+                    return ast.literal_eval(value)
+                except:
+                    return value.encode('utf-8')
 
         # Handle string fields - ensure phone numbers are strings
         if field_type is str or (hasattr(field_type, '__origin__') and field_type.__origin__ is Union and str in getattr(field_type, '__args__', ())):
