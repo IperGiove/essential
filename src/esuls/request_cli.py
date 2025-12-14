@@ -249,6 +249,7 @@ async def make_request(
     params: Optional[Dict[str, Any]] = None,
     json_data: Optional[JsonType] = None,
     files: Optional[Dict[str, FileData]] = None,
+    data: Optional[Union[str, bytes]] = None,
     proxy: Optional[str] = None,
     timeout_request: int = 60,
     max_attempt: int = 10,
@@ -289,6 +290,7 @@ async def make_request(
                 files=files_dict,
                 headers=request_headers,
                 timeout=timeout_request,
+                data=data,
             )
 
             # Create custom Response object
@@ -330,8 +332,8 @@ async def make_request(
             # Validate JSON response
             if json_response:
                 try:
-                    data = response.json()
-                    if json_response_check and json_response_check not in data:
+                    response_data = response.json()
+                    if json_response_check and json_response_check not in response_data:
                         if attempt + 1 == max_attempt:
                             return None
                         await asyncio.sleep(exception_sleep)
