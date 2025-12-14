@@ -178,7 +178,7 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
                 if response.status_code not in range(200, 300):
                     logger.warning(
                         f"Request: {response.status_code}\n"
-                        f"Attempt {attempt}/{max_attempt}\n"
+                        f"Attempt {attempt + 1}/{max_attempt}\n"
                         f"Url: {url}\n"
                         f"Params: {params}\n"
                         f"Response: {response.text[:1000]}\n"
@@ -194,7 +194,13 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
                     if attempt + 1 == max_attempt:
                         return response if force_response else None
 
-                    await asyncio.sleep(exception_sleep)
+                    # Exponential backoff for 429 (rate limit)
+                    if response.status_code == 429:
+                        backoff = min(120, exception_sleep * (2 ** attempt))
+                        logger.info(f"Rate limited (429), backing off for {backoff:.1f}s")
+                        await asyncio.sleep(backoff)
+                    else:
+                        await asyncio.sleep(exception_sleep)
                     continue
 
                 # Validate JSON response
@@ -297,7 +303,7 @@ async def make_request(
             if response.status_code not in range(200, 300):
                 logger.warning(
                     f"Request: {response.status_code}\n"
-                    f"Attempt {attempt}/{max_attempt}\n"
+                    f"Attempt {attempt + 1}/{max_attempt}\n"
                     f"Url: {url}\n"
                     f"Params: {params}\n"
                     f"Response: {response.text[:1000]}\n"
@@ -312,7 +318,13 @@ async def make_request(
                 if attempt + 1 == max_attempt:
                     return response if force_response else None
 
-                await asyncio.sleep(exception_sleep)
+                # Exponential backoff for 429 (rate limit)
+                if response.status_code == 429:
+                    backoff = min(120, exception_sleep * (2 ** attempt))
+                    logger.info(f"Rate limited (429), backing off for {backoff:.1f}s")
+                    await asyncio.sleep(backoff)
+                else:
+                    await asyncio.sleep(exception_sleep)
                 continue
 
             # Validate JSON response
