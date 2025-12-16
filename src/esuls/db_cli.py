@@ -23,25 +23,34 @@ class BaseModel:
 
 class AsyncDB(Generic[SchemaType]):
     """High-performance async SQLite with dataclass schema and reliable connection handling."""
-    
+
     OPERATOR_MAP = {
-        'gt': '>', 'lt': '<', 'gte': '>=', 'lte': '<=', 
+        'gt': '>', 'lt': '<', 'gte': '>=', 'lte': '<=',
         'neq': '!=', 'like': 'LIKE', 'in': 'IN', 'eq': '='
     }
-    
+
+    # Shared write locks per database file (class-level)
+    _db_locks: dict[str, asyncio.Lock] = {}
+
     def __init__(self, db_path: Union[str, Path], table_name: str, schema_class: Type[SchemaType]):
         """Initialize AsyncDB with a path and schema dataclass."""
         if not is_dataclass(schema_class):
             raise TypeError(f"Schema must be a dataclass, got {schema_class}")
-            
+
         self.db_path = Path(db_path).resolve()
         self.schema_class = schema_class
         self.table_name = table_name
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # Make schema initialization unique per instance
         self._db_key = f"{str(self.db_path)}:{self.table_name}:{self.schema_class.__name__}"
-        self._write_lock = asyncio.Lock()
+
+        # Use shared lock per database file (not per instance)
+        db_path_str = str(self.db_path)
+        if db_path_str not in AsyncDB._db_locks:
+            AsyncDB._db_locks[db_path_str] = asyncio.Lock()
+        self._write_lock = AsyncDB._db_locks[db_path_str]
+
         self._type_hints = get_type_hints(schema_class)
         
         # Use a class-level set to track initialized schemas
