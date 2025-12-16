@@ -8,21 +8,16 @@ T = TypeVar("T")
 
 
 async def run_parallel(
-    *coroutines: Awaitable[T],
-    limit: int = 20
-) -> List[T]:
-    """Run parallel coroutines with semaphore limit"""
-    
-    semaphore = asyncio.Semaphore(limit)
-    
-    async def limited_coroutine(coro: Awaitable[T]) -> T:
-        async with semaphore:
-            return await coro
-    
-    tasks = [asyncio.create_task(limited_coroutine(coro)) for coro in coroutines]
-    
-    results = []
-    for fut in asyncio.as_completed(tasks):
-        results.append(await fut)
-    
-    return results
+      *coroutines: Awaitable[T],
+      limit: int = 20
+  ) -> List[T]:
+      """Run parallel coroutines with semaphore limit, preserving order"""
+
+      semaphore = asyncio.Semaphore(limit)
+
+      async def limited_coroutine(coro: Awaitable[T]) -> T:
+          async with semaphore:
+              return await coro
+
+      return await asyncio.gather(*[limited_coroutine(coro) for coro in coroutines])
+
