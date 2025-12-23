@@ -57,20 +57,33 @@ class AsyncDB(Generic[SchemaType]):
         if not hasattr(AsyncDB, '_initialized_schemas'):
             AsyncDB._initialized_schemas = set()
     
-    async def _get_connection(self) -> aiosqlite.Connection:
-        """Create a new optimized connection."""
-        db = await aiosqlite.connect(self.db_path)
-        # Fast WAL mode with minimal sync
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA synchronous=NORMAL")
-        await db.execute("PRAGMA cache_size=10000")
-        
-        # Initialize schema if needed (check per unique schema)
-        if self._db_key not in AsyncDB._initialized_schemas:
-            await self._init_schema(db)
-            AsyncDB._initialized_schemas.add(self._db_key)
-            
-        return db
+    async def _get_connection(self, max_retries: int = 5) -> aiosqlite.Connection:
+        """Create a new optimized connection with retry logic for concurrent access."""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                db = await aiosqlite.connect(self.db_path, timeout=30.0)
+                # Fast WAL mode with minimal sync
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA synchronous=NORMAL")
+                await db.execute("PRAGMA cache_size=10000")
+                await db.execute("PRAGMA busy_timeout=30000")  # 30s busy timeout
+
+                # Initialize schema if needed (check per unique schema)
+                if self._db_key not in AsyncDB._initialized_schemas:
+                    await self._init_schema(db)
+                    AsyncDB._initialized_schemas.add(self._db_key)
+
+                return db
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
+                    wait_time = 0.1 * (2 ** attempt)
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
+        raise last_error
     
     async def _init_schema(self, db: aiosqlite.Connection) -> None:
         """Generate schema from dataclass structure with support for field additions."""

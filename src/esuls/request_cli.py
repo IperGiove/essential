@@ -1,24 +1,28 @@
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TypeAlias, Union, Optional, Dict, Any, TypeVar, AsyncContextManager, Literal
+from typing import TypeAlias, Union, Optional, Dict, Any, AsyncContextManager, Literal
+from urllib.parse import urlparse
 import asyncio
 import json
+import random
 import ssl
 from loguru import logger
 import httpx
 from fake_useragent import UserAgent
 from curl_cffi.requests import AsyncSession
 
-# Type definitions optimized
-ResponseT = TypeVar('ResponseT', bound='Response')
+# Type definitions
 JsonType: TypeAlias = Dict[str, Any]
 FileData: TypeAlias = tuple[str, Union[bytes, str], str]
 Headers: TypeAlias = Dict[str, str]
-HttpMethod: TypeAlias = Literal["GET", "POST",
-                                "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+HttpMethod: TypeAlias = Literal["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
-# Global shared client with connection pooling to prevent "Too many open files" error
-_shared_client: Optional[httpx.AsyncClient] = None
+# Constants
+_FALLBACK_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+_SUCCESS_STATUS_RANGE = range(200, 300)
+
+# Global connection pool per domain to prevent "Too many open files" error
+_domain_clients: Dict[str, httpx.AsyncClient] = {}
 _client_lock = asyncio.Lock()
 
 # Global cached UserAgent to prevent file descriptor exhaustion
@@ -27,24 +31,21 @@ _user_agent_lock = asyncio.Lock()
 
 
 async def _get_user_agent() -> str:
-    """Get or create cached UserAgent instance to avoid file descriptor leaks"""
+    """Get or create cached UserAgent instance to avoid file descriptor leaks."""
     global _user_agent
     async with _user_agent_lock:
         if _user_agent is None:
             try:
                 _user_agent = UserAgent()
-            except Exception as e:
-                # Fallback to a static user agent if UserAgent() fails
-                logger.warning(
-                    f"Failed to initialize UserAgent, using fallback: {e}")
-                return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            except (OSError, IOError) as e:
+                logger.warning(f"Failed to initialize UserAgent, using fallback: {e}")
+                return _FALLBACK_USER_AGENT
 
         try:
             return _user_agent.random
-        except Exception as e:
-            logger.warning(
-                f"Failed to get random user agent, using fallback: {e}")
-            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        except (AttributeError, IndexError) as e:
+            logger.warning(f"Failed to get random user agent, using fallback: {e}")
+            return _FALLBACK_USER_AGENT
 
 
 @lru_cache(maxsize=1)
@@ -58,22 +59,37 @@ def _create_optimized_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-async def _get_shared_client() -> httpx.AsyncClient:
-    """Get or create shared HTTP client with connection pooling"""
-    global _shared_client
+def _extract_domain(url: str) -> str:
+    """Extract domain from URL for connection pooling."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _apply_jitter(delay: float, jitter: float) -> float:
+    """Add random jitter to delay to prevent thundering herd."""
+    if jitter <= 0:
+        return delay
+    return delay + random.uniform(0, delay * jitter)
+
+
+async def _get_domain_client(url: str, http2: bool = True) -> httpx.AsyncClient:
+    """Get or create HTTP client for a specific domain with connection pooling"""
+    domain = _extract_domain(url)
+    cache_key = f"{domain}:{'h2' if http2 else 'h1'}"
     async with _client_lock:
-        if _shared_client is None or _shared_client.is_closed:
-            _shared_client = httpx.AsyncClient(
+        if cache_key not in _domain_clients or _domain_clients[cache_key].is_closed:
+            _domain_clients[cache_key] = httpx.AsyncClient(
                 verify=_create_optimized_ssl_context(),
                 timeout=60,
                 follow_redirects=True,
+                http2=http2,
                 limits=httpx.Limits(
-                    max_connections=100,
-                    max_keepalive_connections=50,
+                    max_connections=20,
+                    max_keepalive_connections=10,
                     keepalive_expiry=30.0
                 )
             )
-        return _shared_client
+        return _domain_clients[cache_key]
 
 
 @dataclass(frozen=True)
@@ -83,6 +99,7 @@ class Response:
     headers: Headers
     _content: bytes
     text: str
+    url: str = ""  # final URL after redirects
 
     @property
     def content(self) -> bytes:
@@ -93,21 +110,11 @@ class Response:
 
 
 class AsyncRequest(AsyncContextManager['AsyncRequest']):
-    def __init__(self) -> None:
-        # self._logger = logging.getLogger(__name__)
-        self._ssl_context = self._create_optimized_ssl_context()
-        self._client: Optional[httpx.AsyncClient] = None
+    """Context manager for HTTP requests with automatic client lifecycle."""
 
-    @staticmethod
-    @lru_cache(maxsize=1)
-    def _create_optimized_ssl_context() -> ssl.SSLContext:
-        """Create an SSL context optimized for performance"""
-        ctx = ssl._create_default_https_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ctx.set_alpn_protocols(['http/1.1'])
-        ctx.post_handshake_auth = True
-        return ctx
+    def __init__(self) -> None:
+        self._ssl_context = _create_optimized_ssl_context()
+        self._client: Optional[httpx.AsyncClient] = None
 
     async def request(
         self,
@@ -171,11 +178,12 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
                     status_code=httpx_response.status_code,
                     headers=dict(httpx_response.headers),
                     _content=httpx_response.content,
-                    text=httpx_response.text
+                    text=httpx_response.text,
+                    url=str(httpx_response.url),
                 )
 
                 # Handle unsuccessful status codes
-                if response.status_code not in range(200, 300):
+                if response.status_code not in _SUCCESS_STATUS_RANGE:
                     logger.warning(
                         f"Request: {response.status_code}\n"
                         f"Attempt {attempt + 1}/{max_attempt}\n"
@@ -185,9 +193,7 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
                         f"Request data: {json_data}\n"
                     )
                     if skip_response:
-                        patterns = [skip_response] if isinstance(
-                            skip_response, str) else skip_response
-                        # Skip if patterns list is empty
+                        patterns = [skip_response] if isinstance(skip_response, str) else skip_response
                         if patterns and any(pattern in response.text for pattern in patterns if pattern):
                             return response if force_response else None
 
@@ -196,7 +202,7 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
                     # Exponential backoff for 429 (rate limit)
                     if response.status_code == 429:
-                        backoff = min(120, exception_sleep * (2 ** attempt))
+                        backoff = min(120.0, exception_sleep * (2 ** attempt))
                         logger.info(f"Rate limited (429), backing off for {backoff:.1f}s")
                         await asyncio.sleep(backoff)
                     else:
@@ -220,9 +226,8 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
                 return response
 
-            except Exception as e:
-                logger.error(
-                    f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
+            except (httpx.HTTPError, OSError) as e:
+                logger.error(f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
                 if attempt + 1 == max_attempt:
                     return None
                 await asyncio.sleep(exception_sleep)
@@ -241,6 +246,33 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
             self._client = None
 
 
+async def close_shared_client() -> None:
+    """Close all domain HTTP clients to release resources"""
+    global _domain_clients
+    async with _client_lock:
+        for domain, client in list(_domain_clients.items()):
+            if not client.is_closed:
+                await client.aclose()
+        _domain_clients.clear()
+
+
+async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
+    """Close HTTP client for a specific domain. If http2 is None, closes both h1 and h2 clients."""
+    domain = _extract_domain(url)
+    async with _client_lock:
+        keys_to_close = []
+        if http2 is None:
+            keys_to_close = [f"{domain}:h1", f"{domain}:h2"]
+        else:
+            keys_to_close = [f"{domain}:{'h2' if http2 else 'h1'}"]
+
+        for key in keys_to_close:
+            if key in _domain_clients:
+                if not _domain_clients[key].is_closed:
+                    await _domain_clients[key].aclose()
+                del _domain_clients[key]
+
+
 async def make_request(
     url: str,
     method: HttpMethod = "GET",
@@ -250,6 +282,7 @@ async def make_request(
     json_data: Optional[JsonType] = None,
     files: Optional[Dict[str, FileData]] = None,
     data: Optional[Union[str, bytes]] = None,
+    form_data: Optional[Dict[str, Any]] = None,
     proxy: Optional[str] = None,
     timeout_request: int = 60,
     max_attempt: int = 10,
@@ -259,102 +292,141 @@ async def make_request(
     skip_response: Optional[Union[str, list[str]]] = None,
     exception_sleep: float = 10,
     add_user_agent: bool = False,
+    follow_redirects: bool = True,
+    verify_ssl: bool = False,
+    no_retry_status_codes: Optional[list[int]] = None,
+    log_errors: bool = True,
+    http2: bool = True,
+    jitter: float = 0.1,
 ) -> Optional[Response]:
-    """Main function to execute HTTP requests using shared client for connection reuse"""
-    # Use shared client to avoid "Too many open files" error
-    client = await _get_shared_client()
+    """Execute HTTP requests using per-domain client for connection reuse."""
+    # Use dedicated client if proxy is specified, otherwise use per-domain pooled client
+    own_client = None
+    if proxy:
+        ssl_context = _create_optimized_ssl_context() if not verify_ssl else True
+        own_client = httpx.AsyncClient(
+            verify=ssl_context,
+            timeout=timeout_request,
+            follow_redirects=follow_redirects,
+            proxy=proxy,
+            http2=http2,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30.0
+            )
+        )
+        client = own_client
+    else:
+        client = await _get_domain_client(url, http2=http2)
 
     # Prepare headers
-    request_headers = dict(headers or {})
+    request_headers = headers.copy() if headers else {}
     if add_user_agent:
         request_headers["User-Agent"] = await _get_user_agent()
 
     # Prepare files for multipart/form-data
-    files_dict = None
-    if files:
-        files_dict = {}
-        for field_name, (filename, content, content_type) in files.items():
-            files_dict[field_name] = (filename, content, content_type)
+    files_dict = {
+        field_name: (filename, content, content_type)
+        for field_name, (filename, content, content_type) in files.items()
+    } if files else None
 
+    # Filter empty params
     if params:
         params = {k: v for k, v in params.items() if v}
 
-    for attempt in range(max_attempt):
-        try:
-            # Execute request with all necessary parameters
-            httpx_response = await client.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json_data,
-                files=files_dict,
-                headers=request_headers,
-                timeout=timeout_request,
-                data=data,
-            )
+    # Determine data payload: form_data takes precedence over raw data
+    request_data = form_data if form_data else data
 
-            # Create custom Response object
-            response = Response(
-                status_code=httpx_response.status_code,
-                headers=dict(httpx_response.headers),
-                _content=httpx_response.content,
-                text=httpx_response.text
-            )
-
-            # Handle unsuccessful status codes
-            if response.status_code not in range(200, 300):
-                logger.warning(
-                    f"Request: {response.status_code}\n"
-                    f"Attempt {attempt + 1}/{max_attempt}\n"
-                    f"Url: {url}\n"
-                    f"Params: {params}\n"
-                    f"Response: {response.text[:1000]}\n"
-                    f"Request data: {json_data}\n"
+    try:
+        for attempt in range(max_attempt):
+            try:
+                # Execute request with all necessary parameters
+                httpx_response = await client.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    files=files_dict,
+                    headers=request_headers,
+                    timeout=timeout_request,
+                    data=request_data,
+                    cookies=cookies,
+                    follow_redirects=follow_redirects,
                 )
-                if skip_response:
-                    patterns = [skip_response] if isinstance(
-                        skip_response, str) else skip_response
-                    if patterns and any(pattern in response.text for pattern in patterns if pattern):
+
+                # Create custom Response object
+                response = Response(
+                    status_code=httpx_response.status_code,
+                    headers=dict(httpx_response.headers),
+                    _content=httpx_response.content,
+                    text=httpx_response.text,
+                    url=str(httpx_response.url),
+                )
+
+                # Handle unsuccessful status codes
+                if response.status_code not in _SUCCESS_STATUS_RANGE:
+                    if log_errors:
+                        logger.warning(
+                            f"Request: {response.status_code}\n"
+                            f"Attempt {attempt + 1}/{max_attempt}\n"
+                            f"Url: {url}\n"
+                            f"Params: {params}\n"
+                            f"Response: {response.text[:1000]}\n"
+                            f"Request data: {json_data}\n"
+                        )
+
+                    # Exit immediately for specific status codes (no retry)
+                    if no_retry_status_codes and response.status_code in no_retry_status_codes:
                         return response if force_response else None
 
-                if attempt + 1 == max_attempt:
-                    return response if force_response else None
+                    if skip_response:
+                        patterns = [skip_response] if isinstance(skip_response, str) else skip_response
+                        if patterns and any(pattern in response.text for pattern in patterns if pattern):
+                            return response if force_response else None
 
-                # Exponential backoff for 429 (rate limit)
-                if response.status_code == 429:
-                    backoff = min(120, exception_sleep * (2 ** attempt))
-                    logger.info(f"Rate limited (429), backing off for {backoff:.1f}s")
-                    await asyncio.sleep(backoff)
-                else:
-                    await asyncio.sleep(exception_sleep)
-                continue
-
-            # Validate JSON response
-            if json_response:
-                try:
-                    response_data = response.json()
-                    if json_response_check and json_response_check not in response_data:
-                        if attempt + 1 == max_attempt:
-                            return None
-                        await asyncio.sleep(exception_sleep)
-                        continue
-                except json.JSONDecodeError:
                     if attempt + 1 == max_attempt:
-                        return None
-                    await asyncio.sleep(exception_sleep)
+                        return response if force_response else None
+
+                    # Exponential backoff for 429 (rate limit)
+                    if response.status_code == 429:
+                        backoff = min(120.0, exception_sleep * (2 ** attempt))
+                        if log_errors:
+                            logger.info(f"Rate limited (429), backing off for {backoff:.1f}s")
+                        await asyncio.sleep(_apply_jitter(backoff, jitter))
+                    else:
+                        await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
                     continue
 
-            return response
+                # Validate JSON response
+                if json_response:
+                    try:
+                        response_data = response.json()
+                        if json_response_check and json_response_check not in response_data:
+                            if attempt + 1 == max_attempt:
+                                return None
+                            await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                            continue
+                    except json.JSONDecodeError:
+                        if attempt + 1 == max_attempt:
+                            return None
+                        await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                        continue
 
-        except Exception as e:
-            logger.error(
-                f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
-            if attempt + 1 == max_attempt:
-                return None
-            await asyncio.sleep(exception_sleep)
-            continue
+                return response
 
-    return None
+            except (httpx.HTTPError, OSError) as e:
+                if log_errors:
+                    logger.error(f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
+                if attempt + 1 == max_attempt:
+                    return None
+                await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                continue
+
+        return None
+    finally:
+        if own_client:
+            await own_client.aclose()
 
 
 @lru_cache(maxsize=1)
@@ -368,13 +440,12 @@ def _get_session_cffi() -> AsyncSession:
 
 
 async def make_request_cffi(url: str) -> Optional[str]:
-    """Optimized HTTP client with connection reuse and error handling."""
+    """HTTP client using curl_cffi for browser impersonation."""
     try:
         response = await _get_session_cffi().get(url)
-        print(response)
         response.raise_for_status()
         return response.text
-    except Exception:
+    except (OSError, IOError):
         return None
 
 
@@ -393,6 +464,6 @@ async def test_make_request_cffi():
     print(r)
 
 if __name__ == "__main__":
-    # asyncio.run(make_request("https://api.geckoterminal.com/api/v2/networks/zora-network/trending_pools?include=base_token%2C%20quote_token%2C%20dex&page=1", method="GET"))
+    print(asyncio.run(make_request("https://italiaonline.it", method="GET")))
     # asyncio.run(test_proxy())
-    asyncio.run(test_make_request_cffi())
+    # asyncio.run(test_make_request_cffi())
