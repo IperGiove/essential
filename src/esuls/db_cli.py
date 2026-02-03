@@ -31,6 +31,8 @@ class AsyncDB(Generic[SchemaType]):
 
     # Shared write locks per database file (class-level)
     _db_locks: dict[str, asyncio.Lock] = {}
+    # Lock for schema initialization (class-level)
+    _schema_init_lock: asyncio.Lock = None
 
     def __init__(self, db_path: Union[str, Path], table_name: str, schema_class: Type[SchemaType]):
         """Initialize AsyncDB with a path and schema dataclass."""
@@ -59,6 +61,10 @@ class AsyncDB(Generic[SchemaType]):
     
     async def _get_connection(self, max_retries: int = 5) -> aiosqlite.Connection:
         """Create a new optimized connection with retry logic for concurrent access."""
+        # Ensure schema init lock exists (lazy init for asyncio compatibility)
+        if AsyncDB._schema_init_lock is None:
+            AsyncDB._schema_init_lock = asyncio.Lock()
+
         last_error = None
         for attempt in range(max_retries):
             try:
@@ -69,10 +75,13 @@ class AsyncDB(Generic[SchemaType]):
                 await db.execute("PRAGMA cache_size=10000")
                 await db.execute("PRAGMA busy_timeout=30000")  # 30s busy timeout
 
-                # Initialize schema if needed (check per unique schema)
+                # Initialize schema if needed (with lock to prevent race condition)
                 if self._db_key not in AsyncDB._initialized_schemas:
-                    await self._init_schema(db)
-                    AsyncDB._initialized_schemas.add(self._db_key)
+                    async with AsyncDB._schema_init_lock:
+                        # Double-check after acquiring lock
+                        if self._db_key not in AsyncDB._initialized_schemas:
+                            await self._init_schema(db)
+                            AsyncDB._initialized_schemas.add(self._db_key)
 
                 return db
             except Exception as e:
@@ -287,40 +296,51 @@ class AsyncDB(Generic[SchemaType]):
 
         saved_count = 0
 
-        async with self._write_lock:
-            async with self.transaction() as db:
-                for item in items:
-                    try:
-                        if not isinstance(item, self.schema_class):
-                            if not skip_errors:
-                                raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
-                            continue
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._write_lock:
+                    async with self.transaction() as db:
+                        for item in items:
+                            try:
+                                if not isinstance(item, self.schema_class):
+                                    if not skip_errors:
+                                        raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
+                                    continue
 
-                        # Extract and process data
-                        data = asdict(item)
-                        item_id = data.pop('id', None) or str(uuid.uuid4())
+                                # Extract and process data
+                                data = asdict(item)
+                                item_id = data.pop('id', None) or str(uuid.uuid4())
 
-                        # Ensure created_at and updated_at are set
-                        now = datetime.now()
-                        if not data.get('created_at'):
-                            data['created_at'] = now
-                        data['updated_at'] = now
+                                # Ensure created_at and updated_at are set
+                                now = datetime.now()
+                                if not data.get('created_at'):
+                                    data['created_at'] = now
+                                data['updated_at'] = now
 
-                        # Prepare SQL and values
-                        field_names = tuple(sorted(data.keys()))
-                        sql = self._generate_save_sql(field_names)
-                        values = [self._serialize_value(data[name]) for name in field_names]
-                        values.append(item_id)
+                                # Prepare SQL and values
+                                field_names = tuple(sorted(data.keys()))
+                                sql = self._generate_save_sql(field_names)
+                                values = [self._serialize_value(data[name]) for name in field_names]
+                                values.append(item_id)
 
-                        # Execute save
-                        await db.execute(sql, values)
-                        saved_count += 1
+                                # Execute save
+                                await db.execute(sql, values)
+                                saved_count += 1
 
-                    except Exception as e:
-                        if skip_errors:
-                            logger.warning(f"Save error (skipped): {e}")
-                            continue
-                        raise
+                            except Exception as e:
+                                if skip_errors:
+                                    logger.warning(f"Save error (skipped): {e}")
+                                    continue
+                                raise
+                break
+            except Exception as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait_time = 0.2 * (2 ** attempt)
+                    logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
 
         return saved_count
 
@@ -356,10 +376,21 @@ class AsyncDB(Generic[SchemaType]):
             values = [self._serialize_value(data[name]) for name in field_names]
             values.append(item_id)
 
-            # Perform save with reliable transaction
-            async with self._write_lock:
-                async with self.transaction() as db:
-                    await db.execute(sql, values)
+            # Perform save with reliable transaction (retry on "database is locked")
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with self._write_lock:
+                        async with self.transaction() as db:
+                            await db.execute(sql, values)
+                    break
+                except Exception as e:
+                    if "database is locked" in str(e) and attempt < max_retries - 1:
+                        wait_time = 0.2 * (2 ** attempt)
+                        logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
 
             return True
 

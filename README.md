@@ -205,8 +205,7 @@ pip install -e .
 
 ```bash
 # With uv
-uv build
-twine upload dist/*
+uv build && twine upload dist/*
 
 # Or with traditional tools
 pip install build twine
