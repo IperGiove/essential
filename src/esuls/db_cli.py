@@ -1,6 +1,10 @@
 import asyncio
 import aiosqlite
+import ast
 import json
+import re
+import threading
+import dataclasses
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypeVar, Generic, Type, get_type_hints, Union, Tuple
@@ -10,6 +14,13 @@ import uuid
 import contextlib
 import enum
 from loguru import logger
+
+_VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+def _validate_identifier(name: str) -> str:
+    if not _VALID_IDENTIFIER.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
 
 T = TypeVar('T')
 SchemaType = TypeVar('SchemaType', bound='BaseModel')
@@ -33,6 +44,8 @@ class AsyncDB(Generic[SchemaType]):
     _db_locks: dict[str, asyncio.Lock] = {}
     # Lock for schema initialization (class-level)
     _schema_init_lock: asyncio.Lock = None
+    # Threading lock to guard class-level dict mutations
+    _db_locks_guard = threading.Lock()
 
     def __init__(self, db_path: Union[str, Path], table_name: str, schema_class: Type[SchemaType]):
         """Initialize AsyncDB with a path and schema dataclass."""
@@ -41,34 +54,49 @@ class AsyncDB(Generic[SchemaType]):
 
         self.db_path = Path(db_path).resolve()
         self.schema_class = schema_class
-        self.table_name = table_name
+        self.table_name = _validate_identifier(table_name)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Validate all field names upfront
+        for f in fields(schema_class):
+            _validate_identifier(f.name)
 
         # Make schema initialization unique per instance
         self._db_key = f"{str(self.db_path)}:{self.table_name}:{self.schema_class.__name__}"
 
         # Use shared lock per database file (not per instance)
         db_path_str = str(self.db_path)
-        if db_path_str not in AsyncDB._db_locks:
-            AsyncDB._db_locks[db_path_str] = asyncio.Lock()
-        self._write_lock = AsyncDB._db_locks[db_path_str]
+        with AsyncDB._db_locks_guard:
+            if db_path_str not in AsyncDB._db_locks:
+                AsyncDB._db_locks[db_path_str] = asyncio.Lock()
+            self._write_lock = AsyncDB._db_locks[db_path_str]
 
         self._type_hints = get_type_hints(schema_class)
-        
+
+        # Persistent connection (lazy init)
+        self._connection: Optional[aiosqlite.Connection] = None
+
         # Use a class-level set to track initialized schemas
         if not hasattr(AsyncDB, '_initialized_schemas'):
             AsyncDB._initialized_schemas = set()
     
-    async def _get_connection(self, max_retries: int = 5) -> aiosqlite.Connection:
-        """Create a new optimized connection with retry logic for concurrent access."""
+    async def _ensure_connection(self, max_retries: int = 5) -> aiosqlite.Connection:
+        """Return the persistent connection, creating it on first call with retry logic."""
+        if self._connection is not None:
+            return self._connection
+
         # Ensure schema init lock exists (lazy init for asyncio compatibility)
-        if AsyncDB._schema_init_lock is None:
-            AsyncDB._schema_init_lock = asyncio.Lock()
+        with AsyncDB._db_locks_guard:
+            if AsyncDB._schema_init_lock is None:
+                AsyncDB._schema_init_lock = asyncio.Lock()
 
         last_error = None
         for attempt in range(max_retries):
             try:
-                db = await aiosqlite.connect(self.db_path, timeout=30.0)
+                db = aiosqlite.connect(self.db_path, timeout=30.0)
+                # Mark aiosqlite's thread as daemon so it won't block process exit
+                db.daemon = True
+                db = await db
                 # Fast WAL mode with minimal sync
                 await db.execute("PRAGMA journal_mode=WAL")
                 await db.execute("PRAGMA synchronous=NORMAL")
@@ -83,6 +111,7 @@ class AsyncDB(Generic[SchemaType]):
                             await self._init_schema(db)
                             AsyncDB._initialized_schemas.add(self._db_key)
 
+                self._connection = db
                 return db
             except Exception as e:
                 last_error = e
@@ -93,7 +122,22 @@ class AsyncDB(Generic[SchemaType]):
                     continue
                 raise
         raise last_error
-    
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+    async def close(self) -> None:
+        """Explicitly close the persistent connection."""
+        if self._connection is not None:
+            try:
+                await self._connection.close()
+            except Exception:
+                pass
+            self._connection = None
+
     async def _init_schema(self, db: aiosqlite.Connection) -> None:
         """Generate schema from dataclass structure with support for field additions."""
         logger.debug(f"Initializing schema for {self.schema_class.__name__} in table {self.table_name}")
@@ -146,7 +190,7 @@ class AsyncDB(Generic[SchemaType]):
                 constraints.append("PRIMARY KEY")
             if f.metadata.get('unique'):
                 constraints.append("UNIQUE")
-            if not f.default and not f.default_factory and f.metadata.get('required', True):
+            if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING and f.metadata.get('required', True):
                 constraints.append("NOT NULL")
                 
             field_def = f"{field_name} {sql_type} {' '.join(constraints)}"
@@ -193,16 +237,27 @@ class AsyncDB(Generic[SchemaType]):
     
     @contextlib.asynccontextmanager
     async def transaction(self):
-        """Run operations in a transaction with reliable cleanup."""
-        db = await self._get_connection()
+        """Run operations in a transaction with reliable cleanup and auto-reconnect."""
+        db = await self._ensure_connection()
         try:
             yield db
             await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
-        finally:
-            await db.close()
+        except Exception as e:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            if "closed" in str(e).lower() or "no active connection" in str(e).lower():
+                self._connection = None
+                db = await self._ensure_connection()
+                try:
+                    yield db
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    raise
+            else:
+                raise
     
     # @lru_cache(maxsize=128)
     def _serialize_value(self, value: Any) -> Any:
@@ -232,11 +287,14 @@ class AsyncDB(Generic[SchemaType]):
                 return value
             # If somehow stored as string, convert back
             if isinstance(value, str):
-                import ast
                 try:
                     return ast.literal_eval(value)
-                except:
+                except (ValueError, SyntaxError):
                     return value.encode('utf-8')
+
+        # Handle bool fields - SQLite stores as INTEGER, need to convert back
+        if field_type is bool:
+            return bool(value)
 
         # Handle string fields - ensure phone numbers are strings
         if field_type is str or (hasattr(field_type, '__origin__') and field_type.__origin__ is Union and str in getattr(field_type, '__args__', ())):
@@ -250,12 +308,12 @@ class AsyncDB(Generic[SchemaType]):
             # Handle Optional[EnumType] case
             args = getattr(field_type, '__args__', ())
             for arg in args:
-                if arg is not type(None) and hasattr(arg, '__bases__') and enum.Enum in arg.__bases__:
+                if arg is not type(None) and isinstance(arg, type) and issubclass(arg, enum.Enum):
                     try:
                         return arg(value)
                     except (ValueError, TypeError):
                         pass
-        elif hasattr(field_type, '__bases__') and enum.Enum in field_type.__bases__:
+        elif isinstance(field_type, type) and issubclass(field_type, enum.Enum):
             # Handle direct enum types
             try:
                 return field_type(value)
@@ -281,6 +339,20 @@ class AsyncDB(Generic[SchemaType]):
             VALUES ({placeholders},?)
         """
     
+    def _prepare_item(self, item: SchemaType) -> Tuple[str, List[Any]]:
+        """Prepare an item for saving. Returns (sql, values)."""
+        data = asdict(item)
+        item_id = data.pop('id', None) or str(uuid.uuid4())
+        now = datetime.now()
+        if not data.get('created_at'):
+            data['created_at'] = now
+        data['updated_at'] = now
+        field_names = tuple(sorted(data.keys()))
+        sql = self._generate_save_sql(field_names)
+        values = [self._serialize_value(data[name]) for name in field_names]
+        values.append(item_id)
+        return sql, values
+
     async def save_batch(self, items: List[SchemaType], skip_errors: bool = True) -> int:
         """Save multiple items in a single transaction for better performance.
 
@@ -299,6 +371,7 @@ class AsyncDB(Generic[SchemaType]):
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                saved_count = 0
                 async with self._write_lock:
                     async with self.transaction() as db:
                         for item in items:
@@ -308,23 +381,7 @@ class AsyncDB(Generic[SchemaType]):
                                         raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
                                     continue
 
-                                # Extract and process data
-                                data = asdict(item)
-                                item_id = data.pop('id', None) or str(uuid.uuid4())
-
-                                # Ensure created_at and updated_at are set
-                                now = datetime.now()
-                                if not data.get('created_at'):
-                                    data['created_at'] = now
-                                data['updated_at'] = now
-
-                                # Prepare SQL and values
-                                field_names = tuple(sorted(data.keys()))
-                                sql = self._generate_save_sql(field_names)
-                                values = [self._serialize_value(data[name]) for name in field_names]
-                                values.append(item_id)
-
-                                # Execute save
+                                sql, values = self._prepare_item(item)
                                 await db.execute(sql, values)
                                 saved_count += 1
 
@@ -360,21 +417,7 @@ class AsyncDB(Generic[SchemaType]):
                     return False
                 raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
 
-            # Extract and process data
-            data = asdict(item)
-            item_id = data.pop('id', None) or str(uuid.uuid4())
-
-            # Ensure created_at and updated_at are set
-            now = datetime.now()
-            if not data.get('created_at'):
-                data['created_at'] = now
-            data['updated_at'] = now
-
-            # Prepare SQL and values
-            field_names = tuple(sorted(data.keys()))
-            sql = self._generate_save_sql(field_names)
-            values = [self._serialize_value(data[name]) for name in field_names]
-            values.append(item_id)
+            sql, values = self._prepare_item(item)
 
             # Perform save with reliable transaction (retry on "database is locked")
             max_retries = 3
@@ -425,10 +468,6 @@ class AsyncDB(Generic[SchemaType]):
         values = []
         
         for key, value in filters.items():
-            # Handle special values
-            if value == 'now':
-                value = datetime.now()
-                
             # Parse field and operator
             parts = key.split('__', 1)
             field = parts[0]
@@ -451,22 +490,32 @@ class AsyncDB(Generic[SchemaType]):
                 
         return f"WHERE {' AND '.join(conditions)}", values
     
-    async def find(self, order_by=None, **filters) -> List[SchemaType]:
+    async def find(self, order_by=None, limit: int = None, offset: int = None, **filters) -> List[SchemaType]:
         """Query items with reliable connection handling."""
         where_clause, values = self._build_where_clause(filters)
-        
+
         # Build query
         query = f"SELECT * FROM {self.table_name} {where_clause}"
-        
+
         # Add ORDER BY clause if specified
         if order_by:
             order_fields = [order_by] if isinstance(order_by, str) else order_by
             order_clauses = [
-                f"{field[1:]} DESC" if field.startswith('-') else f"{field} ASC" 
+                f"{field[1:]} DESC" if field.startswith('-') else f"{field} ASC"
                 for field in order_fields
             ]
             query += f" ORDER BY {', '.join(order_clauses)}"
-        
+
+        # Add LIMIT/OFFSET (SQLite requires LIMIT before OFFSET)
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(limit)
+        elif offset is not None:
+            query += " LIMIT -1"
+        if offset is not None:
+            query += " OFFSET ?"
+            values.append(offset)
+
         # Execute query with reliable transaction
         async with self.transaction() as db:
             cursor = await db.execute(query, values)
@@ -504,4 +553,33 @@ class AsyncDB(Generic[SchemaType]):
         async with self._write_lock:
             async with self.transaction() as db:
                 cursor = await db.execute(f"DELETE FROM {self.table_name} WHERE id = ?", (id,))
+                return cursor.rowcount > 0
+
+    async def exists(self, **filters) -> bool:
+        """Check if any record matches the filters without fetching data."""
+        return await self.count(**filters) > 0
+
+    async def delete_many(self, **filters) -> int:
+        """Delete all items matching filters. Returns count of deleted rows."""
+        if not filters:
+            raise ValueError("delete_many() requires at least one filter to prevent accidental full table delete")
+        where_clause, values = self._build_where_clause(filters)
+        async with self._write_lock:
+            async with self.transaction() as db:
+                cursor = await db.execute(f"DELETE FROM {self.table_name} {where_clause}", values)
+                return cursor.rowcount
+
+    async def update_fields(self, id: str, **fields) -> bool:
+        """Update specific fields on a record by ID without fetching the full record."""
+        if not fields:
+            return False
+        fields['updated_at'] = datetime.now()
+        set_clause = ', '.join(f"{_validate_identifier(k)} = ?" for k in fields)
+        values = [self._serialize_value(v) for v in fields.values()]
+        values.append(id)
+        async with self._write_lock:
+            async with self.transaction() as db:
+                cursor = await db.execute(
+                    f"UPDATE {self.table_name} SET {set_clause} WHERE id = ?", values
+                )
                 return cursor.rowcount > 0

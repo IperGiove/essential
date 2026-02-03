@@ -33,6 +33,7 @@ async def test_concurrent_reads(temp_db):
 
     # All reads should succeed and return same data
     assert all(len(r) == 10 for r in results)
+    await db.close()
     print(f"✓ 100 concurrent reads completed successfully")
 
 
@@ -53,6 +54,7 @@ async def test_concurrent_writes(temp_db):
     # Verify all items were saved
     items = await db.find()
     assert len(items) == 50
+    await db.close()
     print(f"✓ 50 concurrent writes completed successfully")
 
 
@@ -92,6 +94,7 @@ async def test_concurrent_mixed_operations(temp_db):
     # Verify final state
     items = await db.find()
     assert len(items) == 55  # 5 seed + 50 writes
+    await db.close()
     print(f"✓ 200 concurrent mixed operations completed successfully")
 
 
@@ -124,6 +127,7 @@ async def test_stress_concurrent_access(temp_db):
 
     # Should have very few or no failures with retry logic
     assert len(exceptions) == 0, f"{len(exceptions)} operations failed"
+    await db.close()
     print(f"✓ 500 concurrent stress operations completed successfully")
 
 
