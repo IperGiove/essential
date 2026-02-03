@@ -94,7 +94,13 @@ class AsyncDB(Generic[SchemaType]):
             try:
                 db = aiosqlite.connect(self.db_path, timeout=30.0)
                 # Mark aiosqlite's thread as daemon so it won't block process exit
-                db._thread.daemon = True
+                # Must be set before await (which calls start())
+                # <=0.21: Connection extends Thread directly
+                # >=0.22: Connection wraps Thread in _thread attr
+                if hasattr(db, '_thread'):
+                    db._thread.daemon = True
+                elif isinstance(db, threading.Thread):
+                    db.daemon = True
                 db = await db
                 # Fast WAL mode with minimal sync
                 await db.execute("PRAGMA journal_mode=WAL")

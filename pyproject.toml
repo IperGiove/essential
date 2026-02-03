@@ -20,7 +20,7 @@ classifiers = [
 
 # All dependencies (always installed)
 dependencies = [
-    "aiosqlite>=0.21.0",
+    "aiosqlite==0.22.1",
     "curl-cffi>=0.13.0",
     "fake-useragent>=2.2.0",
     "httpx[http2]>=0.28.1",
