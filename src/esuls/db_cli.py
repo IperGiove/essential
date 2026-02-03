@@ -334,9 +334,11 @@ class AsyncDB(Generic[SchemaType]):
         columns = ','.join(field_names)
         placeholders = ','.join('?' for _ in field_names)
 
+        set_clause = ','.join(f'{col}=excluded.{col}' for col in field_names if col != 'created_at')
         return f"""
-            INSERT OR REPLACE INTO {self.table_name} ({columns},id)
+            INSERT INTO {self.table_name} ({columns},id)
             VALUES ({placeholders},?)
+            ON CONFLICT(id) DO UPDATE SET {set_clause}
         """
     
     def _prepare_item(self, item: SchemaType) -> Tuple[str, List[Any]]:

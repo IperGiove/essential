@@ -379,7 +379,7 @@ async def test_prepare_item_dedup(temp_db):
     try:
         item = TestItem(name="test", value=5)
         sql, values = db._prepare_item(item)
-        assert "INSERT OR REPLACE" in sql
+        assert "ON CONFLICT(id) DO UPDATE SET" in sql
         assert "test" in values
         assert 5 in values
 
