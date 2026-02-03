@@ -3,6 +3,7 @@ from functools import lru_cache
 from typing import TypeAlias, Union, Optional, Dict, Any, AsyncContextManager, Literal
 from urllib.parse import urlparse
 import asyncio
+import atexit
 import json
 import random
 import ssl
@@ -254,6 +255,35 @@ async def close_shared_client() -> None:
             if not client.is_closed:
                 await client.aclose()
         _domain_clients.clear()
+
+
+async def cleanup_all() -> None:
+    """Close all global HTTP resources (domain clients + cffi session) and DB connections."""
+    await close_shared_client()
+    if _get_session_cffi.cache_info().currsize > 0:
+        cffi_session = _get_session_cffi()
+        await cffi_session.close()
+        _get_session_cffi.cache_clear()
+    # Close all AsyncDB instances
+    from esuls.db_cli import AsyncDB
+    await AsyncDB.close_all()
+
+
+def _atexit_cleanup() -> None:
+    """Run async cleanup at process exit."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(cleanup_all())
+        else:
+            loop.run_until_complete(cleanup_all())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(cleanup_all())
+        loop.close()
+
+
+atexit.register(_atexit_cleanup)
 
 
 async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
