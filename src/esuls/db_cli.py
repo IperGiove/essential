@@ -46,9 +46,6 @@ class AsyncDB(Generic[SchemaType]):
     _schema_init_lock: asyncio.Lock = None
     # Threading lock to guard class-level dict mutations
     _db_locks_guard = threading.Lock()
-    # Track all instances for cleanup
-    _instances: list['AsyncDB'] = []
-
     def __init__(self, db_path: Union[str, Path], table_name: str, schema_class: Type[SchemaType]):
         """Initialize AsyncDB with a path and schema dataclass."""
         if not is_dataclass(schema_class):
@@ -78,9 +75,6 @@ class AsyncDB(Generic[SchemaType]):
         # Persistent connection (lazy init)
         self._connection: Optional[aiosqlite.Connection] = None
 
-        # Track instance for cleanup
-        AsyncDB._instances.append(self)
-
         # Use a class-level set to track initialized schemas
         if not hasattr(AsyncDB, '_initialized_schemas'):
             AsyncDB._initialized_schemas = set()
@@ -100,7 +94,7 @@ class AsyncDB(Generic[SchemaType]):
             try:
                 db = aiosqlite.connect(self.db_path, timeout=30.0)
                 # Mark aiosqlite's thread as daemon so it won't block process exit
-                db.daemon = True
+                db._thread.daemon = True
                 db = await db
                 # Fast WAL mode with minimal sync
                 await db.execute("PRAGMA journal_mode=WAL")
@@ -142,13 +136,6 @@ class AsyncDB(Generic[SchemaType]):
             except Exception:
                 pass
             self._connection = None
-
-    @classmethod
-    async def close_all(cls) -> None:
-        """Close all AsyncDB instances."""
-        for instance in cls._instances:
-            await instance.close()
-        cls._instances.clear()
 
     async def _init_schema(self, db: aiosqlite.Connection) -> None:
         """Generate schema from dataclass structure with support for field additions."""
