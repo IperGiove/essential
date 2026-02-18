@@ -264,12 +264,17 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
 
 async def close_shared_client() -> None:
-    """Close all domain HTTP clients to release resources"""
+    """Close all domain HTTP clients and cffi session to release resources."""
+    global _cffi_session
     async with _client_lock:
         for client in list(_domain_clients.values()):
             if not client.is_closed:
                 await client.aclose()
         _domain_clients.clear()
+    async with _cffi_lock:
+        if _cffi_session is not None:
+            await _cffi_session.close()
+            _cffi_session = None
 
 
 async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
@@ -449,21 +454,93 @@ async def make_request(
             await own_client.aclose()
 
 
-@lru_cache(maxsize=1)
-def _get_session_cffi() -> AsyncSession:
-    """Cached session factory with optimized settings."""
-    return AsyncSession(
-        impersonate="chrome",
-        timeout=30.0,
-        headers={'User-Agent': 'Mozilla/5.0 (compatible; Scraper)'}
-    )
+_cffi_session: Optional[AsyncSession] = None
+_cffi_lock = asyncio.Lock()
 
 
-async def make_request_cffi(url: str) -> Optional[str]:
-    """HTTP client using curl_cffi for browser impersonation."""
-    try:
-        response = await _get_session_cffi().get(url)
-        response.raise_for_status()
-        return response.text
-    except (OSError, IOError):
-        return None
+async def _get_session_cffi() -> AsyncSession:
+    """Get or create cached curl_cffi session with browser impersonation."""
+    global _cffi_session
+    async with _cffi_lock:
+        if _cffi_session is None:
+            _cffi_session = AsyncSession(
+                impersonate="chrome",
+                timeout=30,
+                verify=False,
+            )
+        return _cffi_session
+
+
+async def make_request_cffi(
+    url: str,
+    method: HttpMethod = "GET",
+    headers: Optional[Headers] = None,
+    cookies: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json_data: Optional[JsonType] = None,
+    data: Optional[Union[str, bytes]] = None,
+    timeout_request: int = 30,
+    max_attempt: int = 3,
+    force_response: bool = False,
+    no_retry_status_codes: Optional[list[int]] = None,
+    exception_sleep: float = 5,
+    jitter: float = 0.1,
+) -> Optional[Response]:
+    """HTTP client using curl_cffi for browser TLS impersonation.
+
+    Falls back to this when standard httpx is blocked by TLS fingerprinting
+    (Cloudflare, Wix, Akamai, etc.). Returns the same Response object as
+    make_request for drop-in compatibility.
+    """
+    session = await _get_session_cffi()
+
+    for attempt in range(max_attempt):
+        try:
+            cffi_resp = await session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                cookies=cookies,
+                params=params,
+                json=json_data,
+                data=data,
+                timeout=timeout_request,
+            )
+
+            response = Response(
+                status_code=cffi_resp.status_code,
+                headers=dict(cffi_resp.headers),
+                _content=cffi_resp.content,
+                text=cffi_resp.text,
+                url=str(cffi_resp.url),
+            )
+
+            if response.status_code not in _SUCCESS_STATUS_RANGE:
+                logger.debug(
+                    f"cffi request: {response.status_code} - {url} "
+                    f"- attempt {attempt + 1}/{max_attempt}"
+                )
+
+                if (no_retry_status_codes
+                        and response.status_code in no_retry_status_codes):
+                    return response if force_response else None
+
+                if attempt + 1 == max_attempt:
+                    return response if force_response else None
+
+                if response.status_code == 429:
+                    backoff = min(120.0, exception_sleep * (2 ** attempt))
+                    await asyncio.sleep(_apply_jitter(backoff, jitter))
+                else:
+                    await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                continue
+
+            return response
+
+        except Exception as e:
+            logger.debug(f"cffi request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
+            if attempt + 1 == max_attempt:
+                return None
+            await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+
+    return None
