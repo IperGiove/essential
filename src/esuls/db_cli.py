@@ -172,7 +172,13 @@ class AsyncDB(Generic[SchemaType]):
             field_name = f.name
             field_type = self._type_hints.get(field_name)
             logger.debug(f"  Field: {field_name} -> {field_type}")
-            
+
+            # Unwrap Optional[X] → X
+            if hasattr(field_type, '__origin__') and field_type.__origin__ is Union:
+                args = [a for a in field_type.__args__ if a is not type(None)]
+                if len(args) == 1:
+                    field_type = args[0]
+
             # Map Python types to SQLite types
             if field_type in (int, bool):
                 sql_type = "INTEGER"
