@@ -264,8 +264,8 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
 
 async def close_shared_client() -> None:
-    """Close all domain HTTP clients and cffi session to release resources."""
-    global _cffi_session
+    """Close all domain HTTP clients, cffi session, and selenium driver to release resources."""
+    global _cffi_session, _selenium_driver
     async with _client_lock:
         for client in list(_domain_clients.values()):
             if not client.is_closed:
@@ -275,6 +275,10 @@ async def close_shared_client() -> None:
         if _cffi_session is not None:
             await _cffi_session.close()
             _cffi_session = None
+    async with _selenium_lock:
+        if _selenium_driver is not None:
+            _selenium_driver.quit()
+            _selenium_driver = None
 
 
 async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
@@ -457,6 +461,9 @@ async def make_request(
 _cffi_session: Optional[AsyncSession] = None
 _cffi_lock = asyncio.Lock()
 
+_selenium_driver = None
+_selenium_lock = asyncio.Lock()
+
 
 async def _get_session_cffi() -> AsyncSession:
     """Get or create cached curl_cffi session with browser impersonation."""
@@ -539,6 +546,97 @@ async def make_request_cffi(
 
         except Exception as e:
             logger.debug(f"cffi request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
+            if attempt + 1 == max_attempt:
+                return None
+            await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+
+    return None
+
+
+def _create_selenium_driver():
+    """Create headless Chrome driver. Uses system chromedriver if available,
+    falls back to webdriver_manager auto-download."""
+    import shutil
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    system_chromedriver = shutil.which("chromedriver")
+    if system_chromedriver:
+        service = Service(system_chromedriver)
+    else:
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
+
+    return webdriver.Chrome(service=service, options=options)
+
+
+async def _get_selenium_driver():
+    """Get or create cached Selenium Chrome driver."""
+    global _selenium_driver
+    async with _selenium_lock:
+        if _selenium_driver is None:
+            _selenium_driver = await asyncio.to_thread(_create_selenium_driver)
+        return _selenium_driver
+
+
+async def make_request_selenium(
+    url: str,
+    timeout_request: int = 15,
+    max_attempt: int = 3,
+    wait_seconds: float = 2,
+    no_retry_status_codes: list[int] | None = None,
+    force_response: bool = False,
+    exception_sleep: float = 5,
+    jitter: float = 0.1,
+) -> Optional[Response]:
+    """HTTP client using Selenium for JavaScript-rendered pages.
+
+    Use this when standard httpx/curl_cffi return empty shells from
+    Angular SPAs or other JS-heavy sites. Returns the same Response
+    object for drop-in compatibility.
+    """
+    import time
+
+    driver = await _get_selenium_driver()
+
+    def _fetch(drv, target_url: str, wait: float) -> tuple[str, str]:
+        drv.set_page_load_timeout(timeout_request)
+        drv.get(target_url)
+        time.sleep(wait)
+        return drv.page_source, drv.current_url
+
+    for attempt in range(max_attempt):
+        try:
+            page_source, final_url = await asyncio.to_thread(
+                _fetch, driver, url, wait_seconds
+            )
+
+            response = Response(
+                status_code=200,
+                headers={},
+                _content=page_source.encode("utf-8"),
+                text=page_source,
+                url=final_url,
+            )
+
+            return response
+
+        except Exception as e:
+            logger.debug(
+                f"selenium request error: {e} - {url} "
+                f"- attempt {attempt + 1}/{max_attempt}"
+            )
             if attempt + 1 == max_attempt:
                 return None
             await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
