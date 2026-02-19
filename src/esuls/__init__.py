@@ -7,7 +7,7 @@ __version__ = "0.1.0"
 # Import all utilities
 from .utils import run_parallel
 from .db_cli import AsyncDB, BaseModel
-from .request_cli import AsyncRequest, make_request, make_request_cffi, make_request_selenium, Response
+from .request_cli import AsyncRequest, make_request, make_request_cffi, make_request_playwright, Response
 from .download_icon import download_icon
 
 
@@ -19,7 +19,7 @@ __all__ = [
     'AsyncRequest',
     'make_request',
     'make_request_cffi',
-    'make_request_selenium',
+    'make_request_playwright',
     'Response',
     'download_icon'
 ]

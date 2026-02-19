@@ -264,8 +264,8 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
 
 async def close_shared_client() -> None:
-    """Close all domain HTTP clients, cffi session, and selenium driver to release resources."""
-    global _cffi_session, _selenium_driver
+    """Close all domain HTTP clients, cffi session, and playwright browser to release resources."""
+    global _cffi_session, _playwright_browser, _playwright_instance
     async with _client_lock:
         for client in list(_domain_clients.values()):
             if not client.is_closed:
@@ -275,10 +275,13 @@ async def close_shared_client() -> None:
         if _cffi_session is not None:
             await _cffi_session.close()
             _cffi_session = None
-    async with _selenium_lock:
-        if _selenium_driver is not None:
-            _selenium_driver.quit()
-            _selenium_driver = None
+    async with _playwright_lock:
+        if _playwright_browser is not None:
+            await _playwright_browser.close()
+            _playwright_browser = None
+        if _playwright_instance is not None:
+            await _playwright_instance.stop()
+            _playwright_instance = None
 
 
 async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
@@ -461,8 +464,9 @@ async def make_request(
 _cffi_session: Optional[AsyncSession] = None
 _cffi_lock = asyncio.Lock()
 
-_selenium_driver = None
-_selenium_lock = asyncio.Lock()
+_playwright_browser = None
+_playwright_instance = None
+_playwright_lock = asyncio.Lock()
 
 
 async def _get_session_cffi() -> AsyncSession:
@@ -553,44 +557,25 @@ async def make_request_cffi(
     return None
 
 
-def _create_selenium_driver():
-    """Create headless Chrome driver. Uses system chromedriver if available,
-    falls back to webdriver_manager auto-download."""
-    import shutil
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    )
-
-    system_chromedriver = shutil.which("chromedriver")
-    if system_chromedriver:
-        service = Service(system_chromedriver)
-    else:
-        from webdriver_manager.chrome import ChromeDriverManager
-        service = Service(ChromeDriverManager().install())
-
-    return webdriver.Chrome(service=service, options=options)
+async def _get_playwright_browser():
+    """Get or create cached Playwright Chromium browser."""
+    global _playwright_browser, _playwright_instance
+    async with _playwright_lock:
+        if _playwright_browser is None:
+            from playwright.async_api import async_playwright
+            _playwright_instance = await async_playwright().start()
+            _playwright_browser = await _playwright_instance.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+        return _playwright_browser
 
 
-async def _get_selenium_driver():
-    """Get or create cached Selenium Chrome driver."""
-    global _selenium_driver
-    async with _selenium_lock:
-        if _selenium_driver is None:
-            _selenium_driver = await asyncio.to_thread(_create_selenium_driver)
-        return _selenium_driver
-
-
-async def make_request_selenium(
+async def make_request_playwright(
     url: str,
     timeout_request: int = 15,
     max_attempt: int = 3,
@@ -600,45 +585,66 @@ async def make_request_selenium(
     exception_sleep: float = 5,
     jitter: float = 0.1,
 ) -> Optional[Response]:
-    """HTTP client using Selenium for JavaScript-rendered pages.
+    """HTTP client using Playwright for JavaScript-rendered pages.
 
-    Use this when standard httpx/curl_cffi return empty shells from
-    Angular SPAs or other JS-heavy sites. Returns the same Response
+    Fully async — use this when standard httpx/curl_cffi return empty shells
+    from Angular SPAs or other JS-heavy sites. Returns the same Response
     object for drop-in compatibility.
     """
-    import time
-
-    driver = await _get_selenium_driver()
-
-    def _fetch(drv, target_url: str, wait: float) -> tuple[str, str]:
-        drv.set_page_load_timeout(timeout_request)
-        drv.get(target_url)
-        time.sleep(wait)
-        return drv.page_source, drv.current_url
+    browser = await _get_playwright_browser()
 
     for attempt in range(max_attempt):
+        page = None
         try:
-            page_source, final_url = await asyncio.to_thread(
-                _fetch, driver, url, wait_seconds
+            page = await browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
             )
+            page.set_default_timeout(timeout_request * 1000)
+
+            resp = await page.goto(url, wait_until="domcontentloaded")
+            # Let JS render
+            await page.wait_for_timeout(int(wait_seconds * 1000))
+
+            page_source = await page.content()
+            final_url = page.url
+            status_code = resp.status if resp else 200
 
             response = Response(
-                status_code=200,
-                headers={},
+                status_code=status_code,
+                headers=dict(resp.headers) if resp else {},
                 _content=page_source.encode("utf-8"),
                 text=page_source,
                 url=final_url,
             )
 
+            if status_code not in _SUCCESS_STATUS_RANGE:
+                logger.debug(
+                    f"playwright request: {status_code} - {url} "
+                    f"- attempt {attempt + 1}/{max_attempt}"
+                )
+                if (no_retry_status_codes
+                        and status_code in no_retry_status_codes):
+                    return response if force_response else None
+                if attempt + 1 == max_attempt:
+                    return response if force_response else None
+                await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                continue
+
             return response
 
         except Exception as e:
             logger.debug(
-                f"selenium request error: {e} - {url} "
+                f"playwright request error: {e} - {url} "
                 f"- attempt {attempt + 1}/{max_attempt}"
             )
             if attempt + 1 == max_attempt:
                 return None
             await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+        finally:
+            if page:
+                await page.close()
 
     return None
