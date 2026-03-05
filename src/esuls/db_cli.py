@@ -5,7 +5,7 @@ import json
 import re
 import threading
 import dataclasses
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypeVar, Generic, Type, get_type_hints, Union, Tuple
 from dataclasses import dataclass, asdict, fields, is_dataclass, field
@@ -14,6 +14,8 @@ import uuid
 import contextlib
 import enum
 from loguru import logger
+from decimal import Decimal
+
 
 _VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 
@@ -30,6 +32,36 @@ class BaseModel:
     id: str = field(default_factory=lambda: str(uuid.uuid4()), metadata={"primary_key": True})
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> dict:
+        result = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            result[f.name] = self._serialize_value(value)
+        return result
+
+    def _serialize_value(self, value):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, enum.Enum):
+            return value.value
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, (list, tuple, set)):
+            return [self._serialize_value(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self._serialize_value(v) for k, v in value.items()}
+        if hasattr(value, "to_dict"):          # nested BaseModel
+            return value.to_dict()
+        if is_dataclass(value):                # nested dataclass generico
+            return asdict(value)
+        return value
 
 
 class AsyncDB(Generic[SchemaType]):
