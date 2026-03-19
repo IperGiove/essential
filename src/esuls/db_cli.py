@@ -314,7 +314,7 @@ class AsyncDB(Generic[SchemaType]):
         if isinstance(value, enum.Enum):
             return value.value
         if isinstance(value, (list, dict, tuple)):
-            return json.dumps(value)
+            return json.dumps(value, default=lambda v: v.value if isinstance(v, enum.Enum) else str(v))
         return str(value)
     
     def _deserialize_value(self, field_name: str, value: Any) -> Any:
