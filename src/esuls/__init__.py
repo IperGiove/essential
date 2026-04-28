@@ -9,6 +9,22 @@ from .utils import run_parallel
 from .db_cli import AsyncDB, BaseModel
 from .request_cli import AsyncRequest, make_request, make_request_cffi, make_request_playwright, Response
 from .download_icon import download_icon
+from .pdf import (
+    Finding,
+    PdfReport,
+    STANDARD_METADATA_KEYS,
+    check_metadata_coherence,
+    check_pdf,
+    find_non_standard_metadata,
+    read_pdf_dynamic,
+    read_pdf_metadata,
+    read_pdf_revisions,
+    read_pdf_summary,
+    read_pdf_xmp,
+    remove_pdf_metadata,
+    replace_pdf_metadata,
+    update_pdf_metadata,
+)
 
 
 __all__ = [
@@ -21,5 +37,20 @@ __all__ = [
     'make_request_cffi',
     'make_request_playwright',
     'Response',
-    'download_icon'
+    'download_icon',
+    # pdf
+    'read_pdf_metadata',
+    'read_pdf_xmp',
+    'read_pdf_summary',
+    'read_pdf_revisions',
+    'read_pdf_dynamic',
+    'check_metadata_coherence',
+    'check_pdf',
+    'Finding',
+    'PdfReport',
+    'find_non_standard_metadata',
+    'STANDARD_METADATA_KEYS',
+    'update_pdf_metadata',
+    'replace_pdf_metadata',
+    'remove_pdf_metadata',
 ]
