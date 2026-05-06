@@ -1,8 +1,14 @@
 """
 esuls - Utility library for async database operations, HTTP requests, and parallel execution
 """
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
-__version__ = "0.1.0"
+try:
+    __version__ = _pkg_version("esuls")
+except PackageNotFoundError:
+    # Source checkout without an installed distribution (e.g. running from
+    # a clone before `pip install -e .`). Keep imports working.
+    __version__ = "0.0.0+unknown"
 
 # Import all utilities
 from .utils import run_parallel

@@ -208,11 +208,14 @@ async def test_close_shared_client():
 async def test_make_request_cffi_mocked():
     """Test make_request_cffi with mocked curl_cffi session."""
     mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.headers = {"content-type": "text/html"}
+    mock_response.content = b"<html>cffi</html>"
     mock_response.text = "<html>cffi</html>"
-    mock_response.raise_for_status = MagicMock()
+    mock_response.url = "https://example.com"
 
     mock_session = MagicMock()
-    mock_session.get = AsyncMock(return_value=mock_response)
+    mock_session.request = AsyncMock(return_value=mock_response)
 
     with patch(
         "esuls.request_cli._get_session_cffi",
@@ -220,20 +223,27 @@ async def test_make_request_cffi_mocked():
     ):
         result = await make_request_cffi("https://example.com")
 
-    assert result == "<html>cffi</html>"
+    assert result is not None
+    assert result.status_code == 200
+    assert result.text == "<html>cffi</html>"
     print("  [PASS] make_request_cffi success")
 
 
 async def test_make_request_cffi_error():
     """Test make_request_cffi returns None on error."""
     mock_session = MagicMock()
-    mock_session.get = AsyncMock(side_effect=OSError("fail"))
+    mock_session.request = AsyncMock(side_effect=OSError("fail"))
 
     with patch(
         "esuls.request_cli._get_session_cffi",
         return_value=mock_session,
     ):
-        result = await make_request_cffi("https://example.com")
+        result = await make_request_cffi(
+            "https://example.com",
+            max_attempt=1,
+            exception_sleep=0,
+            jitter=0,
+        )
 
     assert result is None
     print("  [PASS] make_request_cffi returns None on error")

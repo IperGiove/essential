@@ -75,14 +75,25 @@ def _apply_jitter(delay: float, jitter: float) -> float:
     return delay + random.uniform(0, delay * jitter)
 
 
-async def _get_domain_client(url: str, http2: bool = True) -> httpx.AsyncClient:
-    """Get or create HTTP client for a specific domain with connection pooling"""
+async def _get_domain_client(
+    url: str,
+    http2: bool = True,
+    verify_ssl: bool = False,
+) -> httpx.AsyncClient:
+    """Get or create HTTP client for a specific domain with connection pooling.
+
+    The pool is keyed by (domain, http2, verify_ssl) so callers that opt into
+    real TLS verification get a separate client from the insecure default.
+    """
     domain = _extract_domain(url)
-    cache_key = f"{domain}:{'h2' if http2 else 'h1'}"
+    cache_key = f"{domain}:{'h2' if http2 else 'h1'}:{'v' if verify_ssl else 'nv'}"
     async with _client_lock:
         if cache_key not in _domain_clients or _domain_clients[cache_key].is_closed:
+            verify: Union[bool, ssl.SSLContext] = (
+                True if verify_ssl else _create_optimized_ssl_context()
+            )
             _domain_clients[cache_key] = httpx.AsyncClient(
-                verify=_create_optimized_ssl_context(),
+                verify=verify,
                 timeout=60,
                 follow_redirects=True,
                 http2=http2,
@@ -117,8 +128,13 @@ class Response:
 class AsyncRequest(AsyncContextManager['AsyncRequest']):
     """Context manager for HTTP requests with automatic client lifecycle."""
 
-    def __init__(self) -> None:
-        self._ssl_context = _create_optimized_ssl_context()
+    def __init__(self, verify_ssl: bool = False) -> None:
+        # When verify_ssl is False (default) we use the optimized-but-insecure
+        # context so the AsyncRequest behaves like make_request's pooled path.
+        # Pass verify_ssl=True to enforce real certificate validation.
+        self._verify: Union[bool, ssl.SSLContext] = (
+            True if verify_ssl else _create_optimized_ssl_context()
+        )
         self._client: Optional[httpx.AsyncClient] = None
 
     async def request(
@@ -149,7 +165,7 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
         # Initialize client if not already done
         if self._client is None:
             self._client = httpx.AsyncClient(
-                verify=self._ssl_context,
+                verify=self._verify,
                 timeout=timeout_request,
                 cookies=cookies,
                 headers=request_headers,
@@ -264,17 +280,18 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
 
 async def close_shared_client() -> None:
-    """Close all domain HTTP clients, cffi session, and playwright browser to release resources."""
-    global _cffi_session, _playwright_browser, _playwright_instance
+    """Close all domain HTTP clients, cffi sessions, and playwright browser to release resources."""
+    global _playwright_browser, _playwright_instance
     async with _client_lock:
         for client in list(_domain_clients.values()):
             if not client.is_closed:
                 await client.aclose()
         _domain_clients.clear()
     async with _cffi_lock:
-        if _cffi_session is not None:
-            await _cffi_session.close()
-            _cffi_session = None
+        for verify_flag, session in list(_cffi_sessions.items()):
+            if session is not None:
+                await session.close()
+                _cffi_sessions[verify_flag] = None
     async with _playwright_lock:
         if _playwright_browser is not None:
             await _playwright_browser.close()
@@ -285,20 +302,27 @@ async def close_shared_client() -> None:
 
 
 async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
-    """Close HTTP client for a specific domain. If http2 is None, closes both h1 and h2 clients."""
+    """Close pooled HTTP client(s) for a specific domain.
+
+    Closes every cached variant (verify on/off) for the requested protocol(s);
+    if http2 is None, both h1 and h2 variants are closed.
+    """
     domain = _extract_domain(url)
     async with _client_lock:
-        keys_to_close = []
         if http2 is None:
-            keys_to_close = [f"{domain}:h1", f"{domain}:h2"]
+            prefixes = (f"{domain}:h1:", f"{domain}:h2:")
         else:
-            keys_to_close = [f"{domain}:{'h2' if http2 else 'h1'}"]
+            prefixes = (f"{domain}:{'h2' if http2 else 'h1'}:",)
+
+        keys_to_close = [
+            k for k in list(_domain_clients.keys())
+            if k.startswith(prefixes)
+        ]
 
         for key in keys_to_close:
-            if key in _domain_clients:
-                if not _domain_clients[key].is_closed:
-                    await _domain_clients[key].aclose()
-                del _domain_clients[key]
+            if not _domain_clients[key].is_closed:
+                await _domain_clients[key].aclose()
+            del _domain_clients[key]
 
 
 async def make_request(
@@ -345,7 +369,7 @@ async def make_request(
         )
         client = own_client
     else:
-        client = await _get_domain_client(url, http2=http2)
+        client = await _get_domain_client(url, http2=http2, verify_ssl=verify_ssl)
 
     # Prepare headers
     request_headers = headers.copy() if headers else {}
@@ -461,7 +485,7 @@ async def make_request(
             await own_client.aclose()
 
 
-_cffi_session: Optional[AsyncSession] = None
+_cffi_sessions: Dict[bool, Optional[AsyncSession]] = {True: None, False: None}
 _cffi_lock = asyncio.Lock()
 
 _playwright_browser = None
@@ -469,17 +493,20 @@ _playwright_instance = None
 _playwright_lock = asyncio.Lock()
 
 
-async def _get_session_cffi() -> AsyncSession:
-    """Get or create cached curl_cffi session with browser impersonation."""
-    global _cffi_session
+async def _get_session_cffi(verify_ssl: bool = False) -> AsyncSession:
+    """Get or create cached curl_cffi session with browser impersonation.
+
+    Two sessions are cached (verify on/off) so callers that opt into TLS
+    verification get a separate session from the insecure default.
+    """
     async with _cffi_lock:
-        if _cffi_session is None:
-            _cffi_session = AsyncSession(
+        if _cffi_sessions[verify_ssl] is None:
+            _cffi_sessions[verify_ssl] = AsyncSession(
                 impersonate="chrome",
                 timeout=30,
-                verify=False,
+                verify=verify_ssl,
             )
-        return _cffi_session
+        return _cffi_sessions[verify_ssl]
 
 
 async def make_request_cffi(
@@ -496,6 +523,7 @@ async def make_request_cffi(
     no_retry_status_codes: Optional[list[int]] = None,
     exception_sleep: float = 5,
     jitter: float = 0.1,
+    verify_ssl: bool = False,
 ) -> Optional[Response]:
     """HTTP client using curl_cffi for browser TLS impersonation.
 
@@ -503,7 +531,7 @@ async def make_request_cffi(
     (Cloudflare, Wix, Akamai, etc.). Returns the same Response object as
     make_request for drop-in compatibility.
     """
-    session = await _get_session_cffi()
+    session = await _get_session_cffi(verify_ssl=verify_ssl)
 
     for attempt in range(max_attempt):
         try:
