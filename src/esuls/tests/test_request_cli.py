@@ -13,6 +13,8 @@ from esuls.request_cli import (
     _get_user_agent,
     _extract_domain,
     _apply_jitter,
+    _get_domain_client,
+    _req_loop_state,
 )
 
 
@@ -191,17 +193,19 @@ async def test_make_request_no_retry_status():
 
 
 async def test_close_shared_client():
-    """Test close_shared_client cleans up all clients."""
+    """Test close_shared_client cleans up the current loop's clients."""
     mock_client = AsyncMock()
     mock_client.is_closed = False
 
-    with patch.dict(
-        "esuls.request_cli._domain_clients",
-        {"https://a.com:h2": mock_client},
-        clear=True,
-    ):
+    state = _req_loop_state()
+    state["domain_clients"]["https://a.com:h2:nv"] = mock_client
+    try:
         await close_shared_client()
         mock_client.aclose.assert_awaited_once()
+        assert "https://a.com:h2:nv" not in state["domain_clients"]
+    finally:
+        # Defensive: ensure no leak even if assertion fails
+        state["domain_clients"].pop("https://a.com:h2:nv", None)
     print("  [PASS] close_shared_client")
 
 

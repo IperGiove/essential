@@ -4,6 +4,7 @@ import ast
 import json
 import re
 import threading
+import weakref
 import dataclasses
 from datetime import datetime, date
 from pathlib import Path
@@ -23,6 +24,38 @@ def _validate_identifier(name: str) -> str:
     if not _VALID_IDENTIFIER.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return name
+
+
+# ─── per-loop registry ────────────────────────────────────────────────────
+#
+# asyncio.Lock and aiosqlite.Connection both bind to the running event loop
+# on first use; sharing them across loops raises 'bound to a different event
+# loop' or causes futures to be scheduled on the wrong loop. This affects
+# any code that calls asyncio.run() more than once in a process (CLI scripts
+# that retry, pytest-asyncio with function-scoped loops, embedding via
+# anyio, multi-tenant servers).
+#
+# We keep a per-loop dict of asyncio primitives in a WeakKeyDictionary keyed
+# by the loop object. When a loop is garbage-collected, its entry is dropped
+# automatically — no manual cleanup, no lingering references.
+
+_db_state_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict]" = weakref.WeakKeyDictionary()
+_db_state_guard = threading.Lock()
+
+
+def _db_loop_state() -> dict:
+    """Return per-loop state: write locks, schema-init lock, initialized set."""
+    loop = asyncio.get_running_loop()
+    with _db_state_guard:
+        state = _db_state_by_loop.get(loop)
+        if state is None:
+            state = {
+                "locks": {},                          # db_path -> asyncio.Lock
+                "schema_init_lock": asyncio.Lock(),   # serialises schema init
+                "initialized": set(),                 # set[_db_key]
+            }
+            _db_state_by_loop[loop] = state
+        return state
 
 T = TypeVar('T')
 SchemaType = TypeVar('SchemaType', bound='BaseModel')
@@ -65,19 +98,20 @@ class BaseModel:
 
 
 class AsyncDB(Generic[SchemaType]):
-    """High-performance async SQLite with dataclass schema and reliable connection handling."""
+    """High-performance async SQLite with dataclass schema and reliable connection handling.
+
+    Locks and the cached connection are scoped to the running event loop:
+    multiple `asyncio.run()` invocations against the same AsyncDB instance
+    (or against different instances pointing at the same db file) will
+    re-acquire fresh asyncio primitives in the new loop instead of
+    crashing with `bound to a different event loop`.
+    """
 
     OPERATOR_MAP = {
         'gt': '>', 'lt': '<', 'gte': '>=', 'lte': '<=',
         'neq': '!=', 'like': 'LIKE', 'in': 'IN', 'eq': '='
     }
 
-    # Shared write locks per database file (class-level)
-    _db_locks: dict[str, asyncio.Lock] = {}
-    # Lock for schema initialization (class-level)
-    _schema_init_lock: asyncio.Lock = None
-    # Threading lock to guard class-level dict mutations
-    _db_locks_guard = threading.Lock()
     def __init__(self, db_path: Union[str, Path], table_name: str, schema_class: Type[SchemaType]):
         """Initialize AsyncDB with a path and schema dataclass."""
         if not is_dataclass(schema_class):
@@ -113,31 +147,54 @@ class AsyncDB(Generic[SchemaType]):
         # Make schema initialization unique per instance
         self._db_key = f"{str(self.db_path)}:{self.table_name}:{self.schema_class.__name__}"
 
-        # Use shared lock per database file (not per instance)
-        db_path_str = str(self.db_path)
-        with AsyncDB._db_locks_guard:
-            if db_path_str not in AsyncDB._db_locks:
-                AsyncDB._db_locks[db_path_str] = asyncio.Lock()
-            self._write_lock = AsyncDB._db_locks[db_path_str]
+        # Write lock is acquired per running loop via _get_write_lock();
+        # see _db_loop_state() at module level for the registry semantics.
 
         self._type_hints = get_type_hints(schema_class)
 
-        # Persistent connection (lazy init)
+        # Persistent connection (lazy init); _connection_loop tracks the
+        # event loop in which it was opened. A cross-loop reuse drops the
+        # stale connection so a fresh one is opened in the current loop.
         self._connection: Optional[aiosqlite.Connection] = None
+        self._connection_loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Use a class-level set to track initialized schemas
-        if not hasattr(AsyncDB, '_initialized_schemas'):
-            AsyncDB._initialized_schemas = set()
+    async def _get_write_lock(self) -> asyncio.Lock:
+        """Return the write lock for this db file in the current loop.
+
+        All AsyncDB instances pointing at the same db_path within the same
+        loop share one Lock, so writes against a single SQLite file are
+        serialised in-process before SQLite has to. Different loops get
+        different Lock objects (otherwise they would clash on first
+        contention with `bound to a different event loop`).
+        """
+        state = _db_loop_state()
+        locks = state["locks"]
+        key = str(self.db_path)
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
     
     async def _ensure_connection(self, max_retries: int = 5) -> aiosqlite.Connection:
-        """Return the persistent connection, creating it on first call with retry logic."""
-        if self._connection is not None:
-            return self._connection
+        """Return the persistent connection, creating it on first call with retry logic.
 
-        # Ensure schema init lock exists (lazy init for asyncio compatibility)
-        with AsyncDB._db_locks_guard:
-            if AsyncDB._schema_init_lock is None:
-                AsyncDB._schema_init_lock = asyncio.Lock()
+        If a cached connection is present but bound to a different (likely
+        defunct) event loop, it is silently dropped and a fresh connection
+        is opened in the current loop. We don't try to close the stale
+        connection — closing requires the original loop, which is gone.
+        """
+        loop = asyncio.get_running_loop()
+        if self._connection is not None:
+            if self._connection_loop is loop:
+                return self._connection
+            # Cross-loop reuse: drop without close (the original loop is gone).
+            self._connection = None
+            self._connection_loop = None
+
+        state = _db_loop_state()
+        schema_init_lock: asyncio.Lock = state["schema_init_lock"]
+        initialized: set = state["initialized"]
 
         last_error = None
         for attempt in range(max_retries):
@@ -159,14 +216,15 @@ class AsyncDB(Generic[SchemaType]):
                 await db.execute("PRAGMA busy_timeout=30000")  # 30s busy timeout
 
                 # Initialize schema if needed (with lock to prevent race condition)
-                if self._db_key not in AsyncDB._initialized_schemas:
-                    async with AsyncDB._schema_init_lock:
+                if self._db_key not in initialized:
+                    async with schema_init_lock:
                         # Double-check after acquiring lock
-                        if self._db_key not in AsyncDB._initialized_schemas:
+                        if self._db_key not in initialized:
                             await self._init_schema(db)
-                            AsyncDB._initialized_schemas.add(self._db_key)
+                            initialized.add(self._db_key)
 
                 self._connection = db
+                self._connection_loop = loop
                 return db
             except Exception as e:
                 last_error = e
@@ -192,6 +250,7 @@ class AsyncDB(Generic[SchemaType]):
             except Exception:
                 pass
             self._connection = None
+            self._connection_loop = None
 
     async def _init_schema(self, db: aiosqlite.Connection) -> None:
         """Generate schema from dataclass structure with support for field additions."""
@@ -499,7 +558,8 @@ class AsyncDB(Generic[SchemaType]):
         for attempt in range(max_retries):
             try:
                 saved_count = 0
-                async with self._write_lock:
+                write_lock = await self._get_write_lock()
+                async with write_lock:
                     async with self.transaction() as db:
                         for item in items:
                             try:
@@ -580,7 +640,8 @@ class AsyncDB(Generic[SchemaType]):
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    async with self._write_lock:
+                    write_lock = await self._get_write_lock()
+                    async with write_lock:
                         async with self.transaction() as db:
                             await db.execute(sql, values)
                     break
@@ -734,7 +795,8 @@ class AsyncDB(Generic[SchemaType]):
     
     async def delete(self, id: str) -> bool:
         """Delete an item by ID with reliable transaction handling."""
-        async with self._write_lock:
+        write_lock = await self._get_write_lock()
+        async with write_lock:
             async with self.transaction() as db:
                 cursor = await db.execute(f"DELETE FROM {self.table_name} WHERE id = ?", (id,))
                 return cursor.rowcount > 0
@@ -748,7 +810,8 @@ class AsyncDB(Generic[SchemaType]):
         if not filters:
             raise ValueError("delete_many() requires at least one filter to prevent accidental full table delete")
         where_clause, values = self._build_where_clause(filters)
-        async with self._write_lock:
+        write_lock = await self._get_write_lock()
+        async with write_lock:
             async with self.transaction() as db:
                 cursor = await db.execute(f"DELETE FROM {self.table_name} {where_clause}", values)
                 return cursor.rowcount
@@ -761,7 +824,8 @@ class AsyncDB(Generic[SchemaType]):
         set_clause = ', '.join(f"{self._validate_column(k)} = ?" for k in fields)
         values = [self._serialize_value(v) for v in fields.values()]
         values.append(id)
-        async with self._write_lock:
+        write_lock = await self._get_write_lock()
+        async with write_lock:
             async with self.transaction() as db:
                 cursor = await db.execute(
                     f"UPDATE {self.table_name} SET {set_clause} WHERE id = ?", values

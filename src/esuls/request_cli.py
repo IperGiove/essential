@@ -7,6 +7,8 @@ import asyncio
 import json
 import random
 import ssl
+import threading
+import weakref
 from loguru import logger
 import httpx
 from fake_useragent import UserAgent
@@ -25,18 +27,49 @@ _FALLBACK_USER_AGENT = (
 )
 _SUCCESS_STATUS_RANGE = range(200, 300)
 
-# Global connection pool per domain to prevent "Too many open files" error
-_domain_clients: Dict[str, httpx.AsyncClient] = {}
-_client_lock = asyncio.Lock()
 
-# Global cached UserAgent to prevent file descriptor exhaustion
+# ─── per-loop registry ────────────────────────────────────────────────────
+#
+# httpx.AsyncClient, curl_cffi.AsyncSession, and Playwright browsers are all
+# bound to the event loop they were created in: reuse from another loop
+# fails (asyncio.Lock raises 'bound to a different event loop'; httpx
+# schedules futures on the dead loop and hangs/raises). Storing every
+# loop-bound resource in a per-loop dict (keyed by the loop in a
+# WeakKeyDictionary) lets a process safely call `asyncio.run()` more than
+# once and lets each loop have its own pool.
+
+_req_state_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict]" = weakref.WeakKeyDictionary()
+_req_state_guard = threading.Lock()
+
+
+def _req_loop_state() -> dict:
+    """Return per-loop state: client lock+pool, cffi sessions, playwright."""
+    loop = asyncio.get_running_loop()
+    with _req_state_guard:
+        state = _req_state_by_loop.get(loop)
+        if state is None:
+            state = {
+                "client_lock": asyncio.Lock(),
+                "domain_clients": {},                 # cache_key -> httpx.AsyncClient
+                "cffi_lock": asyncio.Lock(),
+                "cffi_sessions": {True: None, False: None},
+                "playwright_lock": asyncio.Lock(),
+                "playwright_browser": None,
+                "playwright_instance": None,
+            }
+            _req_state_by_loop[loop] = state
+        return state
+
+
+# fake_useragent.UserAgent is a sync object with no event-loop binding,
+# so its cache stays global and is guarded by a plain threading.Lock.
 _user_agent_cache: Dict[str, Optional[UserAgent]] = {"instance": None}
-_user_agent_lock = asyncio.Lock()
+_user_agent_lock = threading.Lock()
 
 
 async def _get_user_agent() -> str:
     """Get or create cached UserAgent instance to avoid file descriptor leaks."""
-    async with _user_agent_lock:
+    with _user_agent_lock:
         if _user_agent_cache["instance"] is None:
             try:
                 _user_agent_cache["instance"] = UserAgent()
@@ -82,17 +115,21 @@ async def _get_domain_client(
 ) -> httpx.AsyncClient:
     """Get or create HTTP client for a specific domain with connection pooling.
 
-    The pool is keyed by (domain, http2, verify_ssl) so callers that opt into
-    real TLS verification get a separate client from the insecure default.
+    The pool is keyed by (domain, http2, verify_ssl) per running event loop,
+    so callers that opt into real TLS verification get a separate client
+    from the insecure default — and clients from a previous (dead) loop are
+    never reused.
     """
+    state = _req_loop_state()
     domain = _extract_domain(url)
     cache_key = f"{domain}:{'h2' if http2 else 'h1'}:{'v' if verify_ssl else 'nv'}"
-    async with _client_lock:
-        if cache_key not in _domain_clients or _domain_clients[cache_key].is_closed:
+    async with state["client_lock"]:
+        clients: Dict[str, httpx.AsyncClient] = state["domain_clients"]
+        if cache_key not in clients or clients[cache_key].is_closed:
             verify: Union[bool, ssl.SSLContext] = (
                 True if verify_ssl else _create_optimized_ssl_context()
             )
-            _domain_clients[cache_key] = httpx.AsyncClient(
+            clients[cache_key] = httpx.AsyncClient(
                 verify=verify,
                 timeout=60,
                 follow_redirects=True,
@@ -103,7 +140,7 @@ async def _get_domain_client(
                     keepalive_expiry=30.0
                 )
             )
-        return _domain_clients[cache_key]
+        return clients[cache_key]
 
 
 @dataclass(frozen=True)
@@ -280,49 +317,54 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
 
 async def close_shared_client() -> None:
-    """Close all domain HTTP clients, cffi sessions, and playwright browser to release resources."""
-    global _playwright_browser, _playwright_instance
-    async with _client_lock:
-        for client in list(_domain_clients.values()):
+    """Close all per-loop resources (HTTP clients, cffi sessions, playwright browser)
+    bound to the *current* event loop. Resources owned by other loops (if any) are
+    untouched and will be GC'd with the loop they belong to.
+    """
+    state = _req_loop_state()
+    async with state["client_lock"]:
+        for client in list(state["domain_clients"].values()):
             if not client.is_closed:
                 await client.aclose()
-        _domain_clients.clear()
-    async with _cffi_lock:
-        for verify_flag, session in list(_cffi_sessions.items()):
+        state["domain_clients"].clear()
+    async with state["cffi_lock"]:
+        for verify_flag, session in list(state["cffi_sessions"].items()):
             if session is not None:
                 await session.close()
-                _cffi_sessions[verify_flag] = None
-    async with _playwright_lock:
-        if _playwright_browser is not None:
-            await _playwright_browser.close()
-            _playwright_browser = None
-        if _playwright_instance is not None:
-            await _playwright_instance.stop()
-            _playwright_instance = None
+                state["cffi_sessions"][verify_flag] = None
+    async with state["playwright_lock"]:
+        if state["playwright_browser"] is not None:
+            await state["playwright_browser"].close()
+            state["playwright_browser"] = None
+        if state["playwright_instance"] is not None:
+            await state["playwright_instance"].stop()
+            state["playwright_instance"] = None
 
 
 async def close_domain_client(url: str, http2: Optional[bool] = None) -> None:
-    """Close pooled HTTP client(s) for a specific domain.
+    """Close pooled HTTP client(s) for a specific domain in the current loop.
 
     Closes every cached variant (verify on/off) for the requested protocol(s);
     if http2 is None, both h1 and h2 variants are closed.
     """
+    state = _req_loop_state()
     domain = _extract_domain(url)
-    async with _client_lock:
+    async with state["client_lock"]:
+        clients: Dict[str, httpx.AsyncClient] = state["domain_clients"]
         if http2 is None:
             prefixes = (f"{domain}:h1:", f"{domain}:h2:")
         else:
             prefixes = (f"{domain}:{'h2' if http2 else 'h1'}:",)
 
         keys_to_close = [
-            k for k in list(_domain_clients.keys())
+            k for k in list(clients.keys())
             if k.startswith(prefixes)
         ]
 
         for key in keys_to_close:
-            if not _domain_clients[key].is_closed:
-                await _domain_clients[key].aclose()
-            del _domain_clients[key]
+            if not clients[key].is_closed:
+                await clients[key].aclose()
+            del clients[key]
 
 
 async def make_request(
@@ -485,28 +527,22 @@ async def make_request(
             await own_client.aclose()
 
 
-_cffi_sessions: Dict[bool, Optional[AsyncSession]] = {True: None, False: None}
-_cffi_lock = asyncio.Lock()
-
-_playwright_browser = None
-_playwright_instance = None
-_playwright_lock = asyncio.Lock()
-
-
 async def _get_session_cffi(verify_ssl: bool = False) -> AsyncSession:
-    """Get or create cached curl_cffi session with browser impersonation.
+    """Get or create cached curl_cffi session for the current event loop.
 
-    Two sessions are cached (verify on/off) so callers that opt into TLS
-    verification get a separate session from the insecure default.
+    Two sessions are cached per loop (verify on/off) so callers that opt
+    into TLS verification get a separate session from the insecure default.
     """
-    async with _cffi_lock:
-        if _cffi_sessions[verify_ssl] is None:
-            _cffi_sessions[verify_ssl] = AsyncSession(
+    state = _req_loop_state()
+    async with state["cffi_lock"]:
+        sessions: Dict[bool, Optional[AsyncSession]] = state["cffi_sessions"]
+        if sessions[verify_ssl] is None:
+            sessions[verify_ssl] = AsyncSession(
                 impersonate="chrome",
                 timeout=30,
                 verify=verify_ssl,
             )
-        return _cffi_sessions[verify_ssl]
+        return sessions[verify_ssl]
 
 
 async def make_request_cffi(
@@ -586,13 +622,13 @@ async def make_request_cffi(
 
 
 async def _get_playwright_browser():
-    """Get or create cached Playwright Chromium browser."""
-    global _playwright_browser, _playwright_instance
-    async with _playwright_lock:
-        if _playwright_browser is None:
+    """Get or create cached Playwright Chromium browser for the current loop."""
+    state = _req_loop_state()
+    async with state["playwright_lock"]:
+        if state["playwright_browser"] is None:
             from playwright.async_api import async_playwright
-            _playwright_instance = await async_playwright().start()
-            _playwright_browser = await _playwright_instance.chromium.launch(
+            state["playwright_instance"] = await async_playwright().start()
+            state["playwright_browser"] = await state["playwright_instance"].chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
@@ -600,7 +636,7 @@ async def _get_playwright_browser():
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
-        return _playwright_browser
+        return state["playwright_browser"]
 
 
 async def make_request_playwright(
