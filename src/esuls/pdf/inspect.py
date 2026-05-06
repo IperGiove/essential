@@ -134,9 +134,25 @@ def read_pdf_dynamic(pdf_path: Union[str, Path]) -> dict:
     }
 
 
+_PDF_DATE_FORMATS = {
+    14: "%Y%m%d%H%M%S",
+    12: "%Y%m%d%H%M",
+    10: "%Y%m%d%H",
+    8: "%Y%m%d",
+    6: "%Y%m",
+    4: "%Y",
+}
+
+
 def parse_pdf_date(s: Optional[str]) -> Optional[datetime]:
     """Parse a PDF date string `D:YYYYMMDDHHMMSS+ZZ'ZZ'` to a naive datetime
-    (timezone offset stripped, since this is used only for ordering checks)."""
+    (timezone offset stripped, since this is used only for ordering checks).
+
+    The format is selected by the length of the date prefix. PDF dates are
+    fixed-width per spec, and length-keyed dispatch avoids strptime greedy
+    matches like `%Y%m%d%H` accepting 8-char `YYYYMMDD` strings as
+    `year=YYYY, month=Y, day=Y, hour=YY` on lenient implementations.
+    """
     if not s:
         return None
     s = str(s)
@@ -148,9 +164,10 @@ def parse_pdf_date(s: Optional[str]) -> Optional[datetime]:
         if sep in base[8:]:
             base = base.split(sep, 1)[0]
             break
-    for fmt in ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y%m%d%H", "%Y%m%d", "%Y%m", "%Y"):
-        try:
-            return datetime.strptime(base, fmt)
-        except ValueError:
-            continue
-    return None
+    fmt = _PDF_DATE_FORMATS.get(len(base))
+    if fmt is None:
+        return None
+    try:
+        return datetime.strptime(base, fmt)
+    except ValueError:
+        return None
