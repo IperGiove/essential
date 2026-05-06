@@ -92,6 +92,15 @@ class AsyncDB(Generic[SchemaType]):
         for f in fields(schema_class):
             _validate_identifier(f.name)
 
+        # Collect columns that can be used as upsert conflict targets:
+        # any field flagged primary_key=True or unique=True. Used by save()
+        # / save_batch() to validate the `on_conflict` argument up-front and
+        # to surface typos as a ValueError instead of an opaque SQL error.
+        self._conflict_targets: set[str] = {
+            f.name for f in fields(schema_class)
+            if f.metadata.get('primary_key') or f.metadata.get('unique')
+        }
+
         # Make schema initialization unique per instance
         self._db_key = f"{str(self.db_path)}:{self.table_name}:{self.schema_class.__name__}"
 
@@ -372,19 +381,41 @@ class AsyncDB(Generic[SchemaType]):
         return value
     
     @lru_cache(maxsize=64)
-    def _generate_save_sql(self, field_names: Tuple[str, ...]) -> str:
-        """Generate efficient SQL for upsert with proper conflict handling."""
+    def _generate_save_sql(
+        self,
+        field_names: Tuple[str, ...],
+        conflict_target: Union[str, Tuple[str, ...]] = "id",
+    ) -> str:
+        """Generate INSERT ... ON CONFLICT(...) DO UPDATE SQL.
+
+        `conflict_target` selects the UNIQUE / PRIMARY KEY column(s) on
+        which a duplicate triggers the UPDATE branch. Defaults to 'id'.
+        Pass a tuple for composite UNIQUE constraints.
+
+        On UPDATE we refresh every column except `created_at`, so the
+        original row's creation timestamp is preserved across updates.
+        """
         columns = ','.join(field_names)
         placeholders = ','.join('?' for _ in field_names)
 
         set_clause = ','.join(f'{col}=excluded.{col}' for col in field_names if col != 'created_at')
+
+        if isinstance(conflict_target, str):
+            conflict_cols = conflict_target
+        else:
+            conflict_cols = ','.join(conflict_target)
+
         return f"""
             INSERT INTO {self.table_name} ({columns},id)
             VALUES ({placeholders},?)
-            ON CONFLICT(id) DO UPDATE SET {set_clause}
+            ON CONFLICT({conflict_cols}) DO UPDATE SET {set_clause}
         """
-    
-    def _prepare_item(self, item: SchemaType) -> Tuple[str, List[Any]]:
+
+    def _prepare_item(
+        self,
+        item: SchemaType,
+        conflict_target: Union[str, Tuple[str, ...]] = "id",
+    ) -> Tuple[str, List[Any]]:
         """Prepare an item for saving. Returns (sql, values)."""
         data = asdict(item)
         item_id = data.pop('id', None) or str(uuid.uuid4())
@@ -393,23 +424,65 @@ class AsyncDB(Generic[SchemaType]):
             data['created_at'] = now
         data['updated_at'] = now
         field_names = tuple(sorted(data.keys()))
-        sql = self._generate_save_sql(field_names)
+        sql = self._generate_save_sql(field_names, conflict_target=conflict_target)
         values = [self._serialize_value(data[name]) for name in field_names]
         values.append(item_id)
         return sql, values
 
-    async def save_batch(self, items: List[SchemaType], skip_errors: bool = True) -> int:
-        """Save multiple items in a single transaction for better performance.
+    def _resolve_conflict_target(
+        self,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]],
+    ) -> Union[str, Tuple[str, ...]]:
+        """Validate and normalize an `on_conflict` argument.
+
+        Returns 'id' when on_conflict is None (legacy upsert-by-primary-key
+        behaviour). Otherwise verifies every column is declared as
+        primary_key or unique on the schema and returns it normalized.
+        """
+        if on_conflict is None:
+            return "id"
+        if isinstance(on_conflict, str):
+            targets = (on_conflict,)
+        else:
+            targets = tuple(on_conflict)
+        unknown = [c for c in targets if c not in self._conflict_targets]
+        if unknown:
+            raise ValueError(
+                f"on_conflict={on_conflict!r}: column(s) {unknown} are not declared "
+                f"primary_key=True or unique=True on {self.schema_class.__name__}. "
+                f"Available conflict targets: {sorted(self._conflict_targets)}"
+            )
+        return targets[0] if len(targets) == 1 else targets
+
+    async def save_batch(
+        self,
+        items: List[SchemaType],
+        skip_errors: bool = True,
+        *,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
+    ) -> int:
+        """Save multiple items atomically in a single transaction.
+
+        Each row is upserted via INSERT ... ON CONFLICT(...) DO UPDATE.
 
         Args:
-            items: List of schema objects to save
-            skip_errors: If True, skip items that cause errors
+            items: List of schema objects to save.
+            skip_errors: If True, skip items that cause errors and continue.
+            on_conflict: Column (or tuple of columns) used as the conflict
+                target. Must reference columns declared primary_key=True or
+                unique=True on the schema. Defaults to the primary key
+                ('id'), making save_batch() idempotent on retries. Use a
+                natural key (e.g. on_conflict='external_id') to make the
+                upsert race-free against concurrent writers identifying
+                rows by that key.
 
         Returns:
-            Number of items successfully saved
+            Number of items successfully saved.
         """
         if not items:
             return 0
+
+        conflict_target = self._resolve_conflict_target(on_conflict)
 
         saved_count = 0
 
@@ -426,7 +499,7 @@ class AsyncDB(Generic[SchemaType]):
                                         raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
                                     continue
 
-                                sql, values = self._prepare_item(item)
+                                sql, values = self._prepare_item(item, conflict_target=conflict_target)
                                 await db.execute(sql, values)
                                 saved_count += 1
 
@@ -446,15 +519,36 @@ class AsyncDB(Generic[SchemaType]):
 
         return saved_count
 
-    async def save(self, item: SchemaType, skip_errors: bool = True) -> bool:
-        """Store a schema object with upsert functionality and error handling.
+    async def save(
+        self,
+        item: SchemaType,
+        skip_errors: bool = True,
+        *,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
+    ) -> bool:
+        """Atomically insert or update a schema object.
+
+        Implemented as INSERT ... ON CONFLICT(...) DO UPDATE, so it is
+        race-free against concurrent writers as long as the conflict
+        target is the same key the caller uses to identify the row.
 
         Args:
-            item: The schema object to save
-            skip_errors: If True, silently skip errors and return False. If False, raise errors.
+            item: The schema object to save.
+            skip_errors: If True, silently skip errors and return False.
+                If False, raise errors.
+            on_conflict: Column (or tuple of columns) used as the conflict
+                target. Must reference columns declared primary_key=True or
+                unique=True on the schema. Defaults to the primary key
+                ('id'), making save() idempotent on retries. Use a natural
+                key (e.g. on_conflict='external_id') when the application
+                identifies rows by a field other than id; this makes the
+                upsert atomic and prevents UNIQUE-constraint races where
+                two callers concurrently try to insert the same logical
+                row with different ids.
 
         Returns:
-            True if save was successful, False if error occurred and skip_errors=True
+            True if save was successful, False if error occurred and
+            skip_errors=True.
         """
         try:
             if not isinstance(item, self.schema_class):
@@ -462,7 +556,8 @@ class AsyncDB(Generic[SchemaType]):
                     return False
                 raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
 
-            sql, values = self._prepare_item(item)
+            conflict_target = self._resolve_conflict_target(on_conflict)
+            sql, values = self._prepare_item(item, conflict_target=conflict_target)
 
             # Perform save with reliable transaction (retry on "database is locked")
             max_retries = 3
