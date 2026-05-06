@@ -92,6 +92,15 @@ class AsyncDB(Generic[SchemaType]):
         for f in fields(schema_class):
             _validate_identifier(f.name)
 
+        # Whitelist of column names declared on the schema. Used by
+        # _validate_column() to gate every column name interpolated into SQL
+        # at runtime (where-clause keys, order_by, update_fields kwargs), so
+        # untrusted inputs cannot smuggle arbitrary identifiers — even if
+        # they happen to match the safe-identifier regex.
+        self._valid_columns: frozenset[str] = frozenset(
+            f.name for f in fields(schema_class)
+        )
+
         # Collect columns that can be used as upsert conflict targets:
         # any field flagged primary_key=True or unique=True. Used by save()
         # / save_batch() to validate the `on_conflict` argument up-front and
@@ -289,7 +298,14 @@ class AsyncDB(Generic[SchemaType]):
     
     @contextlib.asynccontextmanager
     async def transaction(self):
-        """Run operations in a transaction with reliable cleanup and auto-reconnect."""
+        """Run operations in a transaction, rolling back on error.
+
+        On a stale-connection error ("connection is closed", "no active
+        connection") the cached connection is cleared so the next call to
+        `_ensure_connection()` reopens it. Auto-retry is the caller's
+        responsibility — write paths (save/save_batch) wrap this in a
+        retry loop; read paths surface the error to the caller.
+        """
         db = await self._ensure_connection()
         try:
             yield db
@@ -299,17 +315,10 @@ class AsyncDB(Generic[SchemaType]):
                 await db.rollback()
             except Exception:
                 pass
-            if "closed" in str(e).lower() or "no active connection" in str(e).lower():
+            msg = str(e).lower()
+            if "closed" in msg or "no active connection" in msg:
                 self._connection = None
-                db = await self._ensure_connection()
-                try:
-                    yield db
-                    await db.commit()
-                except Exception:
-                    await db.rollback()
-                    raise
-            else:
-                raise
+            raise
     
     # @lru_cache(maxsize=128)
     def _serialize_value(self, value: Any) -> Any:
@@ -510,11 +519,18 @@ class AsyncDB(Generic[SchemaType]):
                                 raise
                 break
             except Exception as e:
-                if "database is locked" in str(e) and attempt < max_retries - 1:
-                    wait_time = 0.2 * (2 ** attempt)
-                    logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
-                    await asyncio.sleep(wait_time)
-                    continue
+                err = str(e).lower()
+                if attempt < max_retries - 1:
+                    if "database is locked" in err:
+                        wait_time = 0.2 * (2 ** attempt)
+                        logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    if "closed" in err or "no active connection" in err:
+                        # transaction() already cleared self._connection;
+                        # next iteration will reopen via _ensure_connection.
+                        logger.debug(f"Stale connection, reconnecting (retry {attempt + 1}/{max_retries})")
+                        continue
                 raise
 
         return saved_count
@@ -559,7 +575,8 @@ class AsyncDB(Generic[SchemaType]):
             conflict_target = self._resolve_conflict_target(on_conflict)
             sql, values = self._prepare_item(item, conflict_target=conflict_target)
 
-            # Perform save with reliable transaction (retry on "database is locked")
+            # Perform save with reliable transaction (retry on "database is
+            # locked" and on stale-connection errors).
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -568,11 +585,16 @@ class AsyncDB(Generic[SchemaType]):
                             await db.execute(sql, values)
                     break
                 except Exception as e:
-                    if "database is locked" in str(e) and attempt < max_retries - 1:
-                        wait_time = 0.2 * (2 ** attempt)
-                        logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
-                        await asyncio.sleep(wait_time)
-                        continue
+                    err = str(e).lower()
+                    if attempt < max_retries - 1:
+                        if "database is locked" in err:
+                            wait_time = 0.2 * (2 ** attempt)
+                            logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        if "closed" in err or "no active connection" in err:
+                            logger.debug(f"Stale connection, reconnecting (retry {attempt + 1}/{max_retries})")
+                            continue
                     raise
 
             return True
@@ -599,22 +621,40 @@ class AsyncDB(Generic[SchemaType]):
                 for i, col in enumerate(columns)
             })
     
+    def _validate_column(self, name: str) -> str:
+        """Ensure `name` is a column declared on the schema.
+
+        This is the runtime gate for every column identifier interpolated
+        into SQL (where-clause keys, order_by, update_fields kwargs). A
+        permissive regex is not enough because an attacker-controlled but
+        regex-safe name like `id; ATTACH DATABASE` could still target the
+        wrong column or be appended to crafted SQL fragments downstream.
+        Whitelisting against the schema makes the column reference
+        provably safe.
+        """
+        if name not in self._valid_columns:
+            raise ValueError(
+                f"Unknown column {name!r} on {self.schema_class.__name__}. "
+                f"Valid columns: {sorted(self._valid_columns)}"
+            )
+        return name
+
     def _build_where_clause(self, filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
         """Build optimized WHERE clause for queries."""
         if not filters:
             return "", []
-            
+
         conditions = []
         values = []
-        
+
         for key, value in filters.items():
             # Parse field and operator
             parts = key.split('__', 1)
-            field = parts[0]
-            
+            field = self._validate_column(parts[0])
+
             if len(parts) > 1 and parts[1] in self.OPERATOR_MAP:
                 op_str = self.OPERATOR_MAP[parts[1]]
-                
+
                 # Handle IN operator specially
                 if op_str == 'IN' and isinstance(value, (list, tuple)):
                     placeholders = ','.join(['?'] * len(value))
@@ -627,7 +667,7 @@ class AsyncDB(Generic[SchemaType]):
                 # Default to equality
                 conditions.append(f"{field} = ?")
                 values.append(value)
-                
+
         return f"WHERE {' AND '.join(conditions)}", values
     
     async def find(self, order_by=None, limit: int = None, offset: int = None, **filters) -> List[SchemaType]:
@@ -640,10 +680,14 @@ class AsyncDB(Generic[SchemaType]):
         # Add ORDER BY clause if specified
         if order_by:
             order_fields = [order_by] if isinstance(order_by, str) else order_by
-            order_clauses = [
-                f"{field[1:]} DESC" if field.startswith('-') else f"{field} ASC"
-                for field in order_fields
-            ]
+            order_clauses = []
+            for entry in order_fields:
+                if entry.startswith('-'):
+                    col = self._validate_column(entry[1:])
+                    order_clauses.append(f"{col} DESC")
+                else:
+                    col = self._validate_column(entry)
+                    order_clauses.append(f"{col} ASC")
             query += f" ORDER BY {', '.join(order_clauses)}"
 
         # Add LIMIT/OFFSET (SQLite requires LIMIT before OFFSET)
@@ -714,7 +758,7 @@ class AsyncDB(Generic[SchemaType]):
         if not fields:
             return False
         fields['updated_at'] = datetime.now()
-        set_clause = ', '.join(f"{_validate_identifier(k)} = ?" for k in fields)
+        set_clause = ', '.join(f"{self._validate_column(k)} = ?" for k in fields)
         values = [self._serialize_value(v) for v in fields.values()]
         values.append(id)
         async with self._write_lock:
