@@ -9,11 +9,10 @@ from .checker import PdfReport, check_pdf
 from .inspect import read_pdf_dynamic, read_pdf_revisions, read_pdf_summary
 from .metadata import (
     _normalize_key,
+    edit_pdf_metadata,
     find_non_standard_metadata,
     read_pdf_metadata,
     read_pdf_xmp,
-    remove_pdf_metadata,
-    update_pdf_metadata,
 )
 
 
@@ -106,36 +105,15 @@ def edit_cmd(file, set_pairs, unset_keys, output, inplace,
         updates[_normalize_key(k)] = v
     drops = [_normalize_key(k) for k in unset_keys]
 
-    update_mod_date = not no_mod_date
-    current = Path(file)
-    out: Optional[Path] = None
-
-    if updates:
-        out = update_pdf_metadata(
-            current, updates,
-            output_path=output if not inplace else None,
-            inplace=inplace,
-            update_mod_date=update_mod_date,
-            keep_xmp=keep_xmp,
-        )
-        current = out
-
-    if drops:
-        if out is None:
-            out = remove_pdf_metadata(
-                current, drops,
-                output_path=output if not inplace else None,
-                inplace=inplace,
-                update_mod_date=update_mod_date,
-                keep_xmp=keep_xmp,
-            )
-        else:
-            out = remove_pdf_metadata(
-                current, drops,
-                inplace=True,
-                update_mod_date=update_mod_date,
-                keep_xmp=keep_xmp,
-            )
+    out = edit_pdf_metadata(
+        file,
+        updates=updates or None,
+        drops=drops or None,
+        output_path=output if not inplace else None,
+        inplace=inplace,
+        update_mod_date=not no_mod_date,
+        keep_xmp=keep_xmp,
+    )
 
     click.echo(f"✅ {file} → {out}")
 

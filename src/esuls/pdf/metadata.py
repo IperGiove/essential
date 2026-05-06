@@ -132,6 +132,51 @@ def replace_pdf_metadata(
     )
 
 
+def edit_pdf_metadata(
+    pdf_path: Union[str, Path],
+    updates: Optional[dict] = None,
+    drops: Optional[Iterable[str]] = None,
+    *,
+    output_path: Union[str, Path, None] = None,
+    inplace: bool = False,
+    update_mod_date: bool = True,
+    keep_xmp: bool = False,
+) -> Path:
+    """
+    Apply `updates` and `drops` to the Info dict in a single write pass.
+
+    Use this instead of chaining `update_pdf_metadata` + `remove_pdf_metadata`
+    when you need to both set and unset keys: chaining them would write the
+    PDF twice and stamp `/ModDate` twice (the second timestamp clobbering
+    the first).
+
+    `drops` wins over `updates` if the same key appears in both. `/ModDate`
+    is auto-bumped to now unless it appears in `updates`, is in `drops`, or
+    `update_mod_date=False`.
+    """
+    pdf_path = Path(pdf_path)
+    out = _resolve_output(pdf_path, output_path, inplace)
+    reader = PdfReader(str(pdf_path))
+
+    norm_updates = _normalize_metadata(updates) if updates else {}
+    to_drop = {_normalize_key(k) for k in drops} if drops else set()
+
+    final = {str(k): str(v) for k, v in (reader.metadata or {}).items()}
+    final.update(norm_updates)
+    final = {k: v for k, v in final.items() if k not in to_drop}
+
+    if (update_mod_date
+            and "/ModDate" not in norm_updates
+            and "/ModDate" not in to_drop):
+        final["/ModDate"] = _pdf_now()
+
+    return _write_with_metadata(
+        reader, final,
+        output_path=out, source_path=pdf_path, inplace=inplace,
+        keep_xmp=keep_xmp,
+    )
+
+
 def remove_pdf_metadata(
     pdf_path: Union[str, Path],
     keys: Iterable[str],

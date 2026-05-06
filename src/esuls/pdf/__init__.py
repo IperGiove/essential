@@ -25,6 +25,7 @@ from .inspect import (
 )
 from .metadata import (
     STANDARD_METADATA_KEYS,
+    edit_pdf_metadata,
     find_non_standard_metadata,
     read_pdf_metadata,
     read_pdf_xmp,
@@ -36,6 +37,7 @@ from .metadata import (
 __all__ = [
     # metadata
     "STANDARD_METADATA_KEYS",
+    "edit_pdf_metadata",
     "find_non_standard_metadata",
     "read_pdf_metadata",
     "read_pdf_xmp",
