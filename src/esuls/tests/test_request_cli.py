@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 from esuls.request_cli import (
     Response,
+    AsyncRequest,
     make_request,
     make_request_cffi,
     close_shared_client,
@@ -15,6 +16,7 @@ from esuls.request_cli import (
     _apply_jitter,
     _get_domain_client,
     _req_loop_state,
+    _run_with_retry,
 )
 
 
@@ -253,6 +255,189 @@ async def test_make_request_cffi_error():
     print("  [PASS] make_request_cffi returns None on error")
 
 
+def _make_mock_client(status_code=200, body=b"ok", text="ok"):
+    """Build a MagicMock httpx.AsyncClient that records request kwargs."""
+    captured = []
+
+    async def fake_request(method, url, **kwargs):
+        captured.append({"method": method, "url": url, **kwargs})
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.headers = {"content-type": "text/html"}
+        mock_response.content = body
+        mock_response.text = text
+        mock_response.url = url
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.request = AsyncMock(side_effect=fake_request)
+    mock_client.aclose = AsyncMock()
+    mock_client.is_closed = False
+    return mock_client, captured
+
+
+async def test_async_request_per_call_headers_cookies():
+    """REGRESSION: AsyncRequest must pass per-call headers/cookies on every
+    call. Pre-fix the values from the FIRST call were baked into the client
+    and subsequent calls' values were silently ignored.
+    """
+    mock_client, captured = _make_mock_client()
+
+    with patch(
+        "esuls.request_cli.httpx.AsyncClient",
+        return_value=mock_client,
+    ):
+        async with AsyncRequest() as req:
+            await req.request(
+                "https://example.com",
+                headers={"X-Call": "1"},
+                cookies={"session": "first"},
+                max_attempt=1, exception_sleep=0, jitter=0,
+            )
+            await req.request(
+                "https://example.com",
+                headers={"X-Call": "2"},
+                cookies={"session": "second"},
+                max_attempt=1, exception_sleep=0, jitter=0,
+            )
+
+    assert captured[0]["headers"] == {"X-Call": "1"}, captured
+    assert captured[0]["cookies"] == {"session": "first"}, captured
+    assert captured[1]["headers"] == {"X-Call": "2"}, captured
+    assert captured[1]["cookies"] == {"session": "second"}, captured
+    print("  [PASS] AsyncRequest applies per-call headers and cookies")
+
+
+async def test_async_request_proxy_uses_one_shot_client():
+    """When proxy is given, AsyncRequest creates and closes a one-shot client
+    for that call only — the persistent instance client stays untouched.
+    """
+    persistent_client, _ = _make_mock_client()
+    one_shot_client, captured = _make_mock_client()
+
+    constructed = []
+
+    def fake_constructor(*args, **kwargs):
+        constructed.append(kwargs)
+        # First call: persistent client (no proxy kwarg)
+        # Second call: one-shot client (proxy kwarg present)
+        return one_shot_client if "proxy" in kwargs else persistent_client
+
+    with patch(
+        "esuls.request_cli.httpx.AsyncClient",
+        side_effect=fake_constructor,
+    ):
+        req = AsyncRequest()
+        # First call uses persistent client (no proxy)
+        await req.request(
+            "https://example.com",
+            max_attempt=1, exception_sleep=0, jitter=0,
+        )
+        # The one-shot must NOT be closed yet (only persistent has run)
+        one_shot_client.aclose.assert_not_called()
+        persistent_client.aclose.assert_not_called()
+
+        # Second call uses one-shot client (proxy set)
+        await req.request(
+            "https://example.com",
+            proxy="http://proxy:8080",
+            max_attempt=1, exception_sleep=0, jitter=0,
+        )
+        # The one-shot is closed after its single use; persistent stays open.
+        one_shot_client.aclose.assert_awaited_once()
+        persistent_client.aclose.assert_not_called()
+
+    # Two AsyncClient instances were constructed
+    assert len(constructed) == 2, constructed
+    assert "proxy" not in constructed[0]
+    assert constructed[1].get("proxy") == "http://proxy:8080"
+    print("  [PASS] AsyncRequest with proxy creates and closes a one-shot client")
+
+
+async def test_async_request_no_retry_status_codes():
+    """AsyncRequest must support no_retry_status_codes (was missing pre-refactor)."""
+    mock_client, _ = _make_mock_client(status_code=404, body=b"nf", text="nf")
+
+    with patch(
+        "esuls.request_cli.httpx.AsyncClient",
+        return_value=mock_client,
+    ):
+        async with AsyncRequest() as req:
+            resp = await req.request(
+                "https://example.com",
+                max_attempt=5,
+                no_retry_status_codes=[404],
+                force_response=True,
+                exception_sleep=0,
+                jitter=0,
+            )
+
+    assert resp is not None and resp.status_code == 404
+    # Without no_retry_status_codes the loop would have done 5 calls;
+    # with it, it bails out after the first attempt.
+    assert mock_client.request.call_count == 1, mock_client.request.call_count
+    print("  [PASS] AsyncRequest honours no_retry_status_codes")
+
+
+async def test_async_request_jitter_applied():
+    """AsyncRequest must apply jitter on retry sleeps (was missing pre-refactor).
+
+    We patch _apply_jitter and assert it gets called with the configured
+    jitter when AsyncRequest retries on a 500.
+    """
+    mock_client, _ = _make_mock_client(status_code=500, body=b"err", text="err")
+
+    with patch(
+        "esuls.request_cli.httpx.AsyncClient",
+        return_value=mock_client,
+    ), patch(
+        "esuls.request_cli._apply_jitter",
+        wraps=_apply_jitter,
+    ) as jitter_spy:
+        async with AsyncRequest() as req:
+            await req.request(
+                "https://example.com",
+                max_attempt=2,
+                exception_sleep=0,
+                jitter=0.42,
+            )
+
+    # _apply_jitter is called with (delay, 0.42) at least once on retry sleep.
+    assert any(
+        call.args[1] == 0.42 or call.kwargs.get("jitter") == 0.42
+        for call in jitter_spy.call_args_list
+    ), jitter_spy.call_args_list
+    print("  [PASS] AsyncRequest applies jitter on retry sleeps")
+
+
+async def test_async_request_persistent_client_reused():
+    """Across many .request() calls without proxy, the same persistent
+    httpx client is reused (the whole point of AsyncRequest)."""
+    mock_client, captured = _make_mock_client()
+
+    constructed = []
+
+    def constructor(*args, **kwargs):
+        constructed.append(kwargs)
+        return mock_client
+
+    with patch(
+        "esuls.request_cli.httpx.AsyncClient",
+        side_effect=constructor,
+    ):
+        async with AsyncRequest() as req:
+            for _ in range(4):
+                await req.request(
+                    "https://example.com",
+                    max_attempt=1, exception_sleep=0, jitter=0,
+                )
+
+    # Only ONE AsyncClient was constructed across 4 calls
+    assert len(constructed) == 1, constructed
+    assert mock_client.request.call_count == 4
+    print("  [PASS] AsyncRequest reuses the persistent client across calls")
+
+
 if __name__ == "__main__":
 
     async def run_all_tests():
@@ -273,6 +458,16 @@ if __name__ == "__main__":
             ("close_shared_client", test_close_shared_client),
             ("make_request_cffi success", test_make_request_cffi_mocked),
             ("make_request_cffi error", test_make_request_cffi_error),
+            ("AsyncRequest per-call headers/cookies",
+             test_async_request_per_call_headers_cookies),
+            ("AsyncRequest proxy one-shot",
+             test_async_request_proxy_uses_one_shot_client),
+            ("AsyncRequest no_retry_status_codes",
+             test_async_request_no_retry_status_codes),
+            ("AsyncRequest jitter applied",
+             test_async_request_jitter_applied),
+            ("AsyncRequest persistent client reused",
+             test_async_request_persistent_client_reused),
         ]
 
         passed = 0

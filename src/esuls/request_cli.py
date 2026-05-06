@@ -162,17 +162,192 @@ class Response:
         return json.loads(self.text)
 
 
-class AsyncRequest(AsyncContextManager['AsyncRequest']):
-    """Context manager for HTTP requests with automatic client lifecycle."""
+async def _run_with_retry(
+    client: httpx.AsyncClient,
+    *,
+    method: HttpMethod,
+    url: str,
+    request_kwargs: Dict[str, Any],
+    max_attempt: int,
+    exception_sleep: float,
+    jitter: float,
+    force_response: bool,
+    no_retry_status_codes: Optional[list[int]],
+    json_response: bool,
+    json_response_check: Optional[str],
+    skip_response: Optional[Union[str, list[str]]],
+) -> Optional[Response]:
+    """Execute an HTTP request with retry, backoff, skip-pattern, and JSON validation.
 
-    def __init__(self, verify_ssl: bool = False) -> None:
-        # When verify_ssl is False (default) we use the optimized-but-insecure
-        # context so the AsyncRequest behaves like make_request's pooled path.
-        # Pass verify_ssl=True to enforce real certificate validation.
+    Single source of truth for retry semantics across `make_request` and
+    `AsyncRequest.request`. Both wrappers should differ only in how they
+    obtain the `client`; the retry/backoff/skip/json-validation contract
+    lives here.
+
+    Behaviour:
+    - Up to `max_attempt` attempts on httpx.HTTPError, OSError, or non-2xx.
+    - 429 → exponential backoff capped at 120s; other failures sleep
+      `exception_sleep`. Every sleep is jittered via `_apply_jitter`.
+    - `no_retry_status_codes` short-circuits retries for the listed codes.
+    - `skip_response` short-circuits when the body matches one of the
+      given patterns (string or list of strings).
+    - `json_response=True` requires a JSON-parsable body; if
+      `json_response_check` is set, that key must be present in the
+      decoded body.
+    - On final failure returns None unless `force_response=True`, in
+      which case the last failing Response is returned.
+    """
+    for attempt in range(max_attempt):
+        try:
+            httpx_response = await client.request(
+                method=method,
+                url=url,
+                **request_kwargs,
+            )
+            response = Response(
+                status_code=httpx_response.status_code,
+                headers=dict(httpx_response.headers),
+                _content=httpx_response.content,
+                text=httpx_response.text,
+                url=str(httpx_response.url),
+            )
+
+            if response.status_code not in _SUCCESS_STATUS_RANGE:
+                logger.debug(
+                    f"Request: {response.status_code}\n"
+                    f"Attempt {attempt + 1}/{max_attempt}\n"
+                    f"Url: {url}\n"
+                    f"Response: {response.text[:1000]}"
+                )
+
+                if (no_retry_status_codes
+                        and response.status_code in no_retry_status_codes):
+                    return response if force_response else None
+
+                if skip_response:
+                    patterns = (
+                        [skip_response]
+                        if isinstance(skip_response, str)
+                        else skip_response
+                    )
+                    if patterns and any(
+                        pattern in response.text
+                        for pattern in patterns if pattern
+                    ):
+                        return response if force_response else None
+
+                if attempt + 1 == max_attempt:
+                    return response if force_response else None
+
+                if response.status_code == 429:
+                    backoff = min(120.0, exception_sleep * (2 ** attempt))
+                    logger.debug(
+                        f"Rate limited (429), backing off for {backoff:.1f}s"
+                    )
+                    await asyncio.sleep(_apply_jitter(backoff, jitter))
+                else:
+                    await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                continue
+
+            if json_response:
+                try:
+                    response_data = response.json()
+                    if json_response_check and json_response_check not in response_data:
+                        if attempt + 1 == max_attempt:
+                            return None
+                        await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                        continue
+                except json.JSONDecodeError:
+                    if attempt + 1 == max_attempt:
+                        return None
+                    await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                    continue
+
+            return response
+
+        except (httpx.HTTPError, OSError) as e:
+            logger.debug(f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
+            if attempt + 1 == max_attempt:
+                return None
+            await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+            continue
+
+    return None
+
+
+def _build_request_kwargs(
+    *,
+    params: Optional[Dict[str, Any]],
+    json_data: Optional[JsonType],
+    files: Optional[Dict[str, FileData]],
+    headers: Headers,
+    timeout_request: int,
+    request_data: Optional[Union[str, bytes, Dict[str, Any]]],
+    cookies: Optional[Dict[str, str]],
+    follow_redirects: bool,
+) -> Dict[str, Any]:
+    """Bundle the per-call kwargs that make_request and AsyncRequest forward
+    to httpx.AsyncClient.request. Centralised so both wrappers stay in sync.
+    """
+    files_dict = None
+    if files:
+        files_dict = {
+            field_name: (filename, content, content_type)
+            for field_name, (filename, content, content_type) in files.items()
+        }
+    if params:
+        params = {k: v for k, v in params.items() if v}
+    return {
+        "params": params,
+        "json": json_data,
+        "files": files_dict,
+        "headers": headers,
+        "timeout": timeout_request,
+        "data": request_data,
+        "cookies": cookies,
+        "follow_redirects": follow_redirects,
+    }
+
+
+class AsyncRequest(AsyncContextManager['AsyncRequest']):
+    """Context manager for HTTP requests with a long-lived pooled client.
+
+    Use AsyncRequest when you want one persistent httpx.AsyncClient across
+    many request calls (avoids the per-call client setup of make_request).
+    Per-call values for headers, cookies, proxy, etc. are honoured: pass
+    them to `.request()` and they apply to that call only.
+
+    Client-level config (verify_ssl, http2) is set at construction time.
+    Passing `proxy` to a per-request call creates a one-shot client for
+    that call; the persistent instance client is unaffected.
+    """
+
+    def __init__(
+        self,
+        verify_ssl: bool = False,
+        http2: bool = True,
+    ) -> None:
+        # Client-level config baked into the persistent AsyncClient.
         self._verify: Union[bool, ssl.SSLContext] = (
             True if verify_ssl else _create_optimized_ssl_context()
         )
+        self._http2 = http2
         self._client: Optional[httpx.AsyncClient] = None
+
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        """Lazily create the persistent client on first use."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                verify=self._verify,
+                http2=self._http2,
+                follow_redirects=True,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=30.0,
+                ),
+            )
+        return self._client
 
     async def request(
         self,
@@ -183,6 +358,8 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
         params: Optional[Dict[str, Any]] = None,
         json_data: Optional[JsonType] = None,
         files: Optional[Dict[str, FileData]] = None,
+        data: Optional[Union[str, bytes]] = None,
+        form_data: Optional[Dict[str, Any]] = None,
         proxy: Optional[str] = None,
         timeout_request: int = 60,
         max_attempt: int = 10,
@@ -191,126 +368,75 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
         json_response_check: Optional[str] = None,
         skip_response: Optional[Union[str, list[str]]] = None,
         exception_sleep: float = 10,
-        add_user_agent: bool = False
+        add_user_agent: bool = False,
+        follow_redirects: bool = True,
+        no_retry_status_codes: Optional[list[int]] = None,
+        jitter: float = 0.1,
     ) -> Optional[Response]:
-        """Execute an HTTP request with type handling and automatic retry"""
-        # Prepare headers
-        request_headers = dict(headers or {})
-        if add_user_agent:
-            request_headers["User-Agent"] = await _get_user_agent()
+        """Execute an HTTP request with retry/backoff against the persistent client.
 
-        # Initialize client if not already done
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                verify=self._verify,
-                timeout=timeout_request,
-                cookies=cookies,
-                headers=request_headers,
-                proxy=proxy,
-                follow_redirects=True,
-                # http2=True  # Enable HTTP/2 for better performance
-            )
+        Per-call headers/cookies/proxy/timeout are applied to this call only.
+        When `proxy` is set, a one-shot client is created and closed for
+        that single call (the instance's persistent client is untouched).
+        """
+        one_shot: Optional[httpx.AsyncClient] = None
+        try:
+            if proxy:
+                one_shot = httpx.AsyncClient(
+                    verify=self._verify,
+                    timeout=timeout_request,
+                    follow_redirects=follow_redirects,
+                    proxy=proxy,
+                    http2=self._http2,
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                        keepalive_expiry=30.0,
+                    ),
+                )
+                client = one_shot
+            else:
+                client = await self._ensure_client()
 
-        # Prepare files for multipart/form-data
-        files_dict = None
-        if files:
-            files_dict = {}
-            for field_name, (filename, content, content_type) in files.items():
-                files_dict[field_name] = (filename, content, content_type)
+            request_headers = dict(headers or {})
+            if add_user_agent:
+                request_headers["User-Agent"] = await _get_user_agent()
 
-        if params:
-            params = {k: v for k, v in params.items() if v}
-        for attempt in range(max_attempt):
-            try:
-                # Execute request with all necessary parameters
-                httpx_response = await self._client.request(
-                    method=method,
-                    url=url,
+            request_data = form_data if form_data else data
+
+            return await _run_with_retry(
+                client,
+                method=method,
+                url=url,
+                request_kwargs=_build_request_kwargs(
                     params=params,
-                    json=json_data,
-                    files=files_dict,
-                )
-
-                # Create custom Response object
-                response = Response(
-                    status_code=httpx_response.status_code,
-                    headers=dict(httpx_response.headers),
-                    _content=httpx_response.content,
-                    text=httpx_response.text,
-                    url=str(httpx_response.url),
-                )
-
-                # Handle unsuccessful status codes
-                if response.status_code not in _SUCCESS_STATUS_RANGE:
-                    logger.warning(
-                        f"Request: {response.status_code}\n"
-                        f"Attempt {attempt + 1}/{max_attempt}\n"
-                        f"Url: {url}\n"
-                        f"Params: {params}\n"
-                        f"Response: {response.text[:1000]}\n"
-                        f"Request data: {json_data}\n"
-                    )
-                    if skip_response:
-                        patterns = (
-                            [skip_response]
-                            if isinstance(skip_response, str)
-                            else skip_response
-                        )
-                        if patterns and any(
-                            pattern in response.text
-                            for pattern in patterns if pattern
-                        ):
-                            return response if force_response else None
-
-                    if attempt + 1 == max_attempt:
-                        return response if force_response else None
-
-                    # Exponential backoff for 429 (rate limit)
-                    if response.status_code == 429:
-                        backoff = min(
-                            120.0, exception_sleep * (2 ** attempt)
-                        )
-                        logger.info(
-                            f"Rate limited (429), backing off "
-                            f"for {backoff:.1f}s"
-                        )
-                        await asyncio.sleep(backoff)
-                    else:
-                        await asyncio.sleep(exception_sleep)
-                    continue
-
-                # Validate JSON response
-                if json_response:
-                    try:
-                        data = response.json()
-                        if json_response_check and json_response_check not in data:
-                            if attempt + 1 == max_attempt:
-                                return None
-                            await asyncio.sleep(exception_sleep)
-                            continue
-                    except json.JSONDecodeError:
-                        if attempt + 1 == max_attempt:
-                            return None
-                        await asyncio.sleep(exception_sleep)
-                        continue
-
-                return response
-
-            except (httpx.HTTPError, OSError) as e:
-                logger.error(f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
-                if attempt + 1 == max_attempt:
-                    return None
-                await asyncio.sleep(exception_sleep)
-                continue
-
-        return None
+                    json_data=json_data,
+                    files=files,
+                    headers=request_headers,
+                    timeout_request=timeout_request,
+                    request_data=request_data,
+                    cookies=cookies,
+                    follow_redirects=follow_redirects,
+                ),
+                max_attempt=max_attempt,
+                exception_sleep=exception_sleep,
+                jitter=jitter,
+                force_response=force_response,
+                no_retry_status_codes=no_retry_status_codes,
+                json_response=json_response,
+                json_response_check=json_response_check,
+                skip_response=skip_response,
+            )
+        finally:
+            if one_shot:
+                await one_shot.aclose()
 
     async def __aenter__(self) -> 'AsyncRequest':
-        """Context manager entry point"""
+        """Context manager entry. Client is created lazily on first request."""
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit point"""
+        """Context manager exit. Closes the persistent client if open."""
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -392,136 +518,61 @@ async def make_request(
     http2: bool = True,
     jitter: float = 0.1,
 ) -> Optional[Response]:
-    """Execute HTTP requests using per-domain client for connection reuse."""
-    # Use dedicated client if proxy is specified, otherwise use per-domain pooled client
-    own_client = None
-    if proxy:
-        ssl_context = _create_optimized_ssl_context() if not verify_ssl else True
-        own_client = httpx.AsyncClient(
-            verify=ssl_context,
-            timeout=timeout_request,
-            follow_redirects=follow_redirects,
-            proxy=proxy,
-            http2=http2,
-            limits=httpx.Limits(
-                max_connections=20,
-                max_keepalive_connections=10,
-                keepalive_expiry=30.0
-            )
-        )
-        client = own_client
-    else:
-        client = await _get_domain_client(url, http2=http2, verify_ssl=verify_ssl)
-
-    # Prepare headers
-    request_headers = headers.copy() if headers else {}
-    if add_user_agent:
-        request_headers["User-Agent"] = await _get_user_agent()
-
-    # Prepare files for multipart/form-data
-    files_dict = {
-        field_name: (filename, content, content_type)
-        for field_name, (filename, content, content_type) in files.items()
-    } if files else None
-
-    # Filter empty params
-    if params:
-        params = {k: v for k, v in params.items() if v}
-
-    # Determine data payload: form_data takes precedence over raw data
-    request_data = form_data if form_data else data
-
+    """Execute an HTTP request via a per-domain pooled client (or a one-shot
+    client when `proxy` is set). Retry/backoff/skip-pattern semantics are
+    delegated to `_run_with_retry` so they stay identical to AsyncRequest.
+    """
+    own_client: Optional[httpx.AsyncClient] = None
     try:
-        for attempt in range(max_attempt):
-            try:
-                # Execute request with all necessary parameters
-                httpx_response = await client.request(
-                    method=method,
-                    url=url,
-                    params=params,
-                    json=json_data,
-                    files=files_dict,
-                    headers=request_headers,
-                    timeout=timeout_request,
-                    data=request_data,
-                    cookies=cookies,
-                    follow_redirects=follow_redirects,
-                )
+        if proxy:
+            ssl_context: Union[bool, ssl.SSLContext] = (
+                True if verify_ssl else _create_optimized_ssl_context()
+            )
+            own_client = httpx.AsyncClient(
+                verify=ssl_context,
+                timeout=timeout_request,
+                follow_redirects=follow_redirects,
+                proxy=proxy,
+                http2=http2,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=30.0,
+                ),
+            )
+            client = own_client
+        else:
+            client = await _get_domain_client(url, http2=http2, verify_ssl=verify_ssl)
 
-                # Create custom Response object
-                response = Response(
-                    status_code=httpx_response.status_code,
-                    headers=dict(httpx_response.headers),
-                    _content=httpx_response.content,
-                    text=httpx_response.text,
-                    url=str(httpx_response.url),
-                )
+        request_headers = headers.copy() if headers else {}
+        if add_user_agent:
+            request_headers["User-Agent"] = await _get_user_agent()
 
-                # Handle unsuccessful status codes
-                if response.status_code not in _SUCCESS_STATUS_RANGE:
-                    logger.debug(
-                        f"Request: {response.status_code}\n"
-                        f"Attempt {attempt + 1}/{max_attempt}\n"
-                        f"Url: {url}\n"
-                        f"Params: {params}\n"
-                        f"Response: {response.text[:1000]}\n"
-                        f"Request data: {json_data}\n"
-                    )
+        request_data = form_data if form_data else data
 
-                    # Exit immediately for specific status codes (no retry)
-                    if (no_retry_status_codes
-                            and response.status_code in no_retry_status_codes):
-                        return response if force_response else None
-
-                    if skip_response:
-                        patterns = (
-                            [skip_response]
-                            if isinstance(skip_response, str)
-                            else skip_response
-                        )
-                        if patterns and any(
-                            pattern in response.text
-                            for pattern in patterns if pattern
-                        ):
-                            return response if force_response else None
-
-                    if attempt + 1 == max_attempt:
-                        return response if force_response else None
-
-                    # Exponential backoff for 429 (rate limit)
-                    if response.status_code == 429:
-                        backoff = min(120.0, exception_sleep * (2 ** attempt))
-                        logger.debug(f"Rate limited (429), backing off for {backoff:.1f}s")
-                        await asyncio.sleep(_apply_jitter(backoff, jitter))
-                    else:
-                        await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
-                    continue
-
-                # Validate JSON response
-                if json_response:
-                    try:
-                        response_data = response.json()
-                        if json_response_check and json_response_check not in response_data:
-                            if attempt + 1 == max_attempt:
-                                return None
-                            await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
-                            continue
-                    except json.JSONDecodeError:
-                        if attempt + 1 == max_attempt:
-                            return None
-                        await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
-                        continue
-
-                return response
-
-            except (httpx.HTTPError, OSError) as e:
-                logger.debug(f"Request error: {e} - {url} - attempt {attempt + 1}/{max_attempt}")
-                if attempt + 1 == max_attempt:
-                    return None
-                await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
-                continue
-
-        return None
+        return await _run_with_retry(
+            client,
+            method=method,
+            url=url,
+            request_kwargs=_build_request_kwargs(
+                params=params,
+                json_data=json_data,
+                files=files,
+                headers=request_headers,
+                timeout_request=timeout_request,
+                request_data=request_data,
+                cookies=cookies,
+                follow_redirects=follow_redirects,
+            ),
+            max_attempt=max_attempt,
+            exception_sleep=exception_sleep,
+            jitter=jitter,
+            force_response=force_response,
+            no_retry_status_codes=no_retry_status_codes,
+            json_response=json_response,
+            json_response_check=json_response_check,
+            skip_response=skip_response,
+        )
     finally:
         if own_client:
             await own_client.aclose()
