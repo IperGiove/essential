@@ -15,11 +15,9 @@ from esuls.request_cli import (
     _get_user_agent,
     _extract_domain,
     _apply_jitter,
-    _get_domain_client,
     _get_playwright_browser,
     _build_playwright_user_agent,
     _req_loop_state,
-    _run_with_retry,
 )
 
 
@@ -710,12 +708,9 @@ async def test_playwright_page_close_failure_does_not_abort_retry():
 
 
 if __name__ == "__main__":
+    from esuls.tests._common import run_test_suite
 
     async def run_all_tests():
-        print("\n" + "=" * 60)
-        print("REQUEST CLI TESTS")
-        print("=" * 60)
-
         tests = [
             ("Response object", test_response_object),
             ("Response JSON error", test_response_json_error),
@@ -752,21 +747,6 @@ if __name__ == "__main__":
             ("playwright UA derived from bundled version",
              test_playwright_user_agent_derived_from_bundled_version),
         ]
-
-        passed = 0
-        failed = 0
-        for name, test_fn in tests:
-            try:
-                await test_fn()
-                passed += 1
-            except Exception as e:
-                print(f"  [FAIL] {name}: {type(e).__name__}: {e}")
-                failed += 1
-
-        print("\n" + "=" * 60)
-        print(f"RESULTS: {passed} passed, {failed} failed")
-        if failed == 0:
-            print("ALL TESTS PASSED!")
-        print("=" * 60)
+        await run_test_suite("REQUEST CLI TESTS", tests)
 
     asyncio.run(run_all_tests())

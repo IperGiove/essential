@@ -3,17 +3,10 @@ Test concurrent database access to verify retry logic works.
 """
 import asyncio
 import tempfile
-import os
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from esuls.db_cli import AsyncDB, BaseModel
-
-
-@dataclass
-class TestItem(BaseModel):
-    name: str = ""
-    value: int = 0
+from esuls.db_cli import AsyncDB
+from esuls.tests._common import TestItem
 
 
 async def test_concurrent_reads(temp_db):
@@ -34,7 +27,7 @@ async def test_concurrent_reads(temp_db):
     # All reads should succeed and return same data
     assert all(len(r) == 10 for r in results)
     await db.close()
-    print(f"✓ 100 concurrent reads completed successfully")
+    print("✓ 100 concurrent reads completed successfully")
 
 
 async def test_concurrent_writes(temp_db):
@@ -55,7 +48,7 @@ async def test_concurrent_writes(temp_db):
     items = await db.find()
     assert len(items) == 50
     await db.close()
-    print(f"✓ 50 concurrent writes completed successfully")
+    print("✓ 50 concurrent writes completed successfully")
 
 
 async def test_concurrent_mixed_operations(temp_db):
@@ -95,7 +88,7 @@ async def test_concurrent_mixed_operations(temp_db):
     items = await db.find()
     assert len(items) == 55  # 5 seed + 50 writes
     await db.close()
-    print(f"✓ 200 concurrent mixed operations completed successfully")
+    print("✓ 200 concurrent mixed operations completed successfully")
 
 
 async def test_stress_concurrent_access(temp_db):
@@ -121,18 +114,17 @@ async def test_stress_concurrent_access(temp_db):
     print(f"Results: {successes} successes, {len(exceptions)} failures")
 
     if exceptions:
-        print(f"Sample exceptions:")
+        print("Sample exceptions:")
         for e in exceptions[:3]:
             print(f"  - {type(e).__name__}: {e}")
 
     # Should have very few or no failures with retry logic
     assert len(exceptions) == 0, f"{len(exceptions)} operations failed"
     await db.close()
-    print(f"✓ 500 concurrent stress operations completed successfully")
+    print("✓ 500 concurrent stress operations completed successfully")
 
 
 if __name__ == "__main__":
-    import sys
 
     async def run_all_tests():
         with tempfile.TemporaryDirectory() as tmpdir:

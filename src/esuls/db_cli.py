@@ -772,10 +772,10 @@ class AsyncDB(Generic[SchemaType]):
                 return False
             raise
     
-    async def get_by_id(self, id: str) -> Optional[SchemaType]:
+    async def get_by_id(self, record_id: str) -> Optional[SchemaType]:
         """Fetch an item by ID with reliable connection handling."""
         async with self.transaction(read_only=True) as db:
-            cursor = await db.execute(f"SELECT * FROM {self.table_name} WHERE id = ?", (id,))
+            cursor = await db.execute(f"SELECT * FROM {self.table_name} WHERE id = ?", (record_id,))
             row = await cursor.fetchone()
             
             if not row:
@@ -899,12 +899,12 @@ class AsyncDB(Generic[SchemaType]):
         """Retrieve all items."""
         return await self.find()
     
-    async def delete(self, id: str) -> bool:
+    async def delete(self, record_id: str) -> bool:
         """Delete an item by ID with reliable transaction handling."""
         write_lock = await self._get_write_lock()
         async with write_lock:
             async with self.transaction() as db:
-                cursor = await db.execute(f"DELETE FROM {self.table_name} WHERE id = ?", (id,))
+                cursor = await db.execute(f"DELETE FROM {self.table_name} WHERE id = ?", (record_id,))
                 return cursor.rowcount > 0
 
     async def exists(self, **filters) -> bool:
@@ -922,18 +922,22 @@ class AsyncDB(Generic[SchemaType]):
                 cursor = await db.execute(f"DELETE FROM {self.table_name} {where_clause}", values)
                 return cursor.rowcount
 
-    async def update_fields(self, id: str, **fields) -> bool:
-        """Update specific fields on a record by ID without fetching the full record."""
-        if not fields:
+    async def update_fields(self, record_id: str, **values) -> bool:
+        """Update specific fields on a record by ID without fetching the full record.
+
+        `values` is a kwargs mapping of column → new value. The parameter is
+        named `values` (not `fields`) so it doesn't shadow `dataclasses.fields`.
+        """
+        if not values:
             return False
-        fields['updated_at'] = datetime.now()
-        set_clause = ', '.join(f"{self._validate_column(k)} = ?" for k in fields)
-        values = [self._serialize_value(v) for v in fields.values()]
-        values.append(id)
+        values['updated_at'] = datetime.now()
+        set_clause = ', '.join(f"{self._validate_column(k)} = ?" for k in values)
+        sql_values = [self._serialize_value(v) for v in values.values()]
+        sql_values.append(record_id)
         write_lock = await self._get_write_lock()
         async with write_lock:
             async with self.transaction() as db:
                 cursor = await db.execute(
-                    f"UPDATE {self.table_name} SET {set_clause} WHERE id = ?", values
+                    f"UPDATE {self.table_name} SET {set_clause} WHERE id = ?", sql_values
                 )
                 return cursor.rowcount > 0

@@ -57,10 +57,9 @@ class DefaultsItem(BaseModel):
     required_field: str = field(default="", metadata={"required": False})
 
 
-@dataclass
-class TestItem(BaseModel):
-    name: str = ""
-    value: int = 0
+# TestItem is shared across test_db_concurrent and test_db_fixes — see
+# tests/_common.py. Imported below to avoid R0801 (duplicate-code).
+from esuls.tests._common import TestItem  # noqa: E402  — kept after schema models
 
 
 # --- Tests ---

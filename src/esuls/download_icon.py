@@ -1,5 +1,5 @@
 from urllib.parse import urlparse, unquote
-from typing import TypedDict, Optional, Dict, Any
+from typing import TypedDict, Optional, Dict
 import asyncio
 import io
 import magic
@@ -72,10 +72,12 @@ async def download_icon(url: str, filename: Optional[str] = None) -> Optional[Ic
     }
 
 def _extract_filename(url: str) -> str:
-    """Extract filename from URL path."""
+    """Extract filename from URL path. Returns "" when the URL has no path
+    component (e.g. "https://host/" or "https://host"); the caller treats
+    "" as missing-filename and skips downstream filename validation."""
     parsed_url = urlparse(url)
     path_components = parsed_url.path.split('/')
-    filename = next((comp for comp in reversed(path_components) if comp))
+    filename = next((comp for comp in reversed(path_components) if comp), "")
     return unquote(filename)
 
 def _detect_mime_type(data: bytes) -> Optional[str]:

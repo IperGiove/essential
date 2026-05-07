@@ -23,7 +23,6 @@ from esuls.db_cli import (
 )
 from esuls.request_cli import (
     _get_domain_client,
-    _req_state_by_loop,
     _req_loop_state,
     close_shared_client,
     make_request,
@@ -241,6 +240,10 @@ if __name__ == "__main__":
          test_request_per_loop_state_gced),
     ]
 
+    # NB: this runner is intentionally sync. Each cross-loop test creates
+    # its own asyncio.run(...) calls — wrapping them in another running
+    # loop (via the shared run_test_suite helper) would crash with
+    # "asyncio.run() cannot be called from a running event loop".
     passed = failed = 0
     for name, fn in tests:
         print(f"\n[Test] {name}")
