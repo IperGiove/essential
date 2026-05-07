@@ -56,9 +56,29 @@ def _req_loop_state() -> dict:
                 "playwright_lock": asyncio.Lock(),
                 "playwright_browser": None,
                 "playwright_instance": None,
+                "playwright_user_agent": None,        # derived from browser.version
             }
             _req_state_by_loop[loop] = state
         return state
+
+
+def _build_playwright_user_agent(browser_version: str) -> str:
+    """Derive a stealth-friendly UA from Playwright's bundled Chromium version.
+
+    Playwright's `browser.version` returns the full version string of the
+    bundled Chromium (e.g. "131.0.6778.69"). We use its major to build a
+    "Chrome/<major>.0.0.0" UA — same major as the actual TLS fingerprint
+    Playwright sends, but with "HeadlessChrome" replaced by "Chrome" so
+    anti-bot stacks don't immediately flag the request.
+
+    Auto-tracks Playwright upgrades: bump `playwright` and the next
+    `_get_playwright_browser()` recomputes a fresh UA. No manual bumps.
+    """
+    major = browser_version.split(".", 1)[0]
+    return (
+        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
 
 
 # fake_useragent.UserAgent is a sync object with no event-loop binding,
@@ -673,9 +693,36 @@ async def make_request_cffi(
 
 
 async def _get_playwright_browser():
-    """Get or create cached Playwright Chromium browser for the current loop."""
+    """Get or create cached Playwright Chromium browser for the current loop.
+
+    Auto-refreshes if the cached browser process has died (crash, OOM, OS
+    kill). Without this, a single browser crash would poison every
+    subsequent make_request_playwright call until the Python process
+    restarts.
+    """
     state = _req_loop_state()
     async with state["playwright_lock"]:
+        # Discard a dead browser before reusing the cache slot.
+        cached = state["playwright_browser"]
+        if cached is not None and not cached.is_connected():
+            logger.debug("Cached Playwright browser is disconnected; refreshing.")
+            try:
+                await cached.close()
+            except Exception:
+                pass
+            try:
+                instance = state["playwright_instance"]
+                if instance is not None:
+                    await instance.stop()
+            except Exception:
+                pass
+            state["playwright_browser"] = None
+            state["playwright_instance"] = None
+            # The cached UA was tied to the dead browser's version; drop it
+            # so the next launch recomputes from the (possibly upgraded)
+            # bundled Chromium.
+            state["playwright_user_agent"] = None
+
         if state["playwright_browser"] is None:
             from playwright.async_api import async_playwright
             state["playwright_instance"] = await async_playwright().start()
@@ -687,6 +734,15 @@ async def _get_playwright_browser():
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
+            # Snapshot the UA right after launch — it's tied to the running
+            # Chromium build and shouldn't change for this browser's lifetime.
+            try:
+                state["playwright_user_agent"] = _build_playwright_user_agent(
+                    state["playwright_browser"].version
+                )
+            except Exception as e:
+                logger.debug(f"Could not derive Playwright UA from browser.version: {e}")
+                state["playwright_user_agent"] = None
         return state["playwright_browser"]
 
 
@@ -705,23 +761,47 @@ async def make_request_playwright(
     Fully async — use this when standard httpx/curl_cffi return empty shells
     from Angular SPAs or other JS-heavy sites. Returns the same Response
     object for drop-in compatibility.
+
+    `wait_seconds` is the upper bound on how long to wait for the page's
+    network activity to settle after DOMContentLoaded. Fast pages return
+    earlier; pages with persistent traffic (analytics, polling, websockets)
+    are bounded at `wait_seconds` and we then proceed with what's rendered.
     """
     browser = await _get_playwright_browser()
+    # UA derived from Playwright's bundled Chromium major (see
+    # _build_playwright_user_agent). Falls back to Playwright's default if
+    # the version probe failed at launch — that default leaks
+    # "HeadlessChrome" but is at least syntactically valid.
+    state = _req_loop_state()
+    cached_ua = state.get("playwright_user_agent")
 
     for attempt in range(max_attempt):
         page = None
         try:
-            page = await browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                ),
+            page = (
+                await browser.new_page(user_agent=cached_ua)
+                if cached_ua
+                else await browser.new_page()
             )
             page.set_default_timeout(timeout_request * 1000)
 
             resp = await page.goto(url, wait_until="domcontentloaded")
-            # Let JS render
-            await page.wait_for_timeout(int(wait_seconds * 1000))
+            # Wait for network activity to settle (more robust than a fixed
+            # sleep for SPAs). Bounded by `wait_seconds` so pages with
+            # endless background traffic don't hang forever.
+            if wait_seconds > 0:
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle",
+                        timeout=int(wait_seconds * 1000),
+                    )
+                except Exception as wait_err:
+                    # Most likely a Playwright TimeoutError: page kept
+                    # making requests beyond wait_seconds. Proceed with
+                    # whatever has rendered so far.
+                    logger.debug(
+                        f"networkidle wait expired, proceeding: {wait_err}"
+                    )
 
             page_source = await page.content()
             final_url = page.url
@@ -759,7 +839,15 @@ async def make_request_playwright(
                 return None
             await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
         finally:
-            if page:
-                await page.close()
+            # page.close() can itself fail when the browser is in a bad
+            # state. Swallow that error so the retry loop can run its
+            # remaining attempts; we'd rather lose the page (it's about
+            # to be GC'd anyway) than abort the request with an unrelated
+            # cleanup exception.
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as close_err:
+                    logger.debug(f"page.close() failed (ignored): {close_err}")
 
     return None

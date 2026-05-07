@@ -3,6 +3,7 @@ import aiosqlite
 import ast
 import json
 import re
+import sqlite3
 import threading
 import weakref
 import dataclasses
@@ -24,6 +25,39 @@ def _validate_identifier(name: str) -> str:
     if not _VALID_IDENTIFIER.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return name
+
+
+# Retryable SQLite error codes: BUSY = whole-db lock contention,
+# LOCKED = table-level lock contention. Both are transient and the
+# canonical retry-and-backoff response is the same.
+_RETRYABLE_SQLITE_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+
+def _is_sqlite_busy(exc: BaseException) -> bool:
+    """True if `exc` is a transient SQLite contention error worth retrying.
+
+    Prefers the structured `sqlite_errorcode` attribute (available on
+    sqlite3 errors since Python 3.11) over string matching. The string
+    fallback covers errors wrapped by intermediate layers (mocks in
+    tests, future aiosqlite shapes) that may strip the errorcode.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code in _RETRYABLE_SQLITE_CODES:
+        return True
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+def _is_stale_connection(exc: BaseException) -> bool:
+    """True if `exc` indicates the cached aiosqlite connection is dead.
+
+    These errors come from the aiosqlite layer (not sqlite3 itself) when
+    a Connection is reused after being closed or after its event loop
+    died. They carry no `sqlite_errorcode`, so string matching is the
+    only signal available.
+    """
+    msg = str(exc).lower()
+    return "closed" in msg or "no active connection" in msg
 
 
 # ─── per-loop registry ────────────────────────────────────────────────────
@@ -56,6 +90,53 @@ def _db_loop_state() -> dict:
             }
             _db_state_by_loop[loop] = state
         return state
+
+
+# Tracks whether we've already warned about an unrecognised aiosqlite
+# Connection shape, so the log line doesn't fire on every connect.
+_aiosqlite_daemon_shape_warned = False
+
+
+def _mark_aiosqlite_daemon(connection_object) -> bool:
+    """Mark aiosqlite's worker thread as daemon so it can't block process exit.
+
+    `aiosqlite.Connection` runs a non-daemon worker thread in a loop waiting
+    for SQL operations. If the user forgets to call `close()` (or doesn't
+    use the async context manager), that thread keeps the interpreter alive
+    indefinitely on exit. Marking it daemon makes it die with the process.
+
+    The attribute we touch is private to aiosqlite (it has changed shape
+    once already: pre-0.22 the Connection itself was a Thread; from 0.22
+    it wraps the worker in `_thread`). To stay resilient against future
+    refactors we:
+      - try `_thread.daemon` first (current shape),
+      - fall back to `Connection`-extends-`Thread` (legacy shape),
+      - on any AttributeError/TypeError log at debug and return False so
+        the caller knows the safety net wasn't applied.
+
+    Returns True iff the flag was applied. The connection still works
+    when False — it's only the "forgotten close()" path that suffers.
+    """
+    global _aiosqlite_daemon_shape_warned
+    try:
+        if hasattr(connection_object, '_thread'):
+            connection_object._thread.daemon = True
+            return True
+        if isinstance(connection_object, threading.Thread):
+            connection_object.daemon = True
+            return True
+    except (AttributeError, TypeError) as e:
+        logger.debug(f"Could not mark aiosqlite worker as daemon: {e}")
+        return False
+
+    if not _aiosqlite_daemon_shape_warned:
+        _aiosqlite_daemon_shape_warned = True
+        logger.warning(
+            "aiosqlite worker shape changed: neither `_thread` nor a "
+            "Thread subclass. Process may hang on unclosed connections; "
+            "always call AsyncDB.close() or use `async with AsyncDB(...)`."
+        )
+    return False
 
 T = TypeVar('T')
 SchemaType = TypeVar('SchemaType', bound='BaseModel')
@@ -200,14 +281,8 @@ class AsyncDB(Generic[SchemaType]):
         for attempt in range(max_retries):
             try:
                 db = aiosqlite.connect(self.db_path, timeout=30.0)
-                # Mark aiosqlite's thread as daemon so it won't block process exit
-                # Must be set before await (which calls start())
-                # <=0.21: Connection extends Thread directly
-                # >=0.22: Connection wraps Thread in _thread attr
-                if hasattr(db, '_thread'):
-                    db._thread.daemon = True
-                elif isinstance(db, threading.Thread):
-                    db.daemon = True
+                # Mark daemon BEFORE await (which calls thread.start()).
+                _mark_aiosqlite_daemon(db)
                 db = await db
                 # Fast WAL mode with minimal sync
                 await db.execute("PRAGMA journal_mode=WAL")
@@ -288,21 +363,36 @@ class AsyncDB(Generic[SchemaType]):
                 if len(args) == 1:
                     field_type = args[0]
 
-            # Map Python types to SQLite types
-            if field_type in (int, bool):
-                sql_type = "INTEGER"
-            elif field_type in (float,):
-                sql_type = "REAL"
-            elif field_type == bytes:
+            # Map Python types to SQLite types.
+            #
+            # Order matters: we check by identity for the leaf types that
+            # don't participate in subclass relationships we care about
+            # (bytes, datetime, float), then by `issubclass` so that
+            # IntEnum/IntFlag inherit `int` → INTEGER, StrEnum inherits
+            # `str` → TEXT, and other Enum subclasses fall back to TEXT.
+            # `isinstance(field_type, type)` guards against typing aliases
+            # (e.g. `List[str]`) that would crash `issubclass`.
+            if field_type is bytes:
                 sql_type = "BLOB"
-            elif field_type in (str, enum.EnumType):
-                sql_type = "TEXT"
-            elif field_type in (datetime,):
+            elif field_type is datetime:
                 sql_type = "TIMESTAMP"
-            elif field_type == List[str]:
-                sql_type = "TEXT"  # Stored as JSON
+            elif field_type is float:
+                sql_type = "REAL"
+            elif isinstance(field_type, type) and issubclass(field_type, int):
+                # int, bool, IntEnum, IntFlag (bool is a subclass of int).
+                sql_type = "INTEGER"
+            elif isinstance(field_type, type) and issubclass(field_type, str):
+                # str, StrEnum.
+                sql_type = "TEXT"
+            elif isinstance(field_type, type) and issubclass(field_type, enum.Enum):
+                # Other Enum subtypes — serialized via `.value`, stored as TEXT.
+                sql_type = "TEXT"
+            elif getattr(field_type, '__origin__', None) is list:
+                # List[X] / list[X] — JSON-encoded into a TEXT column.
+                sql_type = "TEXT"
             else:
-                sql_type = "TEXT"  # Default to TEXT/JSON for complex types
+                # Dict, nested dataclass, unrecognised typing aliases, etc.
+                sql_type = "TEXT"  # JSON-encoded
                 
             # Handle special field metadata
             constraints = []
@@ -356,26 +446,34 @@ class AsyncDB(Generic[SchemaType]):
         logger.debug(f"Schema initialization complete for {self.schema_class.__name__}")
     
     @contextlib.asynccontextmanager
-    async def transaction(self):
-        """Run operations in a transaction, rolling back on error.
+    async def transaction(self, read_only: bool = False):
+        """Run operations in a transaction.
+
+        Write paths (default, `read_only=False`) commit on clean exit and
+        roll back on exception. Read paths (`read_only=True`) skip both
+        commit and rollback — for SELECT-only sequences SQLite doesn't
+        auto-start a transaction (with the default deferred isolation),
+        so commit/rollback are pointless round-trips to the aiosqlite
+        worker thread.
 
         On a stale-connection error ("connection is closed", "no active
         connection") the cached connection is cleared so the next call to
         `_ensure_connection()` reopens it. Auto-retry is the caller's
-        responsibility — write paths (save/save_batch) wrap this in a
-        retry loop; read paths surface the error to the caller.
+        responsibility — write paths wrap this in a retry loop; read
+        paths surface the error to the caller.
         """
         db = await self._ensure_connection()
         try:
             yield db
-            await db.commit()
+            if not read_only:
+                await db.commit()
         except Exception as e:
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            msg = str(e).lower()
-            if "closed" in msg or "no active connection" in msg:
+            if not read_only:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+            if _is_stale_connection(e):
                 self._connection = None
             raise
     
@@ -484,11 +582,21 @@ class AsyncDB(Generic[SchemaType]):
         item: SchemaType,
         conflict_target: Union[str, Tuple[str, ...]] = "id",
     ) -> Tuple[str, List[Any]]:
-        """Prepare an item for saving. Returns (sql, values)."""
+        """Prepare an item for saving. Returns (sql, values).
+
+        `id` and `created_at` are auto-generated only when explicitly None
+        (the missing-value sentinel). Falsy-but-non-None values like `""`
+        or `0` are preserved — the user passed them deliberately, and
+        replacing them silently with a UUID/timestamp would mask schemas
+        that use a non-string id (e.g. `id: int = 0`) or mismatch the
+        caller's expectations.
+        """
         data = asdict(item)
-        item_id = data.pop('id', None) or str(uuid.uuid4())
+        item_id = data.pop('id', None)
+        if item_id is None:
+            item_id = str(uuid.uuid4())
         now = datetime.now()
-        if not data.get('created_at'):
+        if data.get('created_at') is None:
             data['created_at'] = now
         data['updated_at'] = now
         field_names = tuple(sorted(data.keys()))
@@ -579,14 +687,13 @@ class AsyncDB(Generic[SchemaType]):
                                 raise
                 break
             except Exception as e:
-                err = str(e).lower()
                 if attempt < max_retries - 1:
-                    if "database is locked" in err:
+                    if _is_sqlite_busy(e):
                         wait_time = 0.2 * (2 ** attempt)
-                        logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                        logger.debug(f"DB busy/locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
                         await asyncio.sleep(wait_time)
                         continue
-                    if "closed" in err or "no active connection" in err:
+                    if _is_stale_connection(e):
                         # transaction() already cleared self._connection;
                         # next iteration will reopen via _ensure_connection.
                         logger.debug(f"Stale connection, reconnecting (retry {attempt + 1}/{max_retries})")
@@ -646,14 +753,13 @@ class AsyncDB(Generic[SchemaType]):
                             await db.execute(sql, values)
                     break
                 except Exception as e:
-                    err = str(e).lower()
                     if attempt < max_retries - 1:
-                        if "database is locked" in err:
+                        if _is_sqlite_busy(e):
                             wait_time = 0.2 * (2 ** attempt)
-                            logger.debug(f"DB locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
+                            logger.debug(f"DB busy/locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
                             await asyncio.sleep(wait_time)
                             continue
-                        if "closed" in err or "no active connection" in err:
+                        if _is_stale_connection(e):
                             logger.debug(f"Stale connection, reconnecting (retry {attempt + 1}/{max_retries})")
                             continue
                     raise
@@ -668,7 +774,7 @@ class AsyncDB(Generic[SchemaType]):
     
     async def get_by_id(self, id: str) -> Optional[SchemaType]:
         """Fetch an item by ID with reliable connection handling."""
-        async with self.transaction() as db:
+        async with self.transaction(read_only=True) as db:
             cursor = await db.execute(f"SELECT * FROM {self.table_name} WHERE id = ?", (id,))
             row = await cursor.fetchone()
             
@@ -761,14 +867,14 @@ class AsyncDB(Generic[SchemaType]):
             query += " OFFSET ?"
             values.append(offset)
 
-        # Execute query with reliable transaction
-        async with self.transaction() as db:
+        # Execute query with reliable transaction (read-only — no commit needed)
+        async with self.transaction(read_only=True) as db:
             cursor = await db.execute(query, values)
             rows = await cursor.fetchall()
-            
+
             if not rows:
                 return []
-                
+
             # Process results
             columns = [desc[0] for desc in cursor.description]
             return [
@@ -783,8 +889,8 @@ class AsyncDB(Generic[SchemaType]):
         """Count items matching filters with reliable connection handling."""
         where_clause, values = self._build_where_clause(filters)
         query = f"SELECT COUNT(*) FROM {self.table_name} {where_clause}"
-        
-        async with self.transaction() as db:
+
+        async with self.transaction(read_only=True) as db:
             cursor = await db.execute(query, values)
             result = await cursor.fetchone()
             return result[0] if result else 0
