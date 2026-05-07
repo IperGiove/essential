@@ -1,6 +1,7 @@
 import asyncio
 import aiosqlite
 import ast
+import base64
 import json
 import re
 import sqlite3
@@ -17,6 +18,28 @@ import contextlib
 import enum
 from loguru import logger
 from decimal import Decimal
+
+
+# Sentinel prefix for base64-encoded bytes inside JSON-serialised dicts.
+# BaseModel.to_dict() prepends this to bytes values; from_dict() strips
+# it back. Chosen for clarity in logs/inspection — text fields holding
+# a literal "b64:" string are unaffected because from_dict only decodes
+# fields whose declared type is bytes.
+_B64_PREFIX = "b64:"
+
+
+def _is_bytes_field(ftype) -> bool:
+    """True for `bytes` and `Optional[bytes]` (or any Union including bytes).
+
+    Used by BaseModel.from_dict to know which fields need base64
+    decoding back from a transport-encoded ('b64:...') string.
+    """
+    if ftype is bytes:
+        return True
+    origin = getattr(ftype, "__origin__", None)
+    if origin is Union:
+        return bytes in getattr(ftype, "__args__", ())
+    return False
 
 
 _VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
@@ -154,6 +177,35 @@ class BaseModel:
             result[f.name] = self._serialize_value(value)
         return result
 
+    @classmethod
+    def from_dict(cls: Type[SchemaType], data: dict) -> SchemaType:
+        """Reconstruct an instance from a JSON-style dict.
+
+        Symmetric counterpart to `to_dict()`: decodes any "b64:..."
+        strings back into bytes for fields whose declared type is
+        `bytes` (or `Optional[bytes]`). Other fields are passed
+        through unchanged — the dataclass constructor handles
+        primitives, and downstream `_deserialize_value` (in AsyncDB)
+        handles datetime/enum/etc. on the SQLite read path.
+
+        Use this whenever you reconstruct a model from JSON received
+        over the wire (e.g. cache_save / cache_find_many endpoints);
+        plain `cls(**data)` would leave bytes fields holding the
+        encoded string and break downstream consumers.
+        """
+        type_hints = get_type_hints(cls)
+        converted: Dict[str, Any] = {}
+        for k, v in data.items():
+            if (
+                isinstance(v, str)
+                and v.startswith(_B64_PREFIX)
+                and _is_bytes_field(type_hints.get(k))
+            ):
+                converted[k] = base64.b64decode(v[len(_B64_PREFIX):])
+            else:
+                converted[k] = v
+        return cls(**converted)
+
     def _serialize_value(self, value):
         if value is None:
             return None
@@ -161,6 +213,14 @@ class BaseModel:
             return value.isoformat()
         if isinstance(value, date):
             return value.isoformat()
+        if isinstance(value, bytes):
+            # Bytes can't go through json.dumps. Base64-encode with the
+            # _B64_PREFIX sentinel so the symmetric `from_dict` knows
+            # to decode this back into a bytes object on the receiving
+            # side. The SQLite read/write path (AsyncDB._serialize_value
+            # / _deserialize_value) already handles bytes natively as
+            # BLOB and is unaffected by this transport-level encoding.
+            return _B64_PREFIX + base64.b64encode(value).decode("ascii")
         if isinstance(value, enum.Enum):
             return value.value
         if isinstance(value, uuid.UUID):
