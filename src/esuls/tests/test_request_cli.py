@@ -16,22 +16,8 @@ from esuls.request_cli import (
     _extract_domain,
     _apply_jitter,
     _get_playwright_browser,
-    _build_playwright_user_agent,
     _req_loop_state,
 )
-
-
-async def test_build_playwright_user_agent():
-    """Pure helper: extracts the Chromium major and emits a stealth UA."""
-    ua = _build_playwright_user_agent("142.0.7000.50")
-    assert "Chrome/142.0.0.0" in ua
-    assert "HeadlessChrome" not in ua
-    assert ua.startswith("Mozilla/5.0")
-
-    # Single-segment version still works.
-    ua2 = _build_playwright_user_agent("99")
-    assert "Chrome/99.0.0.0" in ua2
-    print("  [PASS] _build_playwright_user_agent extracts major correctly")
 
 
 async def test_response_object():
@@ -468,14 +454,11 @@ async def test_playwright_browser_refresh_on_dead_process():
 
     fresh_browser = MagicMock()
     fresh_browser.is_connected = MagicMock(return_value=True)
-    fresh_browser.version = "142.0.7000.50"   # bundled Chromium major
     fresh_instance = MagicMock()
     fresh_instance.chromium.launch = AsyncMock(return_value=fresh_browser)
 
     state["playwright_browser"] = dead_browser
     state["playwright_instance"] = dead_instance
-    # Stale UA from the previous (dead) browser — must be refreshed too.
-    state["playwright_user_agent"] = "old/UA"
 
     # Patch the playwright import so we don't need a real browser binary.
     fake_pw = MagicMock()
@@ -497,19 +480,11 @@ async def test_playwright_browser_refresh_on_dead_process():
         dead_instance.stop.assert_awaited_once()
         assert result is fresh_browser, "should return the freshly launched browser"
         assert state["playwright_browser"] is fresh_browser
-        # The UA was recomputed from the fresh browser's version, NOT
-        # carried over from the dead one.
-        assert state["playwright_user_agent"] is not None
-        assert "Chrome/142.0.0.0" in state["playwright_user_agent"], (
-            f"UA should reflect fresh browser version 142, got {state['playwright_user_agent']!r}"
-        )
-        assert "HeadlessChrome" not in state["playwright_user_agent"]
     finally:
         # Reset state so other tests aren't affected.
         state["playwright_browser"] = None
         state["playwright_instance"] = None
-        state["playwright_user_agent"] = None
-    print("  [PASS] _get_playwright_browser refreshes browser AND user-agent")
+    print("  [PASS] _get_playwright_browser refreshes the dead browser")
 
 
 async def test_playwright_networkidle_wait_used_and_timeout_tolerated():
@@ -522,6 +497,8 @@ async def test_playwright_networkidle_wait_used_and_timeout_tolerated():
 
     page = MagicMock()
     page.set_default_timeout = MagicMock()
+    page.add_init_script = AsyncMock()
+    page.set_extra_http_headers = AsyncMock()
     page.goto = AsyncMock(return_value=success_resp)
     # Simulate a page with endless background traffic — wait_for_load_state
     # raises a TimeoutError-shaped exception. We must NOT abort the request;
@@ -562,61 +539,6 @@ async def test_playwright_networkidle_wait_used_and_timeout_tolerated():
     print("  [PASS] make_request_playwright uses networkidle and tolerates its timeout")
 
 
-async def test_playwright_user_agent_derived_from_bundled_version():
-    """new_page receives a UA whose Chrome major matches browser.version
-    (Playwright's bundled Chromium), not a hardcoded constant.
-    """
-    success_resp = MagicMock()
-    success_resp.status = 200
-    success_resp.headers = {}
-
-    page = MagicMock()
-    page.set_default_timeout = MagicMock()
-    page.goto = AsyncMock(return_value=success_resp)
-    page.wait_for_load_state = AsyncMock()
-    page.content = AsyncMock(return_value="ok")
-    page.url = "https://example.com"
-    page.close = AsyncMock()
-
-    browser = MagicMock()
-    browser.is_connected = MagicMock(return_value=True)
-    browser.new_page = AsyncMock(return_value=page)
-
-    # Pre-populate the per-loop state as if _get_playwright_browser had
-    # already snapshotted a UA tied to a known version.
-    state = _req_loop_state()
-    state["playwright_browser"] = browser
-    state["playwright_user_agent"] = (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/200.0.0.0 Safari/537.36"
-    )
-
-    try:
-        with patch(
-            "esuls.request_cli._get_playwright_browser",
-            AsyncMock(return_value=browser),
-        ):
-            await make_request_playwright(
-                "https://example.com",
-                max_attempt=1,
-                wait_seconds=0,
-                exception_sleep=0,
-                jitter=0,
-            )
-
-        # new_page was called with the cached, version-derived UA — not
-        # any old hardcoded "Chrome/131" string.
-        browser.new_page.assert_awaited_once()
-        kwargs = browser.new_page.await_args.kwargs
-        assert kwargs.get("user_agent") == state["playwright_user_agent"]
-        assert "Chrome/200.0.0.0" in kwargs["user_agent"]
-        assert "HeadlessChrome" not in kwargs["user_agent"]
-    finally:
-        state["playwright_browser"] = None
-        state["playwright_user_agent"] = None
-    print("  [PASS] make_request_playwright uses the version-derived UA")
-
-
 async def test_playwright_skips_wait_when_wait_seconds_zero():
     """wait_seconds=0 must skip the networkidle call entirely (no infinite wait)."""
     success_resp = MagicMock()
@@ -625,6 +547,8 @@ async def test_playwright_skips_wait_when_wait_seconds_zero():
 
     page = MagicMock()
     page.set_default_timeout = MagicMock()
+    page.add_init_script = AsyncMock()
+    page.set_extra_http_headers = AsyncMock()
     page.goto = AsyncMock(return_value=success_resp)
     page.wait_for_load_state = AsyncMock()
     page.content = AsyncMock(return_value="ok")
@@ -660,6 +584,8 @@ async def test_playwright_page_close_failure_does_not_abort_retry():
 
     page1 = MagicMock()
     page1.set_default_timeout = MagicMock()
+    page1.add_init_script = AsyncMock()
+    page1.set_extra_http_headers = AsyncMock()
     page1.goto = AsyncMock(side_effect=Exception("simulated goto failure"))
     page1.content = AsyncMock(return_value="<html/>")
     page1.url = "https://example.com"
@@ -676,6 +602,8 @@ async def test_playwright_page_close_failure_does_not_abort_retry():
 
     page2 = MagicMock()
     page2.set_default_timeout = MagicMock()
+    page2.add_init_script = AsyncMock()
+    page2.set_extra_http_headers = AsyncMock()
     page2.goto = AsyncMock(return_value=success_resp)
     page2.wait_for_timeout = AsyncMock()
     page2.content = AsyncMock(return_value="<html>ok</html>")
@@ -705,6 +633,50 @@ async def test_playwright_page_close_failure_does_not_abort_retry():
     )
     page2.close.assert_awaited_once()
     print("  [PASS] make_request_playwright survives a failing page.close()")
+
+
+async def test_playwright_stealth_applied_to_every_page():
+    """tf-playwright-stealth owns the fingerprint surface, so every page
+    produced by make_request_playwright must have stealth applied — i.e.
+    add_init_script awaited and stealth's HTTP headers set. Without this
+    test, a refactor that drops `await stealth_async(page)` would silently
+    revert us to a vanilla, easily-fingerprinted browser.
+    """
+    success_resp = MagicMock()
+    success_resp.status = 200
+    success_resp.headers = {}
+
+    page = MagicMock()
+    page.set_default_timeout = MagicMock()
+    page.add_init_script = AsyncMock()
+    page.set_extra_http_headers = AsyncMock()
+    page.goto = AsyncMock(return_value=success_resp)
+    page.wait_for_load_state = AsyncMock()
+    page.content = AsyncMock(return_value="ok")
+    page.url = "https://example.com"
+    page.close = AsyncMock()
+
+    browser = MagicMock()
+    browser.is_connected = MagicMock(return_value=True)
+    browser.new_page = AsyncMock(return_value=page)
+
+    with patch(
+        "esuls.request_cli._get_playwright_browser",
+        AsyncMock(return_value=browser),
+    ):
+        await make_request_playwright(
+            "https://example.com",
+            max_attempt=1,
+            wait_seconds=0,
+            exception_sleep=0,
+            jitter=0,
+        )
+
+    page.add_init_script.assert_awaited_once()
+    page.set_extra_http_headers.assert_awaited_once()
+    # No UA passed to new_page — stealth is the single source of truth.
+    browser.new_page.assert_awaited_once_with()
+    print("  [PASS] make_request_playwright applies stealth to every page")
 
 
 if __name__ == "__main__":
@@ -742,10 +714,8 @@ if __name__ == "__main__":
              test_playwright_networkidle_wait_used_and_timeout_tolerated),
             ("playwright wait_seconds=0 skips networkidle",
              test_playwright_skips_wait_when_wait_seconds_zero),
-            ("_build_playwright_user_agent helper",
-             test_build_playwright_user_agent),
-            ("playwright UA derived from bundled version",
-             test_playwright_user_agent_derived_from_bundled_version),
+            ("playwright stealth applied to every page",
+             test_playwright_stealth_applied_to_every_page),
         ]
         await run_test_suite("REQUEST CLI TESTS", tests)
 

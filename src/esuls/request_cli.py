@@ -13,6 +13,7 @@ from loguru import logger
 import httpx
 from fake_useragent import UserAgent
 from curl_cffi.requests import AsyncSession
+from playwright_stealth import stealth_async
 
 # Type definitions
 JsonType: TypeAlias = Dict[str, Any]
@@ -56,29 +57,9 @@ def _req_loop_state() -> dict:
                 "playwright_lock": asyncio.Lock(),
                 "playwright_browser": None,
                 "playwright_instance": None,
-                "playwright_user_agent": None,        # derived from browser.version
             }
             _req_state_by_loop[loop] = state
         return state
-
-
-def _build_playwright_user_agent(browser_version: str) -> str:
-    """Derive a stealth-friendly UA from Playwright's bundled Chromium version.
-
-    Playwright's `browser.version` returns the full version string of the
-    bundled Chromium (e.g. "131.0.6778.69"). We use its major to build a
-    "Chrome/<major>.0.0.0" UA — same major as the actual TLS fingerprint
-    Playwright sends, but with "HeadlessChrome" replaced by "Chrome" so
-    anti-bot stacks don't immediately flag the request.
-
-    Auto-tracks Playwright upgrades: bump `playwright` and the next
-    `_get_playwright_browser()` recomputes a fresh UA. No manual bumps.
-    """
-    major = browser_version.split(".", 1)[0]
-    return (
-        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-    )
 
 
 # fake_useragent.UserAgent is a sync object with no event-loop binding,
@@ -718,31 +699,20 @@ async def _get_playwright_browser():
                 pass
             state["playwright_browser"] = None
             state["playwright_instance"] = None
-            # The cached UA was tied to the dead browser's version; drop it
-            # so the next launch recomputes from the (possibly upgraded)
-            # bundled Chromium.
-            state["playwright_user_agent"] = None
 
         if state["playwright_browser"] is None:
             from playwright.async_api import async_playwright
             state["playwright_instance"] = await async_playwright().start()
+            # Stealth handles fingerprint surface (webdriver flag,
+            # plugins, WebGL, chrome runtime, UA, etc.); browser args
+            # here are only sandbox/IPC concerns for headless runtime.
             state["playwright_browser"] = await state["playwright_instance"].chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
                 ],
             )
-            # Snapshot the UA right after launch — it's tied to the running
-            # Chromium build and shouldn't change for this browser's lifetime.
-            try:
-                state["playwright_user_agent"] = _build_playwright_user_agent(
-                    state["playwright_browser"].version
-                )
-            except Exception as e:
-                logger.debug(f"Could not derive Playwright UA from browser.version: {e}")
-                state["playwright_user_agent"] = None
         return state["playwright_browser"]
 
 
@@ -756,33 +726,29 @@ async def make_request_playwright(
     exception_sleep: float = 5,
     jitter: float = 0.1,
 ) -> Optional[Response]:
-    """HTTP client using Playwright for JavaScript-rendered pages.
+    """Stealth-driven Playwright client for JS-rendered pages.
 
-    Fully async — use this when standard httpx/curl_cffi return empty shells
-    from Angular SPAs or other JS-heavy sites. Returns the same Response
-    object for drop-in compatibility.
+    Each new page is wrapped by tf-playwright-stealth, which owns the
+    anti-automation surface: navigator.webdriver, navigator.plugins,
+    WebGL vendor/renderer, chrome runtime, languages, UA + sec-ch-ua,
+    permissions, and a few more. We don't layer our own UA or
+    fingerprint hacks on top — stealth is the single source of truth.
 
-    `wait_seconds` is the upper bound on how long to wait for the page's
-    network activity to settle after DOMContentLoaded. Fast pages return
-    earlier; pages with persistent traffic (analytics, polling, websockets)
-    are bounded at `wait_seconds` and we then proceed with what's rendered.
+    Use when httpx/curl_cffi return empty shells from Angular SPAs or
+    JS-heavy sites. Same Response shape as the other clients.
+
+    `wait_seconds` upper-bounds the post-DOMContentLoaded wait for
+    network activity to settle. Pages with persistent traffic
+    (analytics, polling, websockets) are cut off at `wait_seconds`
+    and we proceed with the partial render.
     """
     browser = await _get_playwright_browser()
-    # UA derived from Playwright's bundled Chromium major (see
-    # _build_playwright_user_agent). Falls back to Playwright's default if
-    # the version probe failed at launch — that default leaks
-    # "HeadlessChrome" but is at least syntactically valid.
-    state = _req_loop_state()
-    cached_ua = state.get("playwright_user_agent")
 
     for attempt in range(max_attempt):
         page = None
         try:
-            page = (
-                await browser.new_page(user_agent=cached_ua)
-                if cached_ua
-                else await browser.new_page()
-            )
+            page = await browser.new_page()
+            await stealth_async(page)
             page.set_default_timeout(timeout_request * 1000)
 
             resp = await page.goto(url, wait_until="domcontentloaded")

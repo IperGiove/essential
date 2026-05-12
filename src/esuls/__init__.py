@@ -11,7 +11,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
 # Import all utilities
-from .utils import run_parallel
+from .utils import run_parallel, load_config, generate_example_files
 from .db_cli import AsyncDB, BaseModel
 from .request_cli import AsyncRequest, make_request, make_request_cffi, make_request_playwright, Response
 from .download_icon import download_icon
@@ -37,6 +37,8 @@ from .pdf import (
 __all__ = [
     '__version__',
     'run_parallel',
+    'load_config',
+    'generate_example_files',
     'AsyncDB',
     'BaseModel',
     'AsyncRequest',
