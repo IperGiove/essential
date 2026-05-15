@@ -147,19 +147,34 @@ def test_request_cross_loop_get_domain_client():
 
 
 def test_request_make_request_cross_loop():
-    """make_request works across asyncio.run() calls (mocked transport)."""
+    """make_request works across asyncio.run() calls (mocked transport).
+
+    `_run_with_retry` now uses `client.stream(...)` (an async context
+    manager that yields a streaming response) rather than `client.request`,
+    so the mock impersonates the streaming surface: an async-CM that
+    yields a response whose `.aiter_bytes()` produces the body in chunks.
+    """
+
+    class _MockStreamResp:
+        status_code = 200
+        encoding = "utf-8"
+        headers: dict = {}
+        url = "https://example.com"
+        async def aiter_bytes(self):
+            yield b"ok"
+
+    class _MockClient:
+        is_closed = False
+        def stream(self, *args, **kwargs):
+            class _CM:
+                async def __aenter__(self):
+                    return _MockStreamResp()
+                async def __aexit__(self, *a):
+                    return False
+            return _CM()
 
     def make_mock():
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.headers = {}
-        mock_response.content = b"ok"
-        mock_response.text = "ok"
-        mock_response.url = "https://example.com"
-        mock_client = AsyncMock()
-        mock_client.request = AsyncMock(return_value=mock_response)
-        mock_client.is_closed = False
-        return mock_client
+        return _MockClient()
 
     async def burst():
         with patch(
@@ -216,46 +231,3 @@ def test_request_per_loop_state_gced():
     print("✓ request_cli per-loop state is GC'd when the loop dies")
 
 
-# ─── runner ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("CROSS-LOOP TESTS")
-    print("=" * 60)
-
-    tests = [
-        ("AsyncDB cross-loop under contention",
-         test_db_cross_loop_under_contention),
-        ("AsyncDB instance reused across loops",
-         test_db_same_instance_across_loops),
-        ("AsyncDB per-loop state GC",
-         test_db_per_loop_state_gced_when_loop_dies),
-        ("request_cli _get_domain_client cross-loop",
-         test_request_cross_loop_get_domain_client),
-        ("request_cli make_request cross-loop",
-         test_request_make_request_cross_loop),
-        ("request_cli per-loop state isolated",
-         test_request_per_loop_state_isolated),
-        ("request_cli per-loop state GC",
-         test_request_per_loop_state_gced),
-    ]
-
-    # NB: this runner is intentionally sync. Each cross-loop test creates
-    # its own asyncio.run(...) calls — wrapping them in another running
-    # loop (via the shared run_test_suite helper) would crash with
-    # "asyncio.run() cannot be called from a running event loop".
-    passed = failed = 0
-    for name, fn in tests:
-        print(f"\n[Test] {name}")
-        try:
-            fn()
-            passed += 1
-        except Exception as e:
-            print(f"  [FAIL] {type(e).__name__}: {e}")
-            failed += 1
-
-    print("\n" + "=" * 60)
-    print(f"RESULTS: {passed} passed, {failed} failed")
-    if failed == 0:
-        print("ALL CROSS-LOOP TESTS PASSED!")
-    print("=" * 60)

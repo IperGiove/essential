@@ -51,19 +51,19 @@ def _pdf_date(dt: datetime) -> str:
 
 # ─── metadata round-trip ──────────────────────────────────────────────────
 
-def test_read_pdf_metadata(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
+def test_read_pdf_metadata(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
     info = read_pdf_metadata(src)
     assert info["/Title"] == "T"
     assert info["/Author"] == "A"
     print("  [PASS] read_pdf_metadata round-trip")
 
 
-def test_update_pdf_metadata_preserves_other_keys(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
+def test_update_pdf_metadata_preserves_other_keys(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
     out = update_pdf_metadata(
         src, {"/Title": "NEW"},
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
         update_mod_date=False,
     )
     info = read_pdf_metadata(out)
@@ -73,11 +73,11 @@ def test_update_pdf_metadata_preserves_other_keys(tmp: Path):
     print("  [PASS] update_pdf_metadata preserves untouched keys")
 
 
-def test_replace_pdf_metadata_blows_away_existing(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
+def test_replace_pdf_metadata_blows_away_existing(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
     out = replace_pdf_metadata(
         src, {"/Title": "ONLY"},
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
         update_mod_date=False,
     )
     info = read_pdf_metadata(out)
@@ -86,11 +86,11 @@ def test_replace_pdf_metadata_blows_away_existing(tmp: Path):
     print("  [PASS] replace_pdf_metadata replaces entire dict")
 
 
-def test_remove_pdf_metadata_drops_keys(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
+def test_remove_pdf_metadata_drops_keys(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
     out = remove_pdf_metadata(
         src, ["/Author"],
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
         update_mod_date=False,
     )
     info = read_pdf_metadata(out)
@@ -113,14 +113,14 @@ def test_find_non_standard_metadata():
 
 # ─── edit_pdf_metadata (the new unified write) ────────────────────────────
 
-def test_edit_pdf_metadata_applies_updates_and_drops(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf",
+def test_edit_pdf_metadata_applies_updates_and_drops(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf",
                     {"/Title": "T", "/Author": "A", "/Subject": "S"})
     out = edit_pdf_metadata(
         src,
         updates={"/Title": "NEW", "/Keywords": "k1,k2"},
         drops=["/Author"],
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
     )
     info = read_pdf_metadata(out)
     assert info["/Title"] == "NEW"
@@ -130,14 +130,14 @@ def test_edit_pdf_metadata_applies_updates_and_drops(tmp: Path):
     print("  [PASS] edit_pdf_metadata applies updates+drops in one pass")
 
 
-def test_edit_pdf_metadata_drops_win_over_updates(tmp: Path):
+def test_edit_pdf_metadata_drops_win_over_updates(tmp_path: Path):
     """If a key is in both updates and drops, drops win (key is removed)."""
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     out = edit_pdf_metadata(
         src,
         updates={"/Title": "NEW", "/Keywords": "k"},
         drops=["/Title"],
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
         update_mod_date=False,
     )
     info = read_pdf_metadata(out)
@@ -146,14 +146,14 @@ def test_edit_pdf_metadata_drops_win_over_updates(tmp: Path):
     print("  [PASS] edit_pdf_metadata: drops win over updates")
 
 
-def test_edit_pdf_metadata_single_moddate_stamp(tmp: Path):
+def test_edit_pdf_metadata_single_moddate_stamp(tmp_path: Path):
     """Regression test: only ONE /ModDate bump per edit call (not two)."""
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
     out = edit_pdf_metadata(
         src,
         updates={"/Title": "NEW"},
         drops=["/Author"],
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
     )
     info = read_pdf_metadata(out)
     mod1 = info["/ModDate"]
@@ -165,19 +165,19 @@ def test_edit_pdf_metadata_single_moddate_stamp(tmp: Path):
     out2 = edit_pdf_metadata(
         out,
         updates={"/Subject": "S"},
-        output_path=tmp / "out2.pdf",
+        output_path=tmp_path / "out2.pdf",
     )
     mod2 = read_pdf_metadata(out2)["/ModDate"]
     assert mod2 != mod1, "ModDate should bump on a fresh edit"
     print("  [PASS] edit_pdf_metadata bumps /ModDate exactly once per call")
 
 
-def test_edit_pdf_metadata_no_mod_date_when_disabled(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_edit_pdf_metadata_no_mod_date_when_disabled(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     out = edit_pdf_metadata(
         src,
         updates={"/Title": "X"},
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
         update_mod_date=False,
     )
     info = read_pdf_metadata(out)
@@ -185,26 +185,26 @@ def test_edit_pdf_metadata_no_mod_date_when_disabled(tmp: Path):
     print("  [PASS] edit_pdf_metadata respects update_mod_date=False")
 
 
-def test_edit_pdf_metadata_caller_moddate_wins(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_edit_pdf_metadata_caller_moddate_wins(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     explicit = "D:20200101000000+00'00'"
     out = edit_pdf_metadata(
         src,
         updates={"/Title": "X", "/ModDate": explicit},
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
     )
     info = read_pdf_metadata(out)
     assert info["/ModDate"] == explicit
     print("  [PASS] edit_pdf_metadata: caller-supplied /ModDate is preserved")
 
 
-def test_edit_pdf_metadata_drops_moddate(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf",
+def test_edit_pdf_metadata_drops_moddate(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf",
                     {"/Title": "T", "/ModDate": "D:20200101000000+00'00'"})
     out = edit_pdf_metadata(
         src,
         drops=["/ModDate"],
-        output_path=tmp / "out.pdf",
+        output_path=tmp_path / "out.pdf",
     )
     info = read_pdf_metadata(out)
     assert "/ModDate" not in info, (
@@ -213,8 +213,8 @@ def test_edit_pdf_metadata_drops_moddate(tmp: Path):
     print("  [PASS] edit_pdf_metadata: drops /ModDate cleanly")
 
 
-def test_edit_pdf_metadata_inplace(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
+def test_edit_pdf_metadata_inplace(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
     out = edit_pdf_metadata(
         src,
         updates={"/Title": "X"},
@@ -233,10 +233,21 @@ def test_edit_pdf_metadata_inplace(tmp: Path):
 def test_parse_pdf_date():
     assert parse_pdf_date(None) is None
     assert parse_pdf_date("") is None
-    d = parse_pdf_date("D:20240115093000+02'00'")
-    assert d == datetime(2024, 1, 15, 9, 30, 0)
 
-    # without D: prefix
+    # Offsets are now applied and normalised to naive UTC (was: stripped).
+    # +02:00 means the local clock is ahead of UTC, so UTC = local - 2h.
+    d = parse_pdf_date("D:20240115093000+02'00'")
+    assert d == datetime(2024, 1, 15, 7, 30, 0)
+
+    # -05:00 (e.g. New York) → UTC = local + 5h
+    d_neg = parse_pdf_date("D:20240115093000-05'00'")
+    assert d_neg == datetime(2024, 1, 15, 14, 30, 0)
+
+    # Explicit Z (UTC) → unchanged
+    d_z = parse_pdf_date("D:20240115093000Z")
+    assert d_z == datetime(2024, 1, 15, 9, 30, 0)
+
+    # without D: prefix and no tz → naive, interpreted as already-UTC
     d2 = parse_pdf_date("20240115093000")
     assert d2 == datetime(2024, 1, 15, 9, 30, 0)
 
@@ -245,11 +256,11 @@ def test_parse_pdf_date():
     assert d3 == datetime(2024, 1, 15)
 
     assert parse_pdf_date("not-a-date") is None
-    print("  [PASS] parse_pdf_date handles all PDF-date variants")
+    print("  [PASS] parse_pdf_date handles all PDF-date variants (UTC-normalised)")
 
 
-def test_read_pdf_summary(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_read_pdf_summary(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     s = read_pdf_summary(src)
     assert s["pages"] == 1
     assert s["file_size"] > 0
@@ -260,16 +271,16 @@ def test_read_pdf_summary(tmp: Path):
     print("  [PASS] read_pdf_summary returns plausible identity")
 
 
-def test_read_pdf_revisions_clean(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_read_pdf_revisions_clean(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     r = read_pdf_revisions(src)
     assert r["eof_count"] >= 1
     assert r["trailing_bytes_after_eof"] <= 4
     print("  [PASS] read_pdf_revisions on clean PDF")
 
 
-def test_read_pdf_revisions_with_appended_junk(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_read_pdf_revisions_with_appended_junk(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     with open(src, "ab") as fh:
         fh.write(b"junk appended after EOF\n")
     r = read_pdf_revisions(src)
@@ -277,8 +288,8 @@ def test_read_pdf_revisions_with_appended_junk(tmp: Path):
     print("  [PASS] read_pdf_revisions detects bytes after %%EOF")
 
 
-def test_read_pdf_dynamic_clean(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_read_pdf_dynamic_clean(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     d = read_pdf_dynamic(src)
     assert d["has_acroform"] is False
     assert d["has_openaction"] is False
@@ -290,9 +301,9 @@ def test_read_pdf_dynamic_clean(tmp: Path):
 
 # ─── checker verdicts ─────────────────────────────────────────────────────
 
-def test_check_pdf_clean(tmp: Path):
+def test_check_pdf_clean(tmp_path: Path):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    src = _make_pdf(tmp / "in.pdf", {
+    src = _make_pdf(tmp_path / "in.pdf", {
         "/Title": "T",
         "/CreationDate": _pdf_date(now - timedelta(hours=1)),
         "/ModDate": _pdf_date(now),
@@ -304,9 +315,9 @@ def test_check_pdf_clean(tmp: Path):
     print(f"  [PASS] check_pdf clean → {report.verdict}")
 
 
-def test_check_pdf_mod_before_creation(tmp: Path):
+def test_check_pdf_mod_before_creation(tmp_path: Path):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    src = _make_pdf(tmp / "in.pdf", {
+    src = _make_pdf(tmp_path / "in.pdf", {
         "/CreationDate": _pdf_date(now),
         "/ModDate": _pdf_date(now - timedelta(hours=1)),  # mod precedes creation
     })
@@ -317,9 +328,9 @@ def test_check_pdf_mod_before_creation(tmp: Path):
     print("  [PASS] check_pdf flags /ModDate before /CreationDate")
 
 
-def test_check_pdf_creation_in_future(tmp: Path):
+def test_check_pdf_creation_in_future(tmp_path: Path):
     far_future = datetime(2099, 1, 1)
-    src = _make_pdf(tmp / "in.pdf", {
+    src = _make_pdf(tmp_path / "in.pdf", {
         "/CreationDate": _pdf_date(far_future),
         "/ModDate": _pdf_date(far_future),
     })
@@ -330,8 +341,8 @@ def test_check_pdf_creation_in_future(tmp: Path):
     print("  [PASS] check_pdf flags future /CreationDate")
 
 
-def test_check_pdf_junk_after_eof(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_check_pdf_junk_after_eof(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     with open(src, "ab") as fh:
         fh.write(b"\nappended-junk-payload\n")
     report = check_pdf(src)
@@ -341,8 +352,8 @@ def test_check_pdf_junk_after_eof(tmp: Path):
     print("  [PASS] check_pdf flags junk bytes after %%EOF")
 
 
-def test_check_pdf_to_dict_serializable(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_check_pdf_to_dict_serializable(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     report = check_pdf(src)
     d = report.to_dict()
     blob = json.dumps(d, default=str)  # must round-trip via json
@@ -353,9 +364,9 @@ def test_check_pdf_to_dict_serializable(tmp: Path):
 
 # ─── CLI ──────────────────────────────────────────────────────────────────
 
-def test_cli_edit_set_and_unset(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T", "/Author": "A"})
-    out = tmp / "out.pdf"
+def test_cli_edit_set_and_unset(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T", "/Author": "A"})
+    out = tmp_path / "out.pdf"
     runner = CliRunner()
     r = runner.invoke(app, [
         "edit", str(src),
@@ -372,8 +383,8 @@ def test_cli_edit_set_and_unset(tmp: Path):
     print("  [PASS] CLI edit --set + --unset writes once")
 
 
-def test_cli_edit_inplace(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_cli_edit_inplace(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     runner = CliRunner()
     r = runner.invoke(app, [
         "edit", str(src),
@@ -386,22 +397,22 @@ def test_cli_edit_inplace(tmp: Path):
     print("  [PASS] CLI edit --inplace overwrites source")
 
 
-def test_cli_edit_rejects_inplace_with_output(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_cli_edit_rejects_inplace_with_output(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     runner = CliRunner()
     r = runner.invoke(app, [
         "edit", str(src),
         "--set", "Title=X",
         "--inplace",
-        "--output", str(tmp / "out.pdf"),
+        "--output", str(tmp_path / "out.pdf"),
     ])
     assert r.exit_code != 0
     assert "mutually exclusive" in r.output
     print("  [PASS] CLI edit rejects --inplace + --output")
 
 
-def test_cli_edit_requires_action(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_cli_edit_requires_action(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     runner = CliRunner()
     r = runner.invoke(app, ["edit", str(src), "--inplace"])
     assert r.exit_code != 0
@@ -409,9 +420,9 @@ def test_cli_edit_requires_action(tmp: Path):
     print("  [PASS] CLI edit requires --set or --unset")
 
 
-def test_cli_check_clean_exits_zero(tmp: Path):
+def test_cli_check_clean_exits_zero(tmp_path: Path):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    src = _make_pdf(tmp / "in.pdf", {
+    src = _make_pdf(tmp_path / "in.pdf", {
         "/CreationDate": _pdf_date(now - timedelta(hours=1)),
         "/ModDate": _pdf_date(now),
     })
@@ -421,8 +432,8 @@ def test_cli_check_clean_exits_zero(tmp: Path):
     print("  [PASS] CLI check exits 0 on clean PDF")
 
 
-def test_cli_check_tampered_exits_two(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_cli_check_tampered_exits_two(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     with open(src, "ab") as fh:
         fh.write(b"\nappended-junk\n")
     runner = CliRunner()
@@ -431,8 +442,8 @@ def test_cli_check_tampered_exits_two(tmp: Path):
     print("  [PASS] CLI check exits 2 on tampered PDF")
 
 
-def test_cli_check_json(tmp: Path):
-    src = _make_pdf(tmp / "in.pdf", {"/Title": "T"})
+def test_cli_check_json(tmp_path: Path):
+    src = _make_pdf(tmp_path / "in.pdf", {"/Title": "T"})
     runner = CliRunner()
     r = runner.invoke(app, ["check", str(src), "--json"])
     assert r.exit_code in (0, 1, 2), r.output
@@ -505,3 +516,8 @@ if __name__ == "__main__":
     if failed == 0:
         print("ALL TESTS PASSED!")
     print("=" * 60)
+
+    # Non-zero exit on any failure so CI catches regressions instead of
+    # reading the "X failed" line and still calling it a green build.
+    import sys
+    sys.exit(1 if failed else 0)

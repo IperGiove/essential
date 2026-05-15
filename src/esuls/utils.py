@@ -7,7 +7,7 @@ need run_parallel.
 """
 import asyncio
 from pathlib import Path
-from typing import Awaitable, List, TypeVar
+from typing import Awaitable, List, TypeVar, Union
 
 T = TypeVar("T")
 
@@ -15,8 +15,23 @@ T = TypeVar("T")
 async def run_parallel(
     *coroutines: Awaitable[T],
     limit: int = 20,
-) -> List[T]:
-    """Run parallel coroutines with semaphore limit, preserving order"""
+    return_exceptions: bool = True,
+) -> List[Union[T, BaseException]]:
+    """Run parallel coroutines with a semaphore limit, preserving order.
+
+    `return_exceptions` defaults to True so a single failure does not leave
+    its siblings running as orphan tasks. With raw `asyncio.gather` and
+    `return_exceptions=False`, the first raised exception propagates
+    immediately to the caller but the other in-flight coroutines keep
+    running in the background to natural completion — wasting CPU/IO and
+    holding resources (sockets, file handles, DB cursors) the caller
+    thinks were already torn down.
+
+    Callers that need fail-fast propagation pass `return_exceptions=False`
+    explicitly and accept the orphan-task trade-off. Callers that want the
+    classic "wait for everyone, surface failures in the result" semantics
+    iterate the returned list and check `isinstance(r, BaseException)`.
+    """
 
     semaphore = asyncio.Semaphore(limit)
 
@@ -24,7 +39,22 @@ async def run_parallel(
         async with semaphore:
             return await coro
 
-    return await asyncio.gather(*[limited_coroutine(coro) for coro in coroutines])
+    results = await asyncio.gather(
+        *[limited_coroutine(coro) for coro in coroutines],
+        return_exceptions=return_exceptions,
+    )
+
+    # `return_exceptions=True` captures EVERY BaseException, including
+    # KeyboardInterrupt and SystemExit. Bundling those into the result
+    # list would silently swallow Ctrl-C / sys.exit() and let the
+    # process keep running. Re-raise them so they propagate as the
+    # user expects; ordinary Exception subclasses (the actual point
+    # of return_exceptions=True) stay in the list.
+    if return_exceptions:
+        for r in results:
+            if isinstance(r, (KeyboardInterrupt, SystemExit)):
+                raise r
+    return results
 
 
 # ---------------------------------------------------------------------------

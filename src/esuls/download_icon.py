@@ -6,6 +6,29 @@ import magic
 from PIL import Image
 from .request_cli import make_request
 
+# Decompression-bomb hardening:
+#   - MAX_ICON_BYTES caps the byte stream we hand to PIL. Icons that
+#     exceed this are almost certainly not icons.
+#   - PIL's MAX_IMAGE_PIXELS gate protects against payloads with a small
+#     compressed footprint but enormous declared dimensions (the classic
+#     "PNG bomb"). 25 MP is generous for any real-world icon/avatar (a
+#     5000×5000 image is already absurd in this context) while keeping
+#     well below PIL's default of ~89 MP, which can still allocate
+#     hundreds of MB during verify().
+# Both gates are module-level — local context-managers around them would
+# be racy in multi-threaded callers and the conservative values do not
+# meaningfully restrict legitimate use of this module.
+MAX_ICON_BYTES = 10 * 1024 * 1024  # 10 MB
+Image.MAX_IMAGE_PIXELS = 25_000_000  # 25 megapixels
+
+# Module-level singleton: `magic.Magic(mime=True)` loads the libmagic
+# database (~several MB of compiled patterns) on construction. Rebuilding
+# it on every call to _detect_mime_type wastes startup work and syscall
+# bandwidth. The instance is read-only at use time (only `.from_buffer`
+# is called), so sharing it across threads/coroutines is safe.
+_MIME_DETECTOR = magic.Magic(mime=True)
+
+
 # Type definition
 class IconData(TypedDict):
     data: bytes
@@ -49,13 +72,18 @@ async def download_icon(url: str, filename: Optional[str] = None) -> Optional[Ic
     response = await make_request(url, max_attempt=3, add_user_agent=True)
     if not response:
         return None
-        
+
     file_buffer = response.content
+    if len(file_buffer) > MAX_ICON_BYTES:
+        # Reject oversized payloads before PIL sees them: a small
+        # compressed stream can still declare gigantic dimensions.
+        return None
+
     mime_type = _detect_mime_type(file_buffer)
-    
+
     if not mime_type:
         return None
-        
+
     if not verify_image(file_buffer, mime_type):
         return None
         
@@ -81,9 +109,8 @@ def _extract_filename(url: str) -> str:
     return unquote(filename)
 
 def _detect_mime_type(data: bytes) -> Optional[str]:
-    """Detect MIME type from file content."""
-    mime = magic.Magic(mime=True)
-    return mime.from_buffer(data)
+    """Detect MIME type from file content via the module-level singleton."""
+    return _MIME_DETECTOR.from_buffer(data)
 
 def verify_image(data: bytes, mime_type: str) -> bool:
     """Verify image data integrity."""

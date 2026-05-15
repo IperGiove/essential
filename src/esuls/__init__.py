@@ -12,7 +12,10 @@ except PackageNotFoundError:
 
 # Import all utilities
 from .utils import run_parallel, load_config, generate_example_files
-from .db_cli import AsyncDB, BaseModel
+from .db_cli import (
+    AsyncDB, BaseModel, IdModel, IntIdModel, TimestampedIntModel,
+    TimestampedModel, discover_migrations, utcnow,
+)
 from .request_cli import AsyncRequest, make_request, make_request_cffi, make_request_playwright, Response
 from .download_icon import download_icon
 from .pdf import (
@@ -41,6 +44,12 @@ __all__ = [
     'generate_example_files',
     'AsyncDB',
     'BaseModel',
+    'IdModel',
+    'IntIdModel',
+    'TimestampedModel',
+    'TimestampedIntModel',
+    'discover_migrations',
+    'utcnow',
     'AsyncRequest',
     'make_request',
     'make_request_cffi',

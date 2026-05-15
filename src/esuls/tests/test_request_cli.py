@@ -3,6 +3,7 @@ Tests for request_cli HTTP utilities.
 """
 import asyncio
 import json
+from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from esuls.request_cli import (
@@ -83,18 +84,86 @@ async def test_get_user_agent_fallback():
     print("  [PASS] UserAgent fallback on error")
 
 
+# ─── streaming-mock helpers ───────────────────────────────────────────────
+#
+# `_run_with_retry` now drives requests through `client.stream(...)`, an
+# async context manager that yields a response whose body is consumed via
+# `aiter_bytes()`. These helpers impersonate that surface so the existing
+# tests don't need to know about it individually. Two flavours:
+#   - `_make_streaming_mock_client` for happy/non-2xx paths
+#   - `_make_failing_mock_client`   for transport-error retry paths
+
+
+def _make_streaming_mock_client(
+    status_code: int = 200,
+    body: bytes = b"ok",
+    encoding: str = "utf-8",
+    headers: Optional[Dict[str, str]] = None,
+):
+    """Mock httpx.AsyncClient whose .stream(...) yields a one-chunk response.
+
+    Returns (mock_client, captured) — `captured` accumulates one dict per
+    call with the stream kwargs, so tests can assert the per-call payload
+    that was forwarded.
+    """
+    captured: list[Dict[str, Any]] = []
+
+    response_headers = dict(headers or {"content-type": "text/html"})
+    # If Content-Length is not provided we leave it absent so the cap
+    # check falls through to streaming — closer to real-world chunked
+    # transfer behaviour. Tests that need a specific CL can pass headers.
+
+    def fake_stream(method, url, **kwargs):
+        captured.append({"method": method, "url": url, **kwargs})
+
+        class _StreamResp:
+            def __init__(self):
+                self.status_code = status_code
+                self.encoding = encoding
+                self.headers = response_headers
+                self.url = url
+
+            async def aiter_bytes(self):
+                yield body
+
+        class _CM:
+            async def __aenter__(self):
+                return _StreamResp()
+
+            async def __aexit__(self, *a):
+                return False
+
+        return _CM()
+
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(side_effect=fake_stream)
+    mock_client.aclose = AsyncMock()
+    mock_client.is_closed = False
+    return mock_client, captured
+
+
+def _make_failing_mock_client(exc: BaseException):
+    """Mock httpx.AsyncClient whose .stream(...) raises on enter."""
+    def fake_stream(method, url, **kwargs):
+        class _CM:
+            async def __aenter__(self):
+                raise exc
+            async def __aexit__(self, *a):
+                return False
+        return _CM()
+
+    mock_client = MagicMock()
+    mock_client.stream = MagicMock(side_effect=fake_stream)
+    mock_client.aclose = AsyncMock()
+    mock_client.is_closed = False
+    return mock_client
+
+
 async def test_make_request_success():
     """Test make_request with a mocked successful response."""
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.headers = {"content-type": "text/html"}
-    mock_response.content = b"<html>OK</html>"
-    mock_response.text = "<html>OK</html>"
-    mock_response.url = "https://example.com"
-
-    mock_client = AsyncMock()
-    mock_client.request = AsyncMock(return_value=mock_response)
-    mock_client.is_closed = False
+    mock_client, _ = _make_streaming_mock_client(
+        status_code=200, body=b"<html>OK</html>",
+    )
 
     with patch(
         "esuls.request_cli._get_domain_client",
@@ -110,11 +179,7 @@ async def test_make_request_success():
 
 async def test_make_request_retry_on_error():
     """Test make_request retries on HTTP errors then returns None."""
-    mock_client = AsyncMock()
-    mock_client.request = AsyncMock(
-        side_effect=OSError("connection refused"),
-    )
-    mock_client.is_closed = False
+    mock_client = _make_failing_mock_client(OSError("connection refused"))
 
     with patch(
         "esuls.request_cli._get_domain_client",
@@ -128,22 +193,15 @@ async def test_make_request_retry_on_error():
         )
 
     assert resp is None
-    assert mock_client.request.call_count == 2
+    assert mock_client.stream.call_count == 2
     print("  [PASS] make_request retry on error")
 
 
 async def test_make_request_force_response():
     """Test make_request returns response on failure when force_response=True."""
-    mock_response = MagicMock()
-    mock_response.status_code = 500
-    mock_response.headers = {}
-    mock_response.content = b"error"
-    mock_response.text = "error"
-    mock_response.url = "https://example.com"
-
-    mock_client = AsyncMock()
-    mock_client.request = AsyncMock(return_value=mock_response)
-    mock_client.is_closed = False
+    mock_client, _ = _make_streaming_mock_client(
+        status_code=500, body=b"error",
+    )
 
     with patch(
         "esuls.request_cli._get_domain_client",
@@ -164,16 +222,9 @@ async def test_make_request_force_response():
 
 async def test_make_request_no_retry_status():
     """Test make_request exits immediately for no-retry status codes."""
-    mock_response = MagicMock()
-    mock_response.status_code = 404
-    mock_response.headers = {}
-    mock_response.content = b"not found"
-    mock_response.text = "not found"
-    mock_response.url = "https://example.com"
-
-    mock_client = AsyncMock()
-    mock_client.request = AsyncMock(return_value=mock_response)
-    mock_client.is_closed = False
+    mock_client, _ = _make_streaming_mock_client(
+        status_code=404, body=b"not found",
+    )
 
     with patch(
         "esuls.request_cli._get_domain_client",
@@ -190,7 +241,7 @@ async def test_make_request_no_retry_status():
 
     assert resp is not None
     assert resp.status_code == 404
-    assert mock_client.request.call_count == 1
+    assert mock_client.stream.call_count == 1
     print("  [PASS] make_request no-retry status code")
 
 
@@ -255,25 +306,17 @@ async def test_make_request_cffi_error():
     print("  [PASS] make_request_cffi returns None on error")
 
 
-def _make_mock_client(status_code=200, body=b"ok", text="ok"):
-    """Build a MagicMock httpx.AsyncClient that records request kwargs."""
-    captured = []
+def _make_mock_client(status_code=200, body=b"ok", text=None):
+    """Build a MagicMock httpx.AsyncClient that records stream() kwargs.
 
-    async def fake_request(method, url, **kwargs):
-        captured.append({"method": method, "url": url, **kwargs})
-        mock_response = MagicMock()
-        mock_response.status_code = status_code
-        mock_response.headers = {"content-type": "text/html"}
-        mock_response.content = body
-        mock_response.text = text
-        mock_response.url = url
-        return mock_response
-
-    mock_client = MagicMock()
-    mock_client.request = AsyncMock(side_effect=fake_request)
-    mock_client.aclose = AsyncMock()
-    mock_client.is_closed = False
-    return mock_client, captured
+    Back-compat shim over `_make_streaming_mock_client` so the existing
+    AsyncRequest tests don't need to know that the transport surface is
+    `.stream(...)` rather than `.request(...)`. `text` is ignored: the
+    streaming response derives text from `body` via the configured
+    encoding (utf-8), so a caller asking for a specific text body should
+    pass it as `body` bytes.
+    """
+    return _make_streaming_mock_client(status_code=status_code, body=body)
 
 
 async def test_async_request_per_call_headers_cookies():
@@ -375,7 +418,7 @@ async def test_async_request_no_retry_status_codes():
     assert resp is not None and resp.status_code == 404
     # Without no_retry_status_codes the loop would have done 5 calls;
     # with it, it bails out after the first attempt.
-    assert mock_client.request.call_count == 1, mock_client.request.call_count
+    assert mock_client.stream.call_count == 1, mock_client.stream.call_count
     print("  [PASS] AsyncRequest honours no_retry_status_codes")
 
 
@@ -434,7 +477,7 @@ async def test_async_request_persistent_client_reused():
 
     # Only ONE AsyncClient was constructed across 4 calls
     assert len(constructed) == 1, constructed
-    assert mock_client.request.call_count == 4
+    assert mock_client.stream.call_count == 4
     print("  [PASS] AsyncRequest reuses the persistent client across calls")
 
 

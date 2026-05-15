@@ -5,20 +5,19 @@ NOT NULL schema logic, identifier validation, connection pooling.
 """
 import asyncio
 import enum
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import sqlite3
-import threading
+from sqlalchemy import event, text
+
 from esuls.db_cli import (
     AsyncDB,
     BaseModel,
-    _validate_identifier,
-    _mark_aiosqlite_daemon,
+    _db_state_by_loop,
     _is_sqlite_busy,
     _is_stale_connection,
+    _validate_identifier,
 )
 
 
@@ -175,9 +174,9 @@ async def test_enum_subclass_column_types(temp_db):
         await db.save(EnumItem(color=Color.RED, priority=Priority.HIGH,
                                status=Status.ACTIVE))
 
-        async with db.transaction() as conn:
-            cursor = await conn.execute("PRAGMA table_info(enum_cols)")
-            rows = await cursor.fetchall()
+        async with db.transaction(read_only=True) as conn:
+            result = await conn.execute(text("PRAGMA table_info(enum_cols)"))
+            rows = result.fetchall()
 
         col_types = {row[1]: row[2] for row in rows}
         assert col_types.get("priority") == "INTEGER", col_types
@@ -195,19 +194,25 @@ async def test_enum_subclass_column_types(temp_db):
 
 
 async def test_int_and_bool_column_types(temp_db):
-    """bool maps to INTEGER (subclass of int), str/float behave as expected."""
+    """bool/int/float/str map to the SQLA-rendered declared types.
+
+    Note: SQLite is dynamically typed; the *declared* type only sets
+    type affinity. Boolean → BOOLEAN (NUMERIC affinity), Float → FLOAT
+    (REAL affinity). Functionally equivalent to the prior INTEGER/REAL
+    declarations.
+    """
     db = AsyncDB(temp_db, "defaults_cols", DefaultsItem)
     try:
         await db.save(DefaultsItem())
 
-        async with db.transaction() as conn:
-            cursor = await conn.execute("PRAGMA table_info(defaults_cols)")
-            rows = await cursor.fetchall()
+        async with db.transaction(read_only=True) as conn:
+            result = await conn.execute(text("PRAGMA table_info(defaults_cols)"))
+            rows = result.fetchall()
 
         col_types = {row[1]: row[2] for row in rows}
         assert col_types.get("count") == "INTEGER", col_types
-        assert col_types.get("flag") == "INTEGER", col_types     # bool → INTEGER
-        assert col_types.get("score") == "REAL", col_types
+        assert col_types.get("flag") == "BOOLEAN", col_types
+        assert col_types.get("score") == "FLOAT", col_types
         assert col_types.get("name") == "TEXT", col_types
         print("✓ int/bool/float/str map to correct SQLite column types")
     finally:
@@ -277,47 +282,6 @@ async def test_is_stale_connection_helper():
     print("✓ _is_stale_connection matches closed/no-active-connection")
 
 
-async def test_mark_aiosqlite_daemon_shapes():
-    """_mark_aiosqlite_daemon handles all three aiosqlite shapes gracefully."""
-
-    # Modern shape (aiosqlite >= 0.22): Connection wraps a Thread in _thread.
-    class ModernConn:
-        def __init__(self):
-            self._thread = threading.Thread(target=lambda: None)
-
-    modern = ModernConn()
-    assert _mark_aiosqlite_daemon(modern) is True
-    assert modern._thread.daemon is True
-
-    # Legacy shape (aiosqlite <= 0.21): Connection extends Thread directly.
-    class LegacyConn(threading.Thread):
-        def __init__(self):
-            super().__init__(target=lambda: None)
-
-    legacy = LegacyConn()
-    assert _mark_aiosqlite_daemon(legacy) is True
-    assert legacy.daemon is True
-
-    # Hypothetical future shape: neither _thread nor Thread subclass.
-    # Should NOT raise; should return False (safety net not applied).
-    class FutureConn:
-        pass
-
-    future = FutureConn()
-    assert _mark_aiosqlite_daemon(future) is False
-
-    # Object with _thread that ISN'T a Thread (broken shape) — must not crash.
-    class BrokenConn:
-        _thread = "not actually a thread"
-
-    broken = BrokenConn()
-    # Setting `.daemon = True` on a string raises AttributeError; the
-    # helper must catch it and return False rather than crash the connect.
-    assert _mark_aiosqlite_daemon(broken) is False
-
-    print("✓ _mark_aiosqlite_daemon handles modern/legacy/unknown/broken shapes")
-
-
 async def test_identifier_validation():
     """Test that invalid SQL identifiers are rejected."""
     # Valid identifiers
@@ -358,39 +322,42 @@ async def test_identifier_validation_in_constructor(temp_db):
 
 
 async def test_connection_pooling(temp_db):
-    """Test that persistent connection is reused across operations."""
+    """Engines are cached per (loop, db_path) and reused across operations.
+
+    Replaces the old `db._connection` identity check. The SQLA writer/reader
+    engine pair lives in the per-loop registry; it must persist across
+    operations and be reset after `close()`.
+    """
     db = AsyncDB(temp_db, "items", TestItem)
+    key = str(temp_db.resolve())
 
-    # First operation creates the connection
+    # First operation creates the engine pair
     await db.save(TestItem(name="first", value=1))
-    conn1 = db._connection
-    assert conn1 is not None
+    state = _db_state_by_loop[asyncio.get_running_loop()]
+    pair1 = state["engines"][key]
+    assert pair1 is not None
 
-    # Subsequent operations reuse it
+    # Subsequent operations reuse the same engines
     await db.find()
-    conn2 = db._connection
-    assert conn2 is conn1, "Connection should be reused"
+    assert state["engines"][key] is pair1, "engines should be reused"
 
     await db.count()
-    conn3 = db._connection
-    assert conn3 is conn1, "Connection should still be reused"
+    assert state["engines"][key] is pair1
 
     await db.save(TestItem(name="second", value=2))
-    conn4 = db._connection
-    assert conn4 is conn1, "Connection should persist across saves"
+    assert state["engines"][key] is pair1
 
-    # Explicit close
+    # Explicit close clears the cache
     await db.close()
-    assert db._connection is None
+    assert key not in state["engines"]
 
-    # Next operation creates a new connection
+    # Next operation creates a fresh engine pair
     await db.find()
-    conn5 = db._connection
-    assert conn5 is not None
-    assert conn5 is not conn1, "Should be a new connection after close"
+    pair2 = state["engines"][key]
+    assert pair2 is not None and pair2 is not pair1, "fresh engines after close"
 
     await db.close()
-    print("✓ Connection pooling reuses connections correctly")
+    print("✓ Engine pool reuses (writer, reader) across ops and resets on close")
 
 
 async def test_close_idempotent(temp_db):
@@ -496,15 +463,17 @@ async def test_update_fields(temp_db):
 
 
 async def test_context_manager(temp_db):
-    """Test async context manager for automatic cleanup."""
+    """Async context manager disposes engines on __aexit__."""
+    key = str(temp_db.resolve())
     async with AsyncDB(temp_db, "items", TestItem) as db:
         await db.save(TestItem(name="ctx", value=42))
         items = await db.find()
         assert len(items) == 1
         assert items[0].name == "ctx"
 
-    # Connection should be closed after exiting context
-    assert db._connection is None
+    # After __aexit__, the engine pair is no longer in the registry.
+    state = _db_state_by_loop[asyncio.get_running_loop()]
+    assert key not in state["engines"]
 
     # Should still work when reopened
     async with AsyncDB(temp_db, "items", TestItem) as db:
@@ -515,71 +484,72 @@ async def test_context_manager(temp_db):
 
 
 async def test_read_paths_skip_commit(temp_db):
-    """Read-only operations must NOT call commit() — saves a round-trip
-    to the aiosqlite worker thread for each read.
+    """Read-only operations must NOT issue COMMIT.
 
-    Write operations must still commit so changes are durable.
+    With SQLA the reader engine is opened via `engine.connect()` (no BEGIN),
+    while the writer uses `engine.begin()` (autocommit on success). We
+    register a `commit` event listener on the reader's underlying sync
+    engine and assert it never fires from read paths.
     """
     db = AsyncDB(temp_db, "items", TestItem)
     try:
-        # Force the connection open with one initial save.
+        # Force engines open with one initial save.
         await db.save(TestItem(name="seed", value=1))
 
-        # Spy on the underlying commit() with a counter wrapper.
-        commit_count = 0
-        original_commit = db._connection.commit
+        writer, reader = await db._ensure_engines()
+        reader_commits = 0
+        writer_commits = 0
 
-        async def counting_commit():
-            nonlocal commit_count
-            commit_count += 1
-            return await original_commit()
+        @event.listens_for(reader.sync_engine, "commit")
+        def _on_reader_commit(_conn):
+            nonlocal reader_commits
+            reader_commits += 1
 
-        db._connection.commit = counting_commit
+        @event.listens_for(writer.sync_engine, "commit")
+        def _on_writer_commit(_conn):
+            nonlocal writer_commits
+            writer_commits += 1
 
-        # All read paths — none should commit.
+        # Read paths — reader engine must not commit.
         await db.find()
         await db.find(name="seed")
         await db.count()
         await db.count(name="seed")
         await db.get_by_id("nonexistent")
-        await db.exists(name="seed")          # internally calls count
-        await db.fetch_all()                  # internally calls find
-        assert commit_count == 0, (
-            f"read paths committed {commit_count} times — expected 0"
+        await db.exists(name="seed")
+        await db.fetch_all()
+        assert reader_commits == 0, (
+            f"reader committed {reader_commits} times — expected 0"
         )
 
-        # Write paths still commit.
+        # Write paths — writer engine must commit.
         await db.save(TestItem(name="another", value=2))
-        assert commit_count >= 1, (
-            f"write path didn't commit (count={commit_count})"
+        assert writer_commits >= 1, (
+            f"writer didn't commit on save (count={writer_commits})"
         )
-        commits_after_save = commit_count
+        commits_after_save = writer_commits
 
         await db.delete_many(name="seed")
-        assert commit_count > commits_after_save, (
-            "delete_many didn't commit"
+        assert writer_commits > commits_after_save, (
+            "writer didn't commit on delete_many"
         )
 
-        print("✓ read paths skip commit; write paths commit")
+        print("✓ reader engine never commits; writer commits on writes")
     finally:
         await db.close()
 
 
-async def test_prepare_item_preserves_explicit_falsy_id(temp_db):
+async def test_item_to_row_preserves_explicit_falsy_id(temp_db):
     """Falsy-but-non-None ids must be preserved, not silently replaced.
 
-    Regression: pre-fix `_prepare_item` used `data.pop('id', None) or
-    str(uuid.uuid4())`, which replaced "", 0, False, etc. with a fresh
-    UUID — masking the user's intent and breaking schemas with non-string
-    ids (e.g. `id: int = 0`).
+    `_item_to_row` (formerly `_prepare_item`) only auto-generates a UUID
+    when id is explicitly None; empty-string / 0 / False stay untouched.
     """
     db = AsyncDB(temp_db, "items", TestItem)
     try:
-        # Empty-string id is preserved end-to-end.
         item_empty = TestItem(id="", name="empty_id", value=1)
-        sql, values = db._prepare_item(item_empty)
-        # The id is the LAST element of values (appended after the columns).
-        assert values[-1] == "", f"expected '', got {values[-1]!r}"
+        row = db._item_to_row(item_empty)
+        assert row["id"] == "", f"expected '', got {row['id']!r}"
 
         await db.save(item_empty)
         results = await db.find(name="empty_id")
@@ -587,106 +557,64 @@ async def test_prepare_item_preserves_explicit_falsy_id(temp_db):
         assert results[0].id == "", (
             f"id was silently replaced: {results[0].id!r}"
         )
-        print("✓ _prepare_item preserves explicit empty-string id")
+        print("✓ _item_to_row preserves explicit empty-string id")
     finally:
         await db.close()
 
 
-async def test_prepare_item_generates_id_when_none(temp_db):
+async def test_item_to_row_generates_id_when_none(temp_db):
     """When id is explicitly None, a fresh UUID is generated."""
     db = AsyncDB(temp_db, "items", TestItem)
     try:
         item = TestItem(name="auto_id", value=2)
-        # Force the explicit-None branch (BaseModel's default_factory would
-        # otherwise produce a UUID at __init__ time).
         item.id = None  # type: ignore[assignment]
-        sql, values = db._prepare_item(item)
-        # Generated id should look like a UUID string (36 chars with dashes).
-        generated = values[-1]
+        row = db._item_to_row(item)
+        generated = row["id"]
         assert isinstance(generated, str)
-        assert len(generated) == 36, f"unexpected id format: {generated!r}"
-        assert generated.count("-") == 4, f"unexpected id format: {generated!r}"
-        print("✓ _prepare_item generates UUID when id is None")
+        assert len(generated) == 36 and generated.count("-") == 4, (
+            f"unexpected id format: {generated!r}"
+        )
+        print("✓ _item_to_row generates UUID when id is None")
     finally:
         await db.close()
 
 
-async def test_prepare_item_dedup(temp_db):
-    """Test that _prepare_item produces correct SQL and values for save."""
+async def test_upsert_sql_shape_and_end_to_end(temp_db):
+    """The compiled upsert has the expected ON CONFLICT shape, and
+    save/get_by_id/save_batch all work end-to-end.
+
+    Replaces the old `_prepare_item_dedup` test that inspected raw SQL.
+    """
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+
     db = AsyncDB(temp_db, "items", TestItem)
-
     try:
-        item = TestItem(name="test", value=5)
-        sql, values = db._prepare_item(item)
-        assert "ON CONFLICT(id) DO UPDATE SET" in sql
-        assert "test" in values
-        assert 5 in values
+        # Inspect the compiled SQL for the default-conflict-target upsert.
+        stmt = db._build_upsert(("id",)).values(
+            **db._item_to_row(TestItem(name="test", value=5))
+        )
+        compiled = str(stmt.compile(dialect=sqlite_dialect.dialect()))
+        assert "INSERT INTO items" in compiled
+        assert "ON CONFLICT (id) DO UPDATE" in compiled
+        # created_at must NOT be in the UPDATE SET clause.
+        set_clause = compiled.split("DO UPDATE")[1]
+        assert "created_at" not in set_clause
+        assert "updated_at" in set_clause
+        assert "name" in set_clause
 
-        # Verify save still works end-to-end
+        # End-to-end save still works.
+        item = TestItem(name="test", value=5)
         await db.save(item)
         loaded = await db.get_by_id(item.id)
-        assert loaded.name == "test"
-        assert loaded.value == 5
+        assert loaded.name == "test" and loaded.value == 5
 
-        # Verify batch save still works
+        # And batch save.
         items = [TestItem(name=f"batch_{i}", value=i) for i in range(5)]
         count = await db.save_batch(items)
         assert count == 5
 
-        print("✓ _prepare_item() deduplication works correctly")
+        print("✓ upsert SQL shape and end-to-end save work")
     finally:
         await db.close()
 
 
-if __name__ == "__main__":
-    async def run_all_tests():
-        with tempfile.TemporaryDirectory() as tmpdir:
-            print("\n" + "=" * 60)
-            print("ASYNCDB FIX VERIFICATION TESTS")
-            print("=" * 60)
-
-            test_num = 0
-
-            async def run_test(name, coro):
-                nonlocal test_num
-                test_num += 1
-                # Use a fresh db for each test
-                db_path = Path(tmpdir) / f"test_fix_{test_num}.db"
-                print(f"\n[Test {test_num}] {name}...")
-                await coro(db_path)
-
-            async def run_test_no_db(name, coro):
-                nonlocal test_num
-                test_num += 1
-                print(f"\n[Test {test_num}] {name}...")
-                await coro()
-
-            await run_test("Limit/offset in find()", test_find_limit_offset)
-            await run_test("save_batch count reset", test_save_batch_count_reset)
-            await run_test("Enum subclass deserialization", test_enum_deserialization_subclasses)
-            await run_test("Enum subclass column types", test_enum_subclass_column_types)
-            await run_test("int/bool/float/str column types", test_int_and_bool_column_types)
-            await run_test("NOT NULL with falsy defaults", test_not_null_with_falsy_defaults)
-            await run_test_no_db("_is_sqlite_busy helper", test_is_sqlite_busy_helper)
-            await run_test_no_db("_is_stale_connection helper", test_is_stale_connection_helper)
-            await run_test_no_db("aiosqlite daemon shape detection", test_mark_aiosqlite_daemon_shapes)
-            await run_test_no_db("Identifier validation", test_identifier_validation)
-            await run_test("Constructor identifier validation", test_identifier_validation_in_constructor)
-            await run_test("Connection pooling", test_connection_pooling)
-            await run_test("Close idempotent", test_close_idempotent)
-            await run_test("exists()", test_exists)
-            await run_test("delete_many()", test_delete_many)
-            await run_test("update_fields()", test_update_fields)
-            await run_test("Context manager", test_context_manager)
-            await run_test("read paths skip commit", test_read_paths_skip_commit)
-            await run_test("_prepare_item preserves falsy id",
-                           test_prepare_item_preserves_explicit_falsy_id)
-            await run_test("_prepare_item generates UUID on None",
-                           test_prepare_item_generates_id_when_none)
-            await run_test("_prepare_item dedup", test_prepare_item_dedup)
-
-            print("\n" + "=" * 60)
-            print("ALL TESTS PASSED!")
-            print("=" * 60)
-
-    asyncio.run(run_all_tests())

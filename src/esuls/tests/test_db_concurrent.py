@@ -2,8 +2,6 @@
 Test concurrent database access to verify retry logic works.
 """
 import asyncio
-import tempfile
-from pathlib import Path
 
 from esuls.db_cli import AsyncDB
 from esuls.tests._common import TestItem
@@ -124,34 +122,3 @@ async def test_stress_concurrent_access(temp_db):
     print("✓ 500 concurrent stress operations completed successfully")
 
 
-if __name__ == "__main__":
-
-    async def run_all_tests():
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "test_concurrent.db"
-
-            print("\n" + "=" * 60)
-            print("CONCURRENT DATABASE ACCESS TESTS")
-            print("=" * 60)
-
-            print("\n[Test 1] Concurrent reads...")
-            await test_concurrent_reads(db_path)
-
-            # New db for each test
-            db_path2 = Path(tmpdir) / "test_concurrent2.db"
-            print("\n[Test 2] Concurrent writes...")
-            await test_concurrent_writes(db_path2)
-
-            db_path3 = Path(tmpdir) / "test_concurrent3.db"
-            print("\n[Test 3] Mixed operations...")
-            await test_concurrent_mixed_operations(db_path3)
-
-            db_path4 = Path(tmpdir) / "test_concurrent4.db"
-            print("\n[Test 4] Stress test (500 ops)...")
-            await test_stress_concurrent_access(db_path4)
-
-            print("\n" + "=" * 60)
-            print("ALL TESTS PASSED!")
-            print("=" * 60)
-
-    asyncio.run(run_all_tests())

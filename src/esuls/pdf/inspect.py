@@ -1,5 +1,6 @@
 import hashlib
-from datetime import datetime
+import mmap
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Union
 
@@ -10,18 +11,28 @@ def read_pdf_summary(pdf_path: Union[str, Path]) -> dict:
     """
     High-level identity of the PDF: page count, file size, header version,
     encryption flag, signature count, sha256, linearization flag.
+
+    Streams the file for sha256 and only reads the first 1 KB for the
+    header inspection, so a multi-GB PDF does not get loaded into RAM
+    (avoids OOM/DoS on untrusted input).
     """
     pdf_path = Path(pdf_path)
-    data = pdf_path.read_bytes()
-    sha256 = hashlib.sha256(data).hexdigest()
+
+    # Single open for both head-read and sha256: seek(0) between the
+    # two so file_digest hashes from the start. `hashlib.file_digest`
+    # streams the file via `f.read()` from the current position.
+    with pdf_path.open("rb") as f:
+        head = f.read(1024)
+        f.seek(0)
+        sha256 = hashlib.file_digest(f, "sha256").hexdigest()
 
     pdf_version = None
-    if data.startswith(b"%PDF-"):
-        nl = data.find(b"\n")
+    if head.startswith(b"%PDF-"):
+        nl = head.find(b"\n")
         end = nl if nl != -1 else 16
-        pdf_version = data[5:end].decode("ascii", errors="replace").strip()
+        pdf_version = head[5:end].decode("ascii", errors="replace").strip()
 
-    linearized = b"/Linearized" in data[:1024]
+    linearized = b"/Linearized" in head
 
     reader = PdfReader(str(pdf_path))
     pages = len(reader.pages)
@@ -55,16 +66,36 @@ def read_pdf_revisions(pdf_path: Union[str, Path]) -> dict:
     Revision/integrity surface: %%EOF count (>1 = incremental updates),
     /Prev in trailer, /ID array (original vs current), bytes appended after
     the last %%EOF marker.
+
+    Uses mmap so the OS pages-in only the regions actually scanned: a
+    multi-GB PDF does not allocate process-side RAM, and the `%%EOF`
+    search runs at filesystem-cache speed.
     """
     pdf_path = Path(pdf_path)
-    data = pdf_path.read_bytes()
+    file_size = pdf_path.stat().st_size
 
-    eof_count = data.count(b"%%EOF")
-    last_eof = data.rfind(b"%%EOF")
+    eof_count = 0
+    last_eof = -1
+    if file_size > 0:
+        with pdf_path.open("rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                pos = 0
+                while True:
+                    found = mm.find(b"%%EOF", pos)
+                    if found < 0:
+                        break
+                    eof_count += 1
+                    last_eof = found
+                    pos = found + len(b"%%EOF")
+
     if last_eof == -1:
-        trailing = len(data)
+        trailing = file_size
     else:
-        trailing = len(data[last_eof + len(b"%%EOF"):].lstrip(b"\r\n"))
+        # bytes after last %%EOF, stripping leading CR/LF
+        with pdf_path.open("rb") as f:
+            f.seek(last_eof + len(b"%%EOF"))
+            tail = f.read()
+        trailing = len(tail.lstrip(b"\r\n"))
 
     reader = PdfReader(str(pdf_path))
     has_prev = False
@@ -145,13 +176,20 @@ _PDF_DATE_FORMATS = {
 
 
 def parse_pdf_date(s: Optional[str]) -> Optional[datetime]:
-    """Parse a PDF date string `D:YYYYMMDDHHMMSS+ZZ'ZZ'` to a naive datetime
-    (timezone offset stripped, since this is used only for ordering checks).
+    """Parse a PDF date string `D:YYYYMMDDHHMMSS+HH'mm'` to a naive UTC
+    datetime: any declared timezone offset is applied and stripped so the
+    result is directly comparable against `datetime.utcnow()`-style
+    callers, and timestamps from different zones can be ordered without
+    surprising naive-vs-aware TypeError.
 
-    The format is selected by the length of the date prefix. PDF dates are
-    fixed-width per spec, and length-keyed dispatch avoids strptime greedy
-    matches like `%Y%m%d%H` accepting 8-char `YYYYMMDD` strings as
-    `year=YYYY, month=Y, day=Y, hour=YY` on lenient implementations.
+    Dates without an offset are returned naive as-is (interpreted as
+    already-UTC by callers — the PDF spec recommends an explicit offset,
+    so the no-offset case is a producer that didn't follow the spec).
+
+    The format is selected by the length of the date prefix. PDF dates
+    are fixed-width per spec, and length-keyed dispatch avoids strptime
+    greedy matches like `%Y%m%d%H` accepting 8-char `YYYYMMDD` strings
+    as `year=YYYY, month=Y, day=Y, hour=YY` on lenient implementations.
     """
     if not s:
         return None
@@ -159,15 +197,41 @@ def parse_pdf_date(s: Optional[str]) -> Optional[datetime]:
     if s.startswith("D:"):
         s = s[2:]
     s = s.replace("'", "")
+
+    # Split off timezone suffix. Search starts at index 8 so the date's
+    # leading digits (e.g. the "-" was never valid there in PDF dates,
+    # but defensive) are never mistaken for the tz separator.
     base = s
-    for sep in ("+", "-", "Z"):
-        if sep in base[8:]:
-            base = base.split(sep, 1)[0]
+    tz_seconds: Optional[int] = None
+    for sep in ("Z", "+", "-"):
+        idx = base.find(sep, 8)
+        if idx > 0:
+            tz_part = base[idx:]
+            base = base[:idx]
+            if tz_part == "Z":
+                tz_seconds = 0
+            else:
+                sign = 1 if tz_part[0] == "+" else -1
+                try:
+                    hh = int(tz_part[1:3]) if len(tz_part) >= 3 else 0
+                    mm = int(tz_part[3:5]) if len(tz_part) >= 5 else 0
+                except ValueError:
+                    return None
+                tz_seconds = sign * (hh * 3600 + mm * 60)
             break
+
     fmt = _PDF_DATE_FORMATS.get(len(base))
     if fmt is None:
         return None
     try:
-        return datetime.strptime(base, fmt)
+        dt = datetime.strptime(base, fmt)
     except ValueError:
         return None
+
+    # Normalise to naive UTC so callers can compare against UTC `now`
+    # without aware-vs-naive TypeError and without timezone false-positives
+    # (e.g. a PDF created in +13:00 appearing to be "in the future" when
+    # compared raw against UTC midnight).
+    if tz_seconds is not None:
+        dt = dt - timedelta(seconds=tz_seconds)
+    return dt

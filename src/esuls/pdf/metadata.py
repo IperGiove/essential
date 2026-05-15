@@ -251,13 +251,17 @@ def _write_with_metadata(
             del root["/Metadata"]
 
     if inplace:
+        # Write through the fd that mkstemp returns rather than closing it
+        # and reopening by name: closes the TOCTOU window where another
+        # process in the same parent dir could swap our temp file between
+        # the close(fd) and open(name). On any error we still unlink the
+        # temp by name (the fd may already be closed by the context exit).
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{source_path.name}.", suffix=".tmp", dir=str(source_path.parent)
         )
-        os.close(fd)
         tmp_path = Path(tmp_name)
         try:
-            with open(tmp_path, "wb") as fh:
+            with os.fdopen(fd, "wb") as fh:
                 writer.write(fh)
             os.replace(tmp_path, output_path)
         except Exception:

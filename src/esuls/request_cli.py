@@ -28,6 +28,13 @@ _FALLBACK_USER_AGENT = (
 )
 _SUCCESS_STATUS_RANGE = range(200, 300)
 
+# Default cap on response body size. Servers (or attacker-controlled URLs
+# fed to make_request via user input) can otherwise hand us a multi-GB
+# response that httpx will load fully into memory. 100 MB covers normal
+# HTML/JSON/PDF/icon payloads with headroom; callers that legitimately
+# need larger downloads pass `max_body_bytes` explicitly (None = unlimited).
+_DEFAULT_MAX_BODY_BYTES = 100 * 1024 * 1024
+
 
 # ─── per-loop registry ────────────────────────────────────────────────────
 #
@@ -86,8 +93,33 @@ async def _get_user_agent() -> str:
 
 
 @lru_cache(maxsize=1)
-def _create_optimized_ssl_context() -> ssl.SSLContext:
-    """Create an SSL context optimized for performance"""
+def _create_secure_ssl_context() -> ssl.SSLContext:
+    """Create the default SSL context — full cert verification + hostname
+    check — with two performance tweaks layered on top:
+      - ALPN pinned to http/1.1 to skip h2 negotiation in flight
+      - post-handshake auth enabled (saves a round-trip when the server
+        renegotiates auth mid-stream)
+
+    This is what `verify_ssl=True` (the default) routes to.
+    """
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(['http/1.1'])
+    ctx.post_handshake_auth = True
+    return ctx
+
+
+@lru_cache(maxsize=1)
+def _create_insecure_ssl_context() -> ssl.SSLContext:
+    """Create an SSL context with cert verification AND hostname check
+    DISABLED. Intended for scraping targets with malformed, expired, or
+    self-signed certificates, or when traversing a TLS-intercepting proxy
+    whose CA is not in the system trust store.
+
+    DO NOT use on routes that carry credentials (cookies, API keys,
+    OAuth tokens, basic auth) — without verification an active MITM can
+    impersonate the server, decrypt the request body, and forward it
+    transparently. Callers opt in explicitly via `verify_ssl=False`.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -112,14 +144,18 @@ def _apply_jitter(delay: float, jitter: float) -> float:
 async def _get_domain_client(
     url: str,
     http2: bool = True,
-    verify_ssl: bool = False,
+    verify_ssl: bool = True,
 ) -> httpx.AsyncClient:
     """Get or create HTTP client for a specific domain with connection pooling.
 
     The pool is keyed by (domain, http2, verify_ssl) per running event loop,
-    so callers that opt into real TLS verification get a separate client
-    from the insecure default — and clients from a previous (dead) loop are
-    never reused.
+    so callers that opt out of TLS verification get a separate client from
+    the secure default — and clients from a previous (dead) loop are never
+    reused.
+
+    `verify_ssl` defaults to True (full cert + hostname verification). Pass
+    False explicitly for scraping targets with malformed certs; see
+    `_create_insecure_ssl_context` for the security trade-off.
     """
     state = _req_loop_state()
     domain = _extract_domain(url)
@@ -127,8 +163,9 @@ async def _get_domain_client(
     async with state["client_lock"]:
         clients: Dict[str, httpx.AsyncClient] = state["domain_clients"]
         if cache_key not in clients or clients[cache_key].is_closed:
-            verify: Union[bool, ssl.SSLContext] = (
-                True if verify_ssl else _create_optimized_ssl_context()
+            verify: ssl.SSLContext = (
+                _create_secure_ssl_context() if verify_ssl
+                else _create_insecure_ssl_context()
             )
             clients[cache_key] = httpx.AsyncClient(
                 verify=verify,
@@ -163,6 +200,61 @@ class Response:
         return json.loads(self.text)
 
 
+async def _stream_with_body_cap(
+    client: httpx.AsyncClient,
+    method: HttpMethod,
+    url: str,
+    request_kwargs: Dict[str, Any],
+    max_body_bytes: Optional[int],
+) -> Optional[Response]:
+    """Issue one request and read its body with a size cap.
+
+    Returns a Response object, or None if the body exceeds `max_body_bytes`
+    (either declared via Content-Length or observed during streaming).
+    Caps when `max_body_bytes is None` are disabled — caller opts out.
+    """
+    async with client.stream(method, url, **request_kwargs) as resp:
+        if max_body_bytes is not None:
+            cl = resp.headers.get("content-length")
+            if cl:
+                try:
+                    if int(cl) > max_body_bytes:
+                        logger.warning(
+                            f"Response body Content-Length={cl} exceeds cap "
+                            f"{max_body_bytes} — aborting download. URL: {url}"
+                        )
+                        return None
+                except ValueError:
+                    pass
+
+        body = bytearray()
+        async for chunk in resp.aiter_bytes():
+            body.extend(chunk)
+            if max_body_bytes is not None and len(body) > max_body_bytes:
+                logger.warning(
+                    f"Response body exceeded cap {max_body_bytes} during "
+                    f"streaming — aborting download. URL: {url}"
+                )
+                return None
+
+        body_bytes = bytes(body)
+        # httpx normally decodes lazily through `.text` against
+        # `resp.encoding`; we replicate that here because we own the body.
+        encoding = resp.encoding or "utf-8"
+        try:
+            text = body_bytes.decode(encoding, errors="replace")
+        except LookupError:
+            text = body_bytes.decode("utf-8", errors="replace")
+
+        return Response(
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            _content=body_bytes,
+            text=text,
+            url=str(resp.url),
+        )
+
+
 async def _run_with_retry(
     client: httpx.AsyncClient,
     *,
@@ -177,6 +269,7 @@ async def _run_with_retry(
     json_response: bool,
     json_response_check: Optional[str],
     skip_response: Optional[Union[str, list[str]]],
+    max_body_bytes: Optional[int] = _DEFAULT_MAX_BODY_BYTES,
 ) -> Optional[Response]:
     """Execute an HTTP request with retry, backoff, skip-pattern, and JSON validation.
 
@@ -195,23 +288,23 @@ async def _run_with_retry(
     - `json_response=True` requires a JSON-parsable body; if
       `json_response_check` is set, that key must be present in the
       decoded body.
+    - `max_body_bytes` caps the response body. A Content-Length header
+      that already exceeds the cap aborts the download before reading
+      any body bytes; otherwise the body is streamed and aborted as
+      soon as the accumulated size crosses the cap. Body-cap rejections
+      short-circuit retries — re-asking the same URL would just download
+      the same oversize response. Pass `None` to disable.
     - On final failure returns None unless `force_response=True`, in
       which case the last failing Response is returned.
     """
     for attempt in range(max_attempt):
         try:
-            httpx_response = await client.request(
-                method=method,
-                url=url,
-                **request_kwargs,
+            response = await _stream_with_body_cap(
+                client, method, url, request_kwargs, max_body_bytes,
             )
-            response = Response(
-                status_code=httpx_response.status_code,
-                headers=dict(httpx_response.headers),
-                _content=httpx_response.content,
-                text=httpx_response.text,
-                url=str(httpx_response.url),
-            )
+            if response is None:
+                # Body cap hit — re-asking won't help, surface as failure.
+                return None
 
             if response.status_code not in _SUCCESS_STATUS_RANGE:
                 logger.debug(
@@ -325,12 +418,16 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
 
     def __init__(
         self,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
         http2: bool = True,
     ) -> None:
         # Client-level config baked into the persistent AsyncClient.
-        self._verify: Union[bool, ssl.SSLContext] = (
-            True if verify_ssl else _create_optimized_ssl_context()
+        # Default: full TLS verification. Pass verify_ssl=False explicitly
+        # only for scraping targets with malformed/self-signed certs —
+        # MUST NOT be used on routes that carry credentials.
+        self._verify: ssl.SSLContext = (
+            _create_secure_ssl_context() if verify_ssl
+            else _create_insecure_ssl_context()
         )
         self._http2 = http2
         self._client: Optional[httpx.AsyncClient] = None
@@ -373,12 +470,17 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
         follow_redirects: bool = True,
         no_retry_status_codes: Optional[list[int]] = None,
         jitter: float = 0.1,
+        max_body_bytes: Optional[int] = _DEFAULT_MAX_BODY_BYTES,
     ) -> Optional[Response]:
         """Execute an HTTP request with retry/backoff against the persistent client.
 
         Per-call headers/cookies/proxy/timeout are applied to this call only.
         When `proxy` is set, a one-shot client is created and closed for
         that single call (the instance's persistent client is untouched).
+
+        `max_body_bytes` caps the response body to protect against
+        accidentally OOM-ing on a multi-GB download; pass None to
+        disable.
         """
         one_shot: Optional[httpx.AsyncClient] = None
         try:
@@ -427,6 +529,7 @@ class AsyncRequest(AsyncContextManager['AsyncRequest']):
                 json_response=json_response,
                 json_response_check=json_response_check,
                 skip_response=skip_response,
+                max_body_bytes=max_body_bytes,
             )
         finally:
             if one_shot:
@@ -514,20 +617,27 @@ async def make_request(
     exception_sleep: float = 10,
     add_user_agent: bool = False,
     follow_redirects: bool = True,
-    verify_ssl: bool = False,
+    verify_ssl: bool = True,
     no_retry_status_codes: Optional[list[int]] = None,
     http2: bool = True,
     jitter: float = 0.1,
+    max_body_bytes: Optional[int] = _DEFAULT_MAX_BODY_BYTES,
 ) -> Optional[Response]:
     """Execute an HTTP request via a per-domain pooled client (or a one-shot
     client when `proxy` is set). Retry/backoff/skip-pattern semantics are
     delegated to `_run_with_retry` so they stay identical to AsyncRequest.
+
+    `max_body_bytes` caps the response body (default 100 MB) to protect
+    against accidentally OOM-ing on multi-GB responses from attacker-
+    controlled URLs. Pass None to disable, or a larger value when
+    legitimately downloading big files.
     """
     own_client: Optional[httpx.AsyncClient] = None
     try:
         if proxy:
-            ssl_context: Union[bool, ssl.SSLContext] = (
-                True if verify_ssl else _create_optimized_ssl_context()
+            ssl_context: ssl.SSLContext = (
+                _create_secure_ssl_context() if verify_ssl
+                else _create_insecure_ssl_context()
             )
             own_client = httpx.AsyncClient(
                 verify=ssl_context,
@@ -573,17 +683,18 @@ async def make_request(
             json_response=json_response,
             json_response_check=json_response_check,
             skip_response=skip_response,
+            max_body_bytes=max_body_bytes,
         )
     finally:
         if own_client:
             await own_client.aclose()
 
 
-async def _get_session_cffi(verify_ssl: bool = False) -> AsyncSession:
+async def _get_session_cffi(verify_ssl: bool = True) -> AsyncSession:
     """Get or create cached curl_cffi session for the current event loop.
 
     Two sessions are cached per loop (verify on/off) so callers that opt
-    into TLS verification get a separate session from the insecure default.
+    out of TLS verification get a separate session from the secure default.
     """
     state = _req_loop_state()
     async with state["cffi_lock"]:
@@ -611,13 +722,19 @@ async def make_request_cffi(
     no_retry_status_codes: Optional[list[int]] = None,
     exception_sleep: float = 5,
     jitter: float = 0.1,
-    verify_ssl: bool = False,
+    verify_ssl: bool = True,
+    max_body_bytes: Optional[int] = _DEFAULT_MAX_BODY_BYTES,
 ) -> Optional[Response]:
     """HTTP client using curl_cffi for browser TLS impersonation.
 
     Falls back to this when standard httpx is blocked by TLS fingerprinting
     (Cloudflare, Wix, Akamai, etc.). Returns the same Response object as
     make_request for drop-in compatibility.
+
+    `max_body_bytes` caps the response body. Unlike `make_request`, this
+    path cannot abort mid-download (curl_cffi buffers the whole response
+    before returning), so the cap is enforced post-read: oversize bodies
+    are rejected instead of returned. Pass None to disable.
     """
     session = await _get_session_cffi(verify_ssl=verify_ssl)
 
@@ -634,10 +751,18 @@ async def make_request_cffi(
                 timeout=timeout_request,
             )
 
+            content = cffi_resp.content
+            if max_body_bytes is not None and len(content) > max_body_bytes:
+                logger.warning(
+                    f"cffi response body {len(content)} exceeds cap "
+                    f"{max_body_bytes} — rejecting. URL: {url}"
+                )
+                return None
+
             response = Response(
                 status_code=cffi_resp.status_code,
                 headers=dict(cffi_resp.headers),
-                _content=cffi_resp.content,
+                _content=content,
                 text=cffi_resp.text,
                 url=str(cffi_resp.url),
             )

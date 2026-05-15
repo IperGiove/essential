@@ -1,174 +1,976 @@
+"""
+Async SQLite layer built on SQLAlchemy 2.0 Core.
+
+Public API and dataclass-as-schema ergonomics preserved from the prior
+custom implementation; internals delegate to SQLA Core for SQL building,
+parameter binding, type roundtripping, and connection pooling.
+
+SQLite-specific concerns kept custom:
+  - Write serialisation lock (SQLite is single-writer)
+  - BUSY/LOCKED retry policy with exponential backoff
+  - PRAGMA setup via SQLA `connect` event hook (foreign_keys=ON, WAL,
+    mmap_size, temp_store=MEMORY, wal_autocheckpoint, ...)
+  - Per-event-loop engine registry (a single AsyncDB instance survives
+    multiple `asyncio.run()` calls without `bound to a different event loop`)
+  - PRAGMA optimize + wal_checkpoint(TRUNCATE) on close
+  - Two-engine model: StaticPool writer (single conn; lock pre-serialises)
+    + pooled reader (pool_size=4 for concurrent WAL reads)
+"""
 import asyncio
-import aiosqlite
-import ast
 import base64
+import contextlib
+import dataclasses
+import enum
+import importlib.util
 import json
+import random
 import re
 import sqlite3
 import threading
-import weakref
-import dataclasses
-from datetime import datetime, date
-from pathlib import Path
-from typing import Any, Dict, List, Optional, TypeVar, Generic, Type, get_type_hints, Union, Tuple
-from dataclasses import dataclass, asdict, fields, is_dataclass, field
-from functools import lru_cache
+import types
 import uuid
-import contextlib
-import enum
-from loguru import logger
+import warnings
+import weakref
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from datetime import date, datetime, timezone
 from decimal import Decimal
+from pathlib import Path
+from typing import (
+    Any, AsyncIterator, Awaitable, Callable, Dict, Generic, List, Optional,
+    Tuple, Type, TypeVar, Union, get_type_hints,
+)
+
+from loguru import logger
+from sqlalchemy import (
+    Boolean, Column, Date, DateTime, Float, ForeignKey, Index, Integer,
+    LargeBinary, MetaData, Table, Text, UniqueConstraint, and_, delete, event,
+    func, literal, select, text, update,
+)
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection, AsyncEngine, create_async_engine,
+)
+from sqlalchemy.pool import StaticPool
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.types import TypeDecorator
+import sqlalchemy.exc as sa_exc
 
 
-# Sentinel prefix for base64-encoded bytes inside JSON-serialised dicts.
-# BaseModel.to_dict() prepends this to bytes values; from_dict() strips
-# it back. Chosen for clarity in logs/inspection — text fields holding
-# a literal "b64:" string are unaffected because from_dict only decodes
-# fields whose declared type is bytes.
+# ─── transport-level encoding for BaseModel.to_dict / from_dict ──────────
+#
+# Used when models are shipped over JSON (cache APIs, IPC). The DB layer
+# uses TypeDecorators instead — these two paths are intentionally separate.
+
 _B64_PREFIX = "b64:"
 
 
-def _is_bytes_field(ftype) -> bool:
-    """True for `bytes` and `Optional[bytes]` (or any Union including bytes).
+def _get_union_origin(tp):
+    """Return Union/UnionType if `tp` is a Union (any form), else None.
 
-    Used by BaseModel.from_dict to know which fields need base64
-    decoding back from a transport-encoded ('b64:...') string.
+    Handles both `typing.Optional[X]` / `Union[...]` and PEP 604 `X | None`
+    (which has origin `types.UnionType`, not `typing.Union`).
     """
+    if tp is None:
+        return None
+    if getattr(tp, "__origin__", None) is Union:
+        return Union
+    if isinstance(tp, types.UnionType):
+        return types.UnionType
+    return None
+
+
+def _is_bytes_field(ftype) -> bool:
+    """True for `bytes`, `Optional[bytes]`, and `bytes | None`."""
     if ftype is bytes:
         return True
-    origin = getattr(ftype, "__origin__", None)
-    if origin is Union:
+    if _get_union_origin(ftype) is not None:
         return bytes in getattr(ftype, "__args__", ())
     return False
 
 
-_VALID_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+def _unwrap_optional(tp):
+    """Drop NoneType from a Union and return the lone remaining arg, if any.
+
+    Returns `tp` unchanged when it's not a Union or has multiple non-None args.
+    """
+    if _get_union_origin(tp) is None:
+        return tp
+    args = [a for a in getattr(tp, "__args__", ()) if a is not type(None)]
+    if len(args) == 1:
+        return args[0]
+    return tp
+
+
+_VALID_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
 
 def _validate_identifier(name: str) -> str:
+    """Reject SQL identifiers that don't match `[a-zA-Z_][a-zA-Z0-9_]*`.
+
+    The schema-column whitelist on AsyncDB is the primary defence; this
+    second gate exists so the table_name argument (which isn't a schema
+    column) is still validated.
+    """
     if not _VALID_IDENTIFIER.match(name):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return name
 
 
-# Retryable SQLite error codes: BUSY = whole-db lock contention,
-# LOCKED = table-level lock contention. Both are transient and the
-# canonical retry-and-backoff response is the same.
+# ─── retry classification ────────────────────────────────────────────────
+
 _RETRYABLE_SQLITE_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 
 
 def _is_sqlite_busy(exc: BaseException) -> bool:
     """True if `exc` is a transient SQLite contention error worth retrying.
 
-    Prefers the structured `sqlite_errorcode` attribute (available on
-    sqlite3 errors since Python 3.11) over string matching. The string
-    fallback covers errors wrapped by intermediate layers (mocks in
-    tests, future aiosqlite shapes) that may strip the errorcode.
+    SQLA wraps `sqlite3.OperationalError` in `sa_exc.OperationalError` with
+    the original DBAPI exception under `.orig`. We inspect both layers.
     """
-    code = getattr(exc, "sqlite_errorcode", None)
+    inner = getattr(exc, "orig", None) or exc
+    code = getattr(inner, "sqlite_errorcode", None)
     if code in _RETRYABLE_SQLITE_CODES:
         return True
     msg = str(exc).lower()
     return "database is locked" in msg or "database is busy" in msg
 
 
-def _is_stale_connection(exc: BaseException) -> bool:
-    """True if `exc` indicates the cached aiosqlite connection is dead.
+_STALE_CONNECTION_TYPES: tuple[type, ...] = (
+    sa_exc.ResourceClosedError,
+    sa_exc.DisconnectionError,
+    sa_exc.InvalidRequestError,
+)
 
-    These errors come from the aiosqlite layer (not sqlite3 itself) when
-    a Connection is reused after being closed or after its event loop
-    died. They carry no `sqlite_errorcode`, so string matching is the
-    only signal available.
+
+def _is_stale_connection(exc: BaseException) -> bool:
+    """True if `exc` indicates the pooled connection is dead.
+
+    Prefers SQLA's typed exceptions (`ResourceClosedError`,
+    `DisconnectionError`, `InvalidRequestError`); falls back to string
+    match on the wrapped DBAPI error for cases that don't surface a
+    typed SQLA exception (e.g. raw aiosqlite errors leaking through).
     """
+    if isinstance(exc, _STALE_CONNECTION_TYPES):
+        return True
     msg = str(exc).lower()
     return "closed" in msg or "no active connection" in msg
 
 
-# ─── per-loop registry ────────────────────────────────────────────────────
-#
-# asyncio.Lock and aiosqlite.Connection both bind to the running event loop
-# on first use; sharing them across loops raises 'bound to a different event
-# loop' or causes futures to be scheduled on the wrong loop. This affects
-# any code that calls asyncio.run() more than once in a process (CLI scripts
-# that retry, pytest-asyncio with function-scoped loops, embedding via
-# anyio, multi-tenant servers).
-#
-# We keep a per-loop dict of asyncio primitives in a WeakKeyDictionary keyed
-# by the loop object. When a loop is garbage-collected, its entry is dropped
-# automatically — no manual cleanup, no lingering references.
+def utcnow() -> datetime:
+    """Timezone-aware UTC `now`.
 
-_db_state_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict]" = weakref.WeakKeyDictionary()
+    The canonical clock for everything in this module: `BaseModel` /
+    `TimestampedModel` / `TimestampedIntModel` defaults, `_item_to_row`,
+    `update_fields`. Public so callers that build their own
+    `TimestampedXxxModel`-style bases can stay consistent.
+
+    Centralised so a future swap (e.g. injectable clock for testing) only
+    touches this one symbol.
+    """
+    return datetime.now(timezone.utc)
+
+
+# Backward-compat alias for any internal/vendored code still importing the
+# private name; new call sites should use `utcnow` directly.
+_utcnow = utcnow
+
+
+# Pairs of SQL type names that SQLite treats as functionally interchangeable
+# (same type affinity). The drift detector uses this to avoid false-positive
+# warnings when a live table was created with one of these names by an
+# older version of the code (or by hand) and the dataclass would now
+# declare the other.
+#
+#   BOOLEAN <-> INTEGER : both have NUMERIC affinity; bool is stored as
+#                         0/1 either way. An older table built with
+#                         `Integer` for a bool field is functionally
+#                         identical to a fresh one built with `Boolean`.
+#   DATETIME <-> TEXT   : we now store datetimes via _UTCDateTimeDecorator
+#                         (TEXT), but older code used `DateTime(timezone=True)`
+#                         which rendered as DATETIME.
+#   VARCHAR  <-> TEXT   : SQLA's `String` without length renders VARCHAR;
+#                         our `Text` renders TEXT. Both have TEXT affinity.
+_EQUIVALENT_TYPES: frozenset[frozenset[str]] = frozenset({
+    frozenset({"BOOLEAN", "INTEGER"}),
+    frozenset({"DATETIME", "TEXT"}),
+    frozenset({"VARCHAR", "TEXT"}),
+})
+
+
+def _normalise_sql_type(t: str) -> str:
+    """Reduce a SQL type declaration to a comparable head token.
+
+    Strips length / precision parens (`VARCHAR(36)` → `VARCHAR`) and
+    multi-word modifiers (`UNSIGNED INTEGER` → `UNSIGNED`), then
+    uppercases. Returns "" for falsy input.
+    """
+    if not t:
+        return ""
+    head = t.split("(", 1)[0].strip().split()[0]
+    return head.upper()
+
+
+def _types_equivalent(live: str, declared: str) -> bool:
+    """True if two SQL type names compare equal under SQLite's affinity rules.
+
+    Both inputs are normalised via `_normalise_sql_type` (strips
+    `(length)` parens, takes the first whitespace-separated token,
+    uppercases). The `_EQUIVALENT_TYPES` map then declares a small set
+    of "same-affinity" pairs the drift detector should treat as equal.
+    """
+    a = _normalise_sql_type(live)
+    b = _normalise_sql_type(declared)
+    if a == b:
+        return True
+    return frozenset({a, b}) in _EQUIVALENT_TYPES
+
+
+# ─── per-loop registry ───────────────────────────────────────────────────
+#
+# asyncio.Lock and SQLA AsyncEngine both bind to the running event loop on
+# first use; reusing across loops fails with `bound to a different event
+# loop`. State is keyed in a WeakKeyDictionary on the loop object — when a
+# loop is GC'd its entry is dropped automatically.
+
+_db_state_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict]" = (
+    weakref.WeakKeyDictionary()
+)
 _db_state_guard = threading.Lock()
 
 
 def _db_loop_state() -> dict:
-    """Return per-loop state: write locks, schema-init lock, initialized set."""
+    """Return per-loop state.
+
+    Keys:
+      - "locks"            dict[str, asyncio.Lock]            per-db-path write lock
+      - "schema_init_lock" asyncio.Lock                       serialises schema init
+      - "initialized"      set[str]                            _db_key dedupe
+      - "engines"          dict[str, tuple[AsyncEngine, AsyncEngine]]
+                           (writer, reader) keyed by absolute db_path str
+    """
     loop = asyncio.get_running_loop()
     with _db_state_guard:
         state = _db_state_by_loop.get(loop)
         if state is None:
             state = {
-                "locks": {},                          # db_path -> asyncio.Lock
-                "schema_init_lock": asyncio.Lock(),   # serialises schema init
-                "initialized": set(),                 # set[_db_key]
+                "locks": {},
+                "schema_init_lock": asyncio.Lock(),
+                "initialized": set(),
+                "engines": {},
             }
             _db_state_by_loop[loop] = state
         return state
 
 
-# Tracks whether we've already warned about an unrecognised aiosqlite
-# Connection shape, so the log line doesn't fire on every connect.
-_aiosqlite_daemon_shape_warned = False
+# ─── TypeDecorators ──────────────────────────────────────────────────────
+#
+# Each Python-level type that needs a roundtrip gets a SQLA TypeDecorator.
+# These attach to specific columns; bare `str` columns get plain `Text`
+# (no JSON guessing). This is the structural fix for the previous
+# `_deserialize_value` `json.loads(value)` fallback that silently
+# converted str-holding-"123" into int 123.
 
 
-def _mark_aiosqlite_daemon(connection_object) -> bool:
-    """Mark aiosqlite's worker thread as daemon so it can't block process exit.
+def _json_encode_default(v):
+    """JSON default for nested values embedded in list/dict/set columns."""
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, bytes):
+        return _B64_PREFIX + base64.b64encode(v).decode("ascii")
+    if isinstance(v, enum.Enum):
+        return v.value
+    if isinstance(v, Decimal):
+        return str(v)
+    if isinstance(v, uuid.UUID):
+        return str(v)
+    if isinstance(v, (set, frozenset)):
+        return list(v)
+    if is_dataclass(v):
+        return asdict(v)
+    raise TypeError(f"Object of type {type(v).__name__} is not JSON serialisable")
 
-    `aiosqlite.Connection` runs a non-daemon worker thread in a loop waiting
-    for SQL operations. If the user forgets to call `close()` (or doesn't
-    use the async context manager), that thread keeps the interpreter alive
-    indefinitely on exit. Marking it daemon makes it die with the process.
 
-    The attribute we touch is private to aiosqlite (it has changed shape
-    once already: pre-0.22 the Connection itself was a Thread; from 0.22
-    it wraps the worker in `_thread`). To stay resilient against future
-    refactors we:
-      - try `_thread.daemon` first (current shape),
-      - fall back to `Connection`-extends-`Thread` (legacy shape),
-      - on any AttributeError/TypeError log at debug and return False so
-        the caller knows the safety net wasn't applied.
+# Annotation-driven key coercion for JSON dict columns. When a dataclass
+# field is declared `Dict[K, V]`, the column-level `_JSONDecorator` reads
+# `K` and uses the matching callable to restore the original key type on
+# load. JSON serialises non-string keys as strings (lossy by design), so
+# without this the read path returns `Dict[str, V]` regardless of `K`.
+#
+# Limitation: only applies at the column boundary. Nested dicts inside a
+# list/dict column (e.g. `List[Dict[int, X]]`) are NOT coerced — JSON
+# loses that nesting information and we can't recover it from the
+# annotation. If you need full-fidelity nested keys, coerce at the
+# application boundary.
+_KEY_COERCIONS: Dict[type, Callable[[Any], Any]] = {
+    int: int,
+    float: float,
+    Decimal: Decimal,
+    uuid.UUID: uuid.UUID,
+}
 
-    Returns True iff the flag was applied. The connection still works
-    when False — it's only the "forgotten close()" path that suffers.
+
+def _coercion_for_key_type(key_type) -> Optional[Callable[[Any], Any]]:
+    """Return a callable that converts a JSON-loaded `str` key back to `key_type`.
+
+    Returns None for `str` (the no-op default) and for types we don't
+    know how to coerce (the value falls through as str — preserving the
+    pre-coercion behaviour for unrecognised types).
     """
-    global _aiosqlite_daemon_shape_warned
-    try:
-        if hasattr(connection_object, '_thread'):
-            connection_object._thread.daemon = True
-            return True
-        if isinstance(connection_object, threading.Thread):
-            connection_object.daemon = True
-            return True
-    except (AttributeError, TypeError) as e:
-        logger.debug(f"Could not mark aiosqlite worker as daemon: {e}")
-        return False
+    if key_type is None or key_type is str:
+        return None
+    return _KEY_COERCIONS.get(key_type)
 
-    if not _aiosqlite_daemon_shape_warned:
-        _aiosqlite_daemon_shape_warned = True
-        logger.warning(
-            "aiosqlite worker shape changed: neither `_thread` nor a "
-            "Thread subclass. Process may hang on unclosed connections; "
-            "always call AsyncDB.close() or use `async with AsyncDB(...)`."
+
+def _stringify_dict_key(k):
+    """Convert a dict key to something `json.dumps` will accept.
+
+    JSON only allows str / int / float / bool / None as keys, and
+    `json.dumps` stringifies the non-string variants automatically.
+    Other types (Decimal, UUID, etc.) need explicit conversion or
+    `json.dumps` raises TypeError. We mirror the value-side
+    `_json_encode_default` for symmetry, so a key written via the JSON
+    column comes back through the right coercion on read.
+    """
+    if isinstance(k, (str, int, float, bool)) or k is None:
+        return k
+    if isinstance(k, Decimal):
+        return str(k)
+    if isinstance(k, uuid.UUID):
+        return str(k)
+    if isinstance(k, enum.Enum):
+        return k.value
+    # Fall through — json.dumps will raise TypeError with a clear message.
+    return k
+
+
+class _JSONDecorator(TypeDecorator):
+    """JSON-encoded TEXT column for list / dict / set / nested dataclass fields.
+
+    NEVER attach this to a bare `str` column — that is the bug being fixed.
+
+    For `Dict[K, V]` columns, pass `key_coercion=<callable>` to restore
+    the original key type on read (`{1: 0.5}` round-trips as `{1: 0.5}`
+    instead of `{"1": 0.5}`). Without `key_coercion`, JSON behavior is
+    preserved (all keys are str on read).
+
+    Other annotation-vs-runtime footguns to remember (dataclass annotations
+    are NOT enforced at runtime — these are JSON limitations):
+
+      - `Tuple[X, ...]`: JSON has no tuple, so `(1, 2)` round-trips as
+        `[1, 2]` (a list). Declare `List[X]` if you care about the runtime
+        type matching the annotation.
+      - `Set[X]` / `FrozenSet[X]`: same — round-trips as list (order loss).
+      - Nested dict keys (`List[Dict[int, X]]`) are NOT coerced —
+        `key_coercion` only fires at the column boundary.
+    """
+    impl = Text
+    cache_ok = True
+
+    def __init__(self, *, key_coercion: Optional[Callable[[Any], Any]] = None):
+        self._key_coercion = key_coercion
+        super().__init__()
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            # JSON spec only allows str/int/float/bool/None keys. Convert
+            # other key types (Decimal, UUID, Enum, ...) via the symmetric
+            # helper so `key_coercion` can reverse them on read.
+            value = {_stringify_dict_key(k): v for k, v in value.items()}
+        return json.dumps(value, default=_json_encode_default)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        decoded = json.loads(value)
+        if self._key_coercion is not None and isinstance(decoded, dict):
+            return {self._key_coercion(k): v for k, v in decoded.items()}
+        return decoded
+
+
+class _UTCDateTimeDecorator(TypeDecorator):
+    """TZ-aware datetime stored as ISO 8601 with offset (Text column).
+
+    SQLA's stock `DateTime(timezone=True)` on SQLite parses datetimes
+    through a regex that drops the offset on read — naive datetime
+    returned for what was stored as tz-aware. We bypass it by handling
+    `isoformat()` / `fromisoformat()` ourselves; both round-trip the
+    offset correctly.
+
+    Naive datetimes on the bind path are assumed UTC (legacy data from
+    before the UTC switch). The result path always returns tz-aware UTC.
+    """
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+class _DecimalDecorator(TypeDecorator):
+    """Lossless Decimal roundtrip via TEXT storage.
+
+    SQLite's NUMERIC affinity coerces high-precision decimals through
+    `float`, losing digits past ~15-17. Storing the Decimal as its string
+    representation in a TEXT column preserves arbitrary precision.
+    """
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return str(value if isinstance(value, Decimal) else Decimal(str(value)))
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return Decimal(value)
+
+
+class _UUIDDecorator(TypeDecorator):
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return None if value is None else str(value)
+
+    def process_result_value(self, value, dialect):
+        return None if value is None else uuid.UUID(value)
+
+
+class _EnumDecorator(TypeDecorator):
+    """Stores `enum.value`; reconstructs via `enum_cls(value)`.
+
+    Pass `impl_cls=Integer` for IntEnum/IntFlag, `impl_cls=Text` for
+    StrEnum and regular Enum. The class-level `impl = Text` satisfies
+    SQLA's "TypeDecorator needs an impl" check; `load_dialect_impl`
+    overrides to the per-instance impl at dialect-compile time.
+    """
+    impl = Text
+    cache_ok = True
+
+    def __init__(self, enum_cls, *, impl_cls=Text):
+        self.enum_cls = enum_cls
+        self._impl_cls = impl_cls
+        super().__init__()
+
+    @property
+    def python_type(self):
+        return self.enum_cls
+
+    def load_dialect_impl(self, dialect):
+        return dialect.type_descriptor(self._impl_cls())
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return value.value if isinstance(value, enum.Enum) else value
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return self.enum_cls(value)
+
+
+def _python_to_sa_type(ftype):
+    """Map a Python type (already unwrapped from Optional) to a SQLA type."""
+    if ftype is bytes:
+        return LargeBinary()
+    if ftype is datetime:
+        # Custom decorator (not SQLA's DateTime(timezone=True)) because
+        # SQLA's SQLite path strips the offset on read. The decorator
+        # stores ISO-with-offset and reads back tz-aware UTC datetimes,
+        # closing the naive-local timestamp footgun.
+        return _UTCDateTimeDecorator()
+    if ftype is date:
+        return Date()
+    if ftype is float:
+        return Float()
+    if ftype is Decimal:
+        return _DecimalDecorator()
+    if ftype is uuid.UUID:
+        return _UUIDDecorator()
+    if ftype is bool:
+        # bool MUST be checked before int (bool is a subclass of int).
+        return Boolean()
+    if isinstance(ftype, type) and issubclass(ftype, enum.Enum):
+        impl_cls = Integer if issubclass(ftype, int) else Text
+        return _EnumDecorator(ftype, impl_cls=impl_cls)
+    if isinstance(ftype, type) and issubclass(ftype, int):
+        return Integer()
+    if isinstance(ftype, type) and issubclass(ftype, str):
+        return Text()
+    origin = getattr(ftype, "__origin__", None) if ftype is not None else None
+    if origin is dict:
+        # Dict[K, V] — read K and wire up key-coercion on the decoder so
+        # the runtime keys match the annotation instead of always being
+        # str (JSON's only key flavour).
+        args = getattr(ftype, "__args__", ())
+        key_type = args[0] if len(args) >= 1 else None
+        return _JSONDecorator(key_coercion=_coercion_for_key_type(key_type))
+    if origin in (list, set, frozenset, tuple):
+        return _JSONDecorator()
+    if ftype in (list, dict, set, frozenset, tuple):
+        return _JSONDecorator()
+    if isinstance(ftype, type) and is_dataclass(ftype):
+        return _JSONDecorator()
+    # Last-resort: serialise via JSON. Surfaced at DEBUG so the caller can
+    # see they're hitting the fallback (e.g. for `Any`-typed columns).
+    logger.debug(f"Falling back to JSONDecorator for type {ftype!r}")
+    return _JSONDecorator()
+
+
+def _table_from_schema(metadata: MetaData, table_name: str, schema_class: type) -> Table:
+    """Build a SQLA `Table` from a dataclass schema.
+
+    Honours field metadata: `primary_key`, `unique`, `index`, `required`,
+    `foreign_key` (+ optional `on_delete`). `unique` and `index` become
+    separate `Index` objects (not inline) so schema-drift `ALTER TABLE ADD
+    COLUMN` + a fresh `CREATE INDEX IF NOT EXISTS` keep working uniformly.
+
+    Two optional class-level attributes are honoured:
+      - `__unique_together__`: list of column-name tuples, e.g.
+        `[("user_id", "external_id")]`. Each tuple becomes a
+        `UniqueConstraint` and is registered as a valid
+        composite conflict target on the AsyncDB instance.
+      - `__table_constraints__`: list of raw SQL constraint strings
+        (CHECK, etc.). Use `__unique_together__` for composite uniques
+        — it's structurally introspectable, the raw-SQL form is not.
+    """
+    type_hints = get_type_hints(schema_class, include_extras=False)
+    columns: list[Column] = []
+    indexes: list[Index] = []
+
+    for f in fields(schema_class):
+        col_name = _validate_identifier(f.name)
+        declared = type_hints.get(f.name)
+        ftype = _unwrap_optional(declared)
+        sa_type = _python_to_sa_type(ftype)
+
+        has_default = (
+            f.default is not dataclasses.MISSING
+            or f.default_factory is not dataclasses.MISSING
         )
-    return False
+        is_optional = _get_union_origin(declared) is not None
+        # A column is nullable if the declared type is Optional, OR the
+        # dataclass field has a default (so callers can omit it), OR the
+        # metadata explicitly opts out of NOT NULL.
+        nullable = (not f.metadata.get("required", True)) or has_default or is_optional
 
-T = TypeVar('T')
-SchemaType = TypeVar('SchemaType', bound='BaseModel')
+        col_args: list = [col_name, sa_type]
+        if (fk := f.metadata.get("foreign_key")):
+            on_delete = f.metadata.get("on_delete")
+            col_args.append(
+                ForeignKey(fk, ondelete=on_delete) if on_delete else ForeignKey(fk)
+            )
+        col = Column(
+            *col_args,
+            primary_key=bool(f.metadata.get("primary_key")),
+            nullable=nullable and not f.metadata.get("primary_key"),
+        )
+        columns.append(col)
+
+        if f.metadata.get("unique"):
+            indexes.append(Index(f"idx_{table_name}_{col_name}_unique", col, unique=True))
+        if f.metadata.get("index"):
+            indexes.append(Index(f"idx_{table_name}_{col_name}", col))
+
+    # Composite UNIQUE constraints from __unique_together__.
+    valid_col_names = {c.name for c in columns}
+    unique_together = getattr(schema_class, "__unique_together__", ()) or ()
+    composite_constraints: list[UniqueConstraint] = []
+    for cols in unique_together:
+        if not isinstance(cols, (tuple, list)) or len(cols) < 2:
+            raise ValueError(
+                f"{schema_class.__name__}.__unique_together__: each entry must be "
+                f"a tuple/list of at least 2 column names; got {cols!r}"
+            )
+        for c in cols:
+            if c not in valid_col_names:
+                raise ValueError(
+                    f"{schema_class.__name__}.__unique_together__: unknown column "
+                    f"{c!r}; must be a declared dataclass field"
+                )
+        validated = tuple(_validate_identifier(c) for c in cols)
+        composite_constraints.append(
+            UniqueConstraint(
+                *validated,
+                name=f"uq_{table_name}_" + "_".join(validated),
+            )
+        )
+
+    table_constraints = getattr(schema_class, "__table_constraints__", ()) or ()
+    return Table(
+        table_name, metadata,
+        *columns,
+        *indexes,
+        *composite_constraints,
+        *table_constraints,
+    )
+
+
+# ─── PRAGMAs + engine factory ────────────────────────────────────────────
+
+_PRAGMAS: tuple[str, ...] = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA mmap_size=268435456",     # 256 MB memory-mapped reads
+    "PRAGMA temp_store=MEMORY",
+    "PRAGMA cache_size=-65536",       # 64 MB (negative = KiB)
+    "PRAGMA busy_timeout=30000",
+    "PRAGMA wal_autocheckpoint=1000",
+)
+
+
+def _attach_pragmas(engine: AsyncEngine) -> None:
+    """Install `connect` + `begin` event listeners on the engine.
+
+    The `connect` listener sets all PRAGMAs on each new physical SQLite
+    connection (reader and writer pools see them independently — both
+    must be set) and disables Python sqlite3's auto-COMMIT-before-DDL
+    so SQLA can wrap CREATE TABLE / ALTER inside real transactions.
+
+    The `begin` listener emits the actual `BEGIN` statement since
+    setting `isolation_level=None` switches us to manual transaction
+    control. Without this, a failing migration that issued DDL would
+    leave the DDL committed even though SQLA "rolled back" the txn —
+    because pysqlite/aiosqlite had implicitly committed it first.
+    """
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _on_connect(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        try:
+            for sql in _PRAGMAS:
+                cur.execute(sql)
+        finally:
+            cur.close()
+        # Make DDL transactional. See SQLA "Serializable isolation /
+        # Savepoints / Transactional DDL" recipe for pysqlite/aiosqlite.
+        try:
+            dbapi_conn.isolation_level = None
+        except AttributeError:
+            pass
+        # StaticPool keeps its conn forever. If the loop that created it
+        # dies, the aiosqlite worker thread (non-daemon by default) can
+        # keep the process alive. Mark it daemon so it dies with the
+        # process. This is the only aiosqlite-internal we still touch.
+        thread = getattr(dbapi_conn, "_thread", None)
+        if thread is not None and hasattr(thread, "daemon"):
+            try:
+                thread.daemon = True
+            except (AttributeError, TypeError):
+                pass
+
+    @event.listens_for(engine.sync_engine, "begin")
+    def _do_begin(conn):
+        # With isolation_level=None we issue BEGIN ourselves so SQLA's
+        # transactional semantics work for DDL too.
+        conn.exec_driver_sql("BEGIN")
+
+
+class _EngineDisposalMarker:
+    """Mutable token shared between `close()` and the GC finalizer.
+
+    Stored in `_engine_markers` (a WeakKeyDictionary keyed on the engine,
+    because SQLA's AsyncEngine uses __slots__ and we can't tack on a
+    private attribute). `close()` flips `disposed=True` BEFORE actually
+    disposing; the GC finalizer, when it later fires, checks the flag:
+    still False ⇒ the user dropped the engine without calling `close()`,
+    and we emit a `ResourceWarning` so the leak doesn't go silent.
+    """
+    __slots__ = ("disposed",)
+
+    def __init__(self):
+        self.disposed = False
+
+
+# Engine → marker map. WeakKeyDictionary auto-drops entries when the
+# engine is GC'd; the marker survives until the finalizer also runs
+# (the finalizer closes over the marker via its arg list).
+_engine_markers: "weakref.WeakKeyDictionary[AsyncEngine, _EngineDisposalMarker]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _maybe_warn_undisposed_engine(db_path: str, marker: _EngineDisposalMarker) -> None:
+    """Emit ResourceWarning iff the engine reached GC without being disposed.
+
+    Runs in `weakref.finalize` context, so it must be import-time-safe and
+    not require a running event loop. We only warn — the actual fd-level
+    cleanup is the OS's responsibility (the aiosqlite worker thread is
+    daemon-marked so it dies with the process either way).
+    """
+    if marker.disposed:
+        return
+    warnings.warn(
+        f"AsyncDB engine for {db_path!r} was garbage-collected without "
+        f"`await db.close()`. File descriptors and the aiosqlite worker "
+        f"thread will leak until process exit. Always call `await db.close()` "
+        f"or use `async with AsyncDB(...)`.",
+        ResourceWarning,
+        stacklevel=2,
+    )
+
+
+def _get_engines(db_path: Path) -> tuple[AsyncEngine, AsyncEngine]:
+    """Return (writer, reader) engines for `db_path` in the current loop.
+
+    No active disposal happens from a finalizer — aiosqlite's close path
+    needs a running event loop / greenlet context and a finalizer
+    triggered at GC may be outside any. Instead we register a
+    `ResourceWarning` finalizer that fires only when the engine was
+    dropped without `close()`, surfacing the leak instead of letting it
+    go silent. The aiosqlite worker thread is daemon-marked in the
+    PRAGMA hook, so process exit is never blocked even on a leak.
+    """
+    state = _db_loop_state()
+    engines = state["engines"]
+    key = str(db_path)
+    pair = engines.get(key)
+    if pair is not None:
+        return pair
+
+    url = f"sqlite+aiosqlite:///{db_path}"
+    writer = create_async_engine(
+        url,
+        poolclass=StaticPool,           # one underlying conn; write lock serialises
+        connect_args={"timeout": 30.0, "check_same_thread": False},
+    )
+    reader = create_async_engine(
+        url,
+        pool_size=4,
+        max_overflow=4,
+        pool_timeout=30.0,
+        pool_recycle=3600,
+        connect_args={"timeout": 30.0, "check_same_thread": False},
+    )
+    _attach_pragmas(writer)
+    _attach_pragmas(reader)
+
+    # Attach a disposal marker per engine via a WeakKeyDictionary (can't
+    # set arbitrary attrs on AsyncEngine — it uses __slots__). The
+    # finalizer captures the marker in its arg list so it survives even
+    # after the WKD entry is auto-cleaned on engine GC.
+    for engine in (writer, reader):
+        marker = _EngineDisposalMarker()
+        _engine_markers[engine] = marker
+        weakref.finalize(engine, _maybe_warn_undisposed_engine, key, marker)
+
+    engines[key] = (writer, reader)
+    return writer, reader
+
+
+# ─── schema versioning (tier 2): file-based migrations ────────────────────
+#
+# Convention: AsyncDB probes `<db_path>.parent / "migrations"` and applies
+# any script whose `version` exceeds the live `PRAGMA user_version`.
+# Migrations are plain Python modules:
+#
+#     # migrations/001_add_email.py
+#     version = 1
+#     description = "Add email column to users"
+#
+#     async def upgrade(conn):
+#         await conn.execute(text("ALTER TABLE users ADD COLUMN email TEXT"))
+#
+# Validation rules:
+#   - filenames match `NNN_*.py` where NNN is the version (zero-padded ok)
+#   - versions start at 1 and form a contiguous sequence (no gaps, no dupes)
+#   - each module defines `version: int`, `description: str`,
+#     `async def upgrade(conn)`.
+#
+# Forward-only by design. We deliberately do NOT support `downgrade()`:
+# automated schema rollbacks are dangerous in practice and tempt users
+# to write reversible migrations that aren't actually reversible (e.g.
+# SQLite can't DROP COLUMN before 3.35; backfilled data is often lost
+# on rollback). For ad-hoc rollback, restore from backup or write a
+# forward migration that undoes the change.
+
+_MIGRATION_FILENAME = re.compile(r"^(\d+)_[A-Za-z0-9_]+\.py$")
+
+
+@dataclass(frozen=True)
+class _Migration:
+    version: int
+    description: str
+    upgrade: Callable[["AsyncConnection"], Awaitable[None]]
+    source: Path
+
+
+# Process-wide cache for migration modules: key is (abs path, mtime_ns).
+# A file edit invalidates the cache automatically; same-file re-imports
+# are reused. Stops `_ensure_engines()` from re-executing every migration
+# module on every (instance, loop) — important for test suites that
+# create many short-lived AsyncDBs against a shared migrations dir.
+_migration_module_cache: Dict[Tuple[str, int], Any] = {}
+
+
+def _load_migration_module(fp: Path) -> Any:
+    """Import (or return cached) the migration module at `fp`.
+
+    Cache key is (resolved path, mtime_ns). Editing the file produces a
+    new key; identical re-imports are free. Any error from the module's
+    top-level execution (`SyntaxError`, `ImportError`, anything raised
+    at import time) is wrapped in a `RuntimeError` that points to the
+    migration file by name — otherwise the traceback shows the synthetic
+    `_esuls_migration_*` module name and the user has to dig.
+    """
+    stat = fp.stat()
+    key = (str(fp.resolve()), stat.st_mtime_ns)
+    module = _migration_module_cache.get(key)
+    if module is not None:
+        return module
+    # Include the mtime in the synthetic module name so a re-imported
+    # edited file doesn't collide in sys.modules with its prior version.
+    mod_name = f"_esuls_migration_{fp.stem}_{stat.st_mtime_ns}"
+    spec = importlib.util.spec_from_file_location(mod_name, fp)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load migration spec: {fp.name}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        raise RuntimeError(
+            f"failed to load migration {fp.name}: {type(e).__name__}: {e}"
+        ) from e
+    _migration_module_cache[key] = module
+    return module
+
+
+def _discover_migrations(migrations_dir: Path) -> List[_Migration]:
+    """Load + sort + validate migration scripts in `migrations_dir`.
+
+    Raises `ValueError` on gaps, duplicate versions, or invalid module
+    structure. Returns an empty list if the directory has no matching
+    files (an empty `migrations/` is not an error).
+    """
+    candidates = sorted(
+        p for p in migrations_dir.glob("*.py")
+        if _MIGRATION_FILENAME.match(p.name)
+    )
+    migrations: List[_Migration] = []
+    for fp in candidates:
+        module = _load_migration_module(fp)
+
+        version = getattr(module, "version", None)
+        if not isinstance(version, int) or version < 1:
+            raise ValueError(
+                f"{fp}: `version` must be a positive int, got {version!r}"
+            )
+        description = getattr(module, "description", "")
+        upgrade = getattr(module, "upgrade", None)
+        if not callable(upgrade):
+            raise ValueError(f"{fp}: missing `async def upgrade(conn)`")
+        # Any `downgrade` defined in the module is ignored — forward-only.
+        migrations.append(_Migration(
+            version=version,
+            description=str(description),
+            upgrade=upgrade,
+            source=fp,
+        ))
+
+    migrations.sort(key=lambda m: m.version)
+    seen: set[int] = set()
+    for m in migrations:
+        if m.version in seen:
+            raise ValueError(
+                f"duplicate migration version {m.version} in {migrations_dir}"
+            )
+        seen.add(m.version)
+    if migrations:
+        if migrations[0].version != 1:
+            raise ValueError(
+                f"migrations must start at version 1; first is {migrations[0].version}"
+            )
+        for prev, curr in zip(migrations, migrations[1:]):
+            if curr.version != prev.version + 1:
+                raise ValueError(
+                    f"migration version gap: {prev.version} → {curr.version} "
+                    f"(expected {prev.version + 1})"
+                )
+    return migrations
+
+
+def discover_migrations(migrations_dir: Path) -> List[Dict[str, Any]]:
+    """Public introspection of migration files without opening a db.
+
+    Returns one dict per migration with `version`, `description`, and
+    `source` (filename). For "applied vs pending" status against a real
+    db, instantiate AsyncDB and call `await db.list_migrations()`.
+    """
+    return [
+        {
+            "version": m.version,
+            "description": m.description,
+            "source": m.source.name,
+        }
+        for m in _discover_migrations(migrations_dir)
+    ]
+
+
+async def _apply_pending_migrations(
+    conn: "AsyncConnection", migrations_dir: Path
+) -> List[int]:
+    """Apply all migrations whose `version` > current `PRAGMA user_version`.
+
+    Runs inside the caller's transaction (`writer.begin()`), so a
+    migration failure rolls back everything: the user_version stays at
+    its pre-migration value and the data is untouched. Returns the list
+    of applied versions for callers that want to log / verify.
+    """
+    if not migrations_dir.is_dir():
+        return []
+    migrations = _discover_migrations(migrations_dir)
+    if not migrations:
+        return []
+    current = (await conn.execute(text("PRAGMA user_version"))).scalar() or 0
+    applied: List[int] = []
+    for m in migrations:
+        if m.version <= current:
+            continue
+        logger.info(
+            f"applying migration {m.version}: {m.description} ({m.source.name})"
+        )
+        await m.upgrade(conn)
+        # PRAGMA user_version doesn't accept bound parameters; embed an
+        # already-validated int directly.
+        await conn.execute(text(f"PRAGMA user_version = {int(m.version)}"))
+        applied.append(m.version)
+    return applied
+
+
+T = TypeVar("T")
+SchemaType = TypeVar("SchemaType", bound="_ModelBase")
+
 
 @dataclass
-class BaseModel:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()), metadata={"primary_key": True})
-    created_at: datetime = field(default_factory=datetime.now)
-    updated_at: datetime = field(default_factory=datetime.now)
+class _ModelBase:
+    """Shared `to_dict` / `from_dict` (transport-level JSON encoding).
+
+    No fields of its own. Concrete bases — `IdModel`, `IntIdModel`,
+    `TimestampedModel` — add primary-key and (optionally) timestamp
+    fields. Compose by inheritance: `class MyRow(TimestampedModel)`
+    for the legacy default, `class MyRow(IdModel)` for "id only, no
+    timestamps", `class MyRow(IntIdModel)` for autoincrement int PK.
+    """
 
     def to_dict(self) -> dict:
         result = {}
@@ -179,19 +981,10 @@ class BaseModel:
 
     @classmethod
     def from_dict(cls: Type[SchemaType], data: dict) -> SchemaType:
-        """Reconstruct an instance from a JSON-style dict.
+        """Decode any `b64:...` strings back into bytes for bytes-typed fields.
 
-        Symmetric counterpart to `to_dict()`: decodes any "b64:..."
-        strings back into bytes for fields whose declared type is
-        `bytes` (or `Optional[bytes]`). Other fields are passed
-        through unchanged — the dataclass constructor handles
-        primitives, and downstream `_deserialize_value` (in AsyncDB)
-        handles datetime/enum/etc. on the SQLite read path.
-
-        Use this whenever you reconstruct a model from JSON received
-        over the wire (e.g. cache_save / cache_find_many endpoints);
-        plain `cls(**data)` would leave bytes fields holding the
-        encoded string and break downstream consumers.
+        Non-bytes fields pass through unchanged — a `str` field that happens
+        to hold the literal text `"b64:..."` is preserved as-is.
         """
         type_hints = get_type_hints(cls)
         converted: Dict[str, Any] = {}
@@ -214,100 +1007,153 @@ class BaseModel:
         if isinstance(value, date):
             return value.isoformat()
         if isinstance(value, bytes):
-            # Bytes can't go through json.dumps. Base64-encode with the
-            # _B64_PREFIX sentinel so the symmetric `from_dict` knows
-            # to decode this back into a bytes object on the receiving
-            # side. The SQLite read/write path (AsyncDB._serialize_value
-            # / _deserialize_value) already handles bytes natively as
-            # BLOB and is unaffected by this transport-level encoding.
             return _B64_PREFIX + base64.b64encode(value).decode("ascii")
         if isinstance(value, enum.Enum):
             return value.value
         if isinstance(value, uuid.UUID):
             return str(value)
         if isinstance(value, Decimal):
-            return float(value)
-        if isinstance(value, (list, tuple, set)):
+            # Lossless. Previous version coerced to float() — that silently
+            # truncated precision for big-decimal payloads.
+            return str(value)
+        if isinstance(value, (list, tuple, set, frozenset)):
             return [self._serialize_value(v) for v in value]
         if isinstance(value, dict):
             return {k: self._serialize_value(v) for k, v in value.items()}
-        if hasattr(value, "to_dict"):          # nested BaseModel
+        if hasattr(value, "to_dict"):
             return value.to_dict()
-        if is_dataclass(value):                # nested dataclass generico
+        if is_dataclass(value):
             return asdict(value)
         return value
 
 
-class AsyncDB(Generic[SchemaType]):
-    """High-performance async SQLite with dataclass schema and reliable connection handling.
+@dataclass
+class IdModel(_ModelBase):
+    """String-id only — for cache/lookup tables that don't need timestamps."""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()), metadata={"primary_key": True})
 
-    Locks and the cached connection are scoped to the running event loop:
-    multiple `asyncio.run()` invocations against the same AsyncDB instance
-    (or against different instances pointing at the same db file) will
-    re-acquire fresh asyncio primitives in the new loop instead of
-    crashing with `bound to a different event loop`.
+
+@dataclass
+class IntIdModel(_ModelBase):
+    """Integer autoincrement PK. SQLite assigns the rowid on insert when
+    `id` is None. Use for high-throughput tables where UUID4-as-string PK
+    fragments the B-tree."""
+    id: Optional[int] = field(default=None, metadata={"primary_key": True})
+
+
+@dataclass
+class TimestampedModel(IdModel):
+    """String id + `created_at` / `updated_at` (the legacy default).
+
+    `created_at` is preserved across upserts (excluded from the SET
+    clause of ON CONFLICT DO UPDATE). `updated_at` is overwritten on
+    every save / update_fields.
+    """
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass
+class TimestampedIntModel(IntIdModel):
+    """Integer autoincrement PK + `created_at` / `updated_at`.
+
+    The high-throughput counterpart to `TimestampedModel`. Use when you
+    want the perf characteristics of an INTEGER PRIMARY KEY (no UUID
+    string fragmentation, smaller indexes, faster joins) but also need
+    the auto-managed timestamp columns.
+    """
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+
+# Backward-compat alias — `BaseModel` was the old single class; everything
+# that inherits from it keeps working because `TimestampedModel` has the
+# same fields + methods. New code can prefer the explicit names.
+BaseModel = TimestampedModel
+
+
+class AsyncDB(Generic[SchemaType]):
+    """Async SQLite layer with dataclass schemas, built on SQLAlchemy Core.
+
+    Locks and engines are scoped to the running event loop via the
+    per-loop registry — the same AsyncDB instance can be used across
+    multiple `asyncio.run()` calls without `bound to a different event
+    loop` crashes.
     """
 
-    OPERATOR_MAP = {
-        'gt': '>', 'lt': '<', 'gte': '>=', 'lte': '<=',
-        'neq': '!=', 'like': 'LIKE', 'in': 'IN', 'eq': '='
-    }
+    # Operator suffixes recognised on filter kwargs (e.g. `count__gt=5`).
+    # Anything else is treated as a column name (so a literal `__` in a
+    # column name still works as long as the schema declares it).
+    OPERATOR_MAP = frozenset({
+        "gt", "lt", "gte", "lte", "neq", "like", "in", "eq",
+        "is_null", "not_null", "not_in", "between",
+    })
 
-    def __init__(self, db_path: Union[str, Path], table_name: str, schema_class: Type[SchemaType]):
-        """Initialize AsyncDB with a path and schema dataclass."""
+    def __init__(
+        self,
+        db_path: Union[str, Path],
+        table_name: str,
+        schema_class: Type[SchemaType],
+        *,
+        strict_schema: bool = False,
+    ):
+        """
+        `strict_schema=True` promotes schema-drift warnings (type mismatch
+        between dataclass and DB, NOT NULL violated by retrofit, orphan
+        columns in the DB) into `RuntimeError`. Default is to log a
+        warning and proceed — useful for dev/iteration but a footgun in
+        prod, hence the opt-in strict mode.
+        """
         if not is_dataclass(schema_class):
             raise TypeError(f"Schema must be a dataclass, got {schema_class}")
 
         self.db_path = Path(db_path).resolve()
         self.schema_class = schema_class
         self.table_name = _validate_identifier(table_name)
+        self.strict_schema = strict_schema
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Validate all field names upfront
+        # Migrations convention: `./migrations/` next to the db file.
+        # Probed on every `_init_or_migrate_schema`; an absent or empty
+        # directory is silently a no-op (so callers without migrations
+        # pay no cost). Per-instance attribute so users can override it
+        # for testing without monkeypatching constants.
+        self.migrations_dir: Path = self.db_path.parent / "migrations"
+
+        # Validate field identifiers up front so a bad schema fails at
+        # construction time rather than on first save.
         for f in fields(schema_class):
             _validate_identifier(f.name)
 
-        # Whitelist of column names declared on the schema. Used by
-        # _validate_column() to gate every column name interpolated into SQL
-        # at runtime (where-clause keys, order_by, update_fields kwargs), so
-        # untrusted inputs cannot smuggle arbitrary identifiers — even if
-        # they happen to match the safe-identifier regex.
+        # Whitelist used by `_validate_column` to gate every column-name
+        # interpolated into SQL (filter keys, order_by, update_fields kwargs).
         self._valid_columns: frozenset[str] = frozenset(
             f.name for f in fields(schema_class)
         )
-
-        # Collect columns that can be used as upsert conflict targets:
-        # any field flagged primary_key=True or unique=True. Used by save()
-        # / save_batch() to validate the `on_conflict` argument up-front and
-        # to surface typos as a ValueError instead of an opaque SQL error.
+        # Columns individually eligible as upsert conflict targets.
         self._conflict_targets: set[str] = {
             f.name for f in fields(schema_class)
-            if f.metadata.get('primary_key') or f.metadata.get('unique')
+            if f.metadata.get("primary_key") or f.metadata.get("unique")
         }
+        # Composite conflict targets declared via `__unique_together__`.
+        # Stored as frozensets so the caller can pass the columns in any
+        # order: `on_conflict=("a", "b")` matches `[("b", "a")]`.
+        unique_together = getattr(schema_class, "__unique_together__", ()) or ()
+        self._composite_conflict_targets: set[frozenset[str]] = {
+            frozenset(cols) for cols in unique_together
+        }
+        self._db_key = f"{self.db_path}:{self.table_name}:{self.schema_class.__name__}"
 
-        # Make schema initialization unique per instance
-        self._db_key = f"{str(self.db_path)}:{self.table_name}:{self.schema_class.__name__}"
+        # Build the SQLA Table synchronously — pure-Python, no I/O.
+        self._metadata = MetaData()
+        self._table: Table = _table_from_schema(
+            self._metadata, self.table_name, schema_class
+        )
 
-        # Write lock is acquired per running loop via _get_write_lock();
-        # see _db_loop_state() at module level for the registry semantics.
-
-        self._type_hints = get_type_hints(schema_class)
-
-        # Persistent connection (lazy init); _connection_loop tracks the
-        # event loop in which it was opened. A cross-loop reuse drops the
-        # stale connection so a fresh one is opened in the current loop.
-        self._connection: Optional[aiosqlite.Connection] = None
-        self._connection_loop: Optional[asyncio.AbstractEventLoop] = None
+    # ──────────────── engines + write lock (per-loop) ────────────────
 
     async def _get_write_lock(self) -> asyncio.Lock:
-        """Return the write lock for this db file in the current loop.
-
-        All AsyncDB instances pointing at the same db_path within the same
-        loop share one Lock, so writes against a single SQLite file are
-        serialised in-process before SQLite has to. Different loops get
-        different Lock objects (otherwise they would clash on first
-        contention with `bound to a different event loop`).
-        """
+        """Return the per-loop, per-db-path write lock."""
         state = _db_loop_state()
         locks = state["locks"]
         key = str(self.db_path)
@@ -316,60 +1162,191 @@ class AsyncDB(Generic[SchemaType]):
             lock = asyncio.Lock()
             locks[key] = lock
         return lock
-    
-    async def _ensure_connection(self, max_retries: int = 5) -> aiosqlite.Connection:
-        """Return the persistent connection, creating it on first call with retry logic.
 
-        If a cached connection is present but bound to a different (likely
-        defunct) event loop, it is silently dropped and a fresh connection
-        is opened in the current loop. We don't try to close the stale
-        connection — closing requires the original loop, which is gone.
+    async def _ensure_engines(self) -> tuple[AsyncEngine, AsyncEngine]:
+        """Get/create the (writer, reader) pair; run schema init if needed."""
+        writer, reader = _get_engines(self.db_path)
+        await self._ensure_schema_initialized()
+        return writer, reader
+
+    async def _ensure_schema_initialized(
+        self, conn: Optional[AsyncConnection] = None,
+    ) -> None:
+        """Run schema init + pending migrations once per (instance, loop).
+
+        When called without `conn` (the normal path), it opens its own
+        `writer.begin()` and does the work inside that transaction, then
+        caches the result in `state["initialized"]` so subsequent calls
+        are no-ops.
+
+        When called WITH `conn` (the `save(conn=...)` path), it runs on
+        the caller's connection so the schema-init DDL is atomic with
+        the caller's transaction — and crucially is rolled back together
+        if the caller's transaction fails. For this reason we do NOT
+        cache the init result: a future call after a rollback must redo
+        the schema init. The op is idempotent (CREATE TABLE IF NOT EXISTS,
+        ALTER ADD COLUMN only on missing columns, migrations gated by
+        PRAGMA user_version), so re-running is safe and cheap.
         """
-        loop = asyncio.get_running_loop()
-        if self._connection is not None:
-            if self._connection_loop is loop:
-                return self._connection
-            # Cross-loop reuse: drop without close (the original loop is gone).
-            self._connection = None
-            self._connection_loop = None
-
         state = _db_loop_state()
-        schema_init_lock: asyncio.Lock = state["schema_init_lock"]
-        initialized: set = state["initialized"]
+        if self._db_key in state["initialized"]:
+            return
+        async with state["schema_init_lock"]:
+            if self._db_key in state["initialized"]:
+                return
+            if conn is not None:
+                # Inline path: schema-init runs on the caller's conn so
+                # it's atomic with the rest of their transaction. We
+                # deliberately don't mark as initialized — if the caller
+                # rolls back, the CREATE TABLE rolls back too and the
+                # next call must redo it.
+                await self._init_or_migrate_schema(conn)
+                return
+            writer, _ = _get_engines(self.db_path)
+            async with writer.begin() as own_conn:
+                await self._init_or_migrate_schema(own_conn)
+            state["initialized"].add(self._db_key)
 
-        last_error = None
-        for attempt in range(max_retries):
-            try:
-                db = aiosqlite.connect(self.db_path, timeout=30.0)
-                # Mark daemon BEFORE await (which calls thread.start()).
-                _mark_aiosqlite_daemon(db)
-                db = await db
-                # Fast WAL mode with minimal sync
-                await db.execute("PRAGMA journal_mode=WAL")
-                await db.execute("PRAGMA synchronous=NORMAL")
-                await db.execute("PRAGMA cache_size=10000")
-                await db.execute("PRAGMA busy_timeout=30000")  # 30s busy timeout
+    async def _init_or_migrate_schema(self, conn: AsyncConnection) -> None:
+        """Create-on-first-run or add missing columns on schema drift.
 
-                # Initialize schema if needed (with lock to prevent race condition)
-                if self._db_key not in initialized:
-                    async with schema_init_lock:
-                        # Double-check after acquiring lock
-                        if self._db_key not in initialized:
-                            await self._init_schema(db)
-                            initialized.add(self._db_key)
+        Order is load-bearing: ALTER TABLE ADD COLUMN must run BEFORE the
+        idempotent `metadata.create_all`, because indexes referencing new
+        columns would otherwise fail to create.
 
-                self._connection = db
-                self._connection_loop = loop
-                return db
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    # Exponential backoff: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
-                    wait_time = 0.1 * (2 ** attempt)
-                    await asyncio.sleep(wait_time)
-                    continue
-                raise
-        raise last_error
+        After the retrofit, we diff the live schema against the dataclass
+        and surface mismatches (type drift, NOT NULL violated by retrofit,
+        orphan columns) as warnings — or as `RuntimeError` when
+        `strict_schema=True`.
+        """
+        result = await conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name=:n"),
+            {"n": self.table_name},
+        )
+        table_exists = result.fetchone() is not None
+
+        if not table_exists:
+            # Fresh table — create_all handles columns and indexes in one shot.
+            await conn.run_sync(self._metadata.create_all)
+            # Fresh DB: the dataclass-driven schema is by definition "at
+            # the latest version", so we leap-frog `PRAGMA user_version`
+            # to the max declared migration. Otherwise the next start
+            # would try to re-apply migrations that already match the
+            # live schema (typically ALTER ADD COLUMN of a column the
+            # dataclass already declared).
+            if self.migrations_dir.is_dir():
+                migs = _discover_migrations(self.migrations_dir)
+                if migs:
+                    max_version = migs[-1].version
+                    await conn.execute(
+                        text(f"PRAGMA user_version = {int(max_version)}")
+                    )
+            return
+
+        # Existing table — retrofit missing columns. SQLite's ADD COLUMN
+        # cannot enforce NOT NULL retroactively, so all retrofits are
+        # NULL-able regardless of `required=True` on the dataclass.
+        info = await conn.execute(
+            text(f'PRAGMA table_info("{self.table_name}")')
+        )
+        existing = {row[1] for row in info.fetchall()}
+        retrofit_names: set[str] = set()
+        for col in self._table.columns:
+            if col.name in existing:
+                continue
+            type_ddl = col.type.compile(dialect=conn.dialect)
+            await conn.execute(
+                text(
+                    f'ALTER TABLE "{self.table_name}" '
+                    f'ADD COLUMN "{col.name}" {type_ddl}'
+                )
+            )
+            retrofit_names.add(col.name)
+        # Pick up any new indexes (idempotent: CREATE INDEX IF NOT EXISTS).
+        await conn.run_sync(self._metadata.create_all)
+
+        # Drift detection: surface mismatches the retrofit cannot fix.
+        await self._check_schema_drift(conn, retrofit_names)
+
+        # Apply file-based migrations from `<db_path.parent>/migrations`.
+        # Runs in the same writer transaction → atomic across schema init
+        # + drift check + every migration. Any failure rolls back the
+        # whole thing and leaves `PRAGMA user_version` at its prior value.
+        await _apply_pending_migrations(conn, self.migrations_dir)
+
+    async def _check_schema_drift(
+        self,
+        conn: AsyncConnection,
+        retrofit_names: set[str],
+    ) -> None:
+        """Diff live schema against dataclass and surface issues.
+
+        Three flavours of drift, all reported via the same channel:
+          1. Type mismatch — column exists in both, but the declared SQL
+             type is not equivalent under SQLite affinity rules to what
+             the dataclass would produce (`_types_equivalent` handles the
+             common BOOLEAN↔INTEGER, DATETIME↔TEXT, VARCHAR↔TEXT pairs).
+          2. Retrofit NOT NULL violation — a `required=True` column had
+             to be added via ALTER, which cannot enforce NOT NULL on
+             pre-existing rows.
+          3. Orphan column — exists in the DB but no longer declared on
+             the dataclass.
+
+        Each is `logger.warning` by default; with `strict_schema=True`,
+        the first issue is raised as `RuntimeError` to stop the world.
+        """
+        issues: list[str] = []
+
+        info = await conn.execute(
+            text(f'PRAGMA table_info("{self.table_name}")')
+        )
+        live_by_name = {row[1]: row for row in info.fetchall()}
+        declared_by_name = {c.name: c for c in self._table.columns}
+        # Dataclass field metadata is the source of truth for `required` —
+        # SQLA Column doesn't carry that flag forward, so we look it up here.
+        dataclass_field_meta = {
+            f.name: f.metadata for f in fields(self.schema_class)
+        }
+
+        for name, col in declared_by_name.items():
+            declared_ddl = col.type.compile(dialect=conn.dialect)
+            live_row = live_by_name.get(name)
+            if live_row is None:
+                continue  # should not happen post-retrofit
+            live_type = (live_row[2] or "")
+            if live_type and declared_ddl and not _types_equivalent(live_type, declared_ddl):
+                issues.append(
+                    f"column {self.table_name}.{name}: type drift "
+                    f"(DB declared {live_type!r}, schema would declare {declared_ddl!r}). "
+                    f"SQLite is dynamically typed so reads may still work, "
+                    f"but writes can store values the schema can't decode."
+                )
+            field_meta = dataclass_field_meta.get(name, {})
+            if name in retrofit_names and field_meta.get("required", False):
+                issues.append(
+                    f"column {self.table_name}.{name}: retrofitted via "
+                    f"ALTER TABLE ADD COLUMN but declared required=True. "
+                    f"SQLite cannot enforce NOT NULL on retrofitted columns; "
+                    f"pre-existing rows will have NULL in this column."
+                )
+
+        for name in live_by_name:
+            if name not in declared_by_name:
+                issues.append(
+                    f"column {self.table_name}.{name}: present in DB but not "
+                    f"on {self.schema_class.__name__}. Either drop it via a "
+                    f"migration or add the field to the dataclass."
+                )
+
+        for msg in issues:
+            logger.warning(f"schema drift: {msg}")
+        if issues and self.strict_schema:
+            raise RuntimeError(
+                f"strict_schema=True: {len(issues)} schema drift issue(s) "
+                f"on {self.table_name}. See warnings above."
+            )
+
+    # ──────────────── lifecycle ────────────────
 
     async def __aenter__(self):
         return self
@@ -378,487 +1355,150 @@ class AsyncDB(Generic[SchemaType]):
         await self.close()
 
     async def close(self) -> None:
-        """Explicitly close the persistent connection."""
-        if self._connection is not None:
-            try:
-                await self._connection.close()
-            except Exception:
-                pass
-            self._connection = None
-            self._connection_loop = None
+        """Run PRAGMA optimize + checkpoint, then dispose both engines.
 
-    async def _init_schema(self, db: aiosqlite.Connection) -> None:
-        """Generate schema from dataclass structure with support for field additions."""
-        logger.debug(f"Initializing schema for {self.schema_class.__name__} in table {self.table_name}")
-        
-        field_defs = []
-        indexes = []
-        
-        # First check if table exists
-        cursor = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (self.table_name,)
-        )
-        table_exists = await cursor.fetchone() is not None
-        
-        existing_columns = set()
-        if table_exists:
-            # Get existing columns if table exists
-            cursor = await db.execute(f"PRAGMA table_info({self.table_name})")
-            columns = await cursor.fetchall()
-            existing_columns = {col[1] for col in columns}  # col[1] is the column name
-        
-        # Process all fields in the dataclass - ONLY THIS SCHEMA CLASS
-        schema_fields = fields(self.schema_class)
-        logger.debug(f"Processing {len(schema_fields)} fields for {self.schema_class.__name__}")
-        
-        for f in schema_fields:
-            field_name = f.name
-            field_type = self._type_hints.get(field_name)
-            logger.debug(f"  Field: {field_name} -> {field_type}")
+        Idempotent — a second call is a no-op. The per-loop `initialized`
+        flag is cleared too so the next operation re-runs schema init
+        against fresh engines.
 
-            # Unwrap Optional[X] → X
-            if hasattr(field_type, '__origin__') and field_type.__origin__ is Union:
-                args = [a for a in field_type.__args__ if a is not type(None)]
-                if len(args) == 1:
-                    field_type = args[0]
+        Flips each engine's `_EngineDisposalMarker.disposed` flag BEFORE
+        calling `dispose()` so the GC finalizer, when it later fires,
+        recognises this as a clean teardown and does NOT emit the
+        "engine GC'd without close" `ResourceWarning`.
+        """
+        try:
+            state = _db_loop_state()
+        except RuntimeError:
+            # Called outside an event loop (e.g. atexit). Nothing to do —
+            # the GC finalizer's ResourceWarning is the only signal here.
+            return
+        key = str(self.db_path)
+        pair = state["engines"].pop(key, None)
+        state["initialized"].discard(self._db_key)
+        if pair is None:
+            return
+        writer, reader = pair
+        # Mark disposed BEFORE the actual dispose so a finalizer racing
+        # against close() (rare but possible if GC kicks in mid-method)
+        # sees the flag set and skips the warning.
+        for engine in (writer, reader):
+            marker = _engine_markers.get(engine)
+            if marker is not None:
+                marker.disposed = True
+        try:
+            async with writer.connect() as conn:
+                await conn.execute(text("PRAGMA optimize"))
+                await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+        except Exception as e:
+            logger.debug(f"close(): PRAGMA optimize/checkpoint skipped: {e}")
+        try:
+            await writer.dispose()
+        except Exception:
+            pass
+        try:
+            await reader.dispose()
+        except Exception:
+            pass
 
-            # Map Python types to SQLite types.
-            #
-            # Order matters: we check by identity for the leaf types that
-            # don't participate in subclass relationships we care about
-            # (bytes, datetime, float), then by `issubclass` so that
-            # IntEnum/IntFlag inherit `int` → INTEGER, StrEnum inherits
-            # `str` → TEXT, and other Enum subclasses fall back to TEXT.
-            # `isinstance(field_type, type)` guards against typing aliases
-            # (e.g. `List[str]`) that would crash `issubclass`.
-            if field_type is bytes:
-                sql_type = "BLOB"
-            elif field_type is datetime:
-                sql_type = "TIMESTAMP"
-            elif field_type is float:
-                sql_type = "REAL"
-            elif isinstance(field_type, type) and issubclass(field_type, int):
-                # int, bool, IntEnum, IntFlag (bool is a subclass of int).
-                sql_type = "INTEGER"
-            elif isinstance(field_type, type) and issubclass(field_type, str):
-                # str, StrEnum.
-                sql_type = "TEXT"
-            elif isinstance(field_type, type) and issubclass(field_type, enum.Enum):
-                # Other Enum subtypes — serialized via `.value`, stored as TEXT.
-                sql_type = "TEXT"
-            elif getattr(field_type, '__origin__', None) is list:
-                # List[X] / list[X] — JSON-encoded into a TEXT column.
-                sql_type = "TEXT"
-            else:
-                # Dict, nested dataclass, unrecognised typing aliases, etc.
-                sql_type = "TEXT"  # JSON-encoded
-                
-            # Handle special field metadata
-            constraints = []
-            if f.metadata.get('primary_key'):
-                constraints.append("PRIMARY KEY")
-            if f.metadata.get('unique'):
-                constraints.append("UNIQUE")
-            if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING and f.metadata.get('required', True):
-                constraints.append("NOT NULL")
-                
-            field_def = f"{field_name} {sql_type} {' '.join(constraints)}"
-            
-            if not table_exists:
-                # Add field definition for new table creation
-                field_defs.append(field_def)
-            elif field_name not in existing_columns:
-                # Alter table to add the new column without NOT NULL constraint
-                alter_sql = f"ALTER TABLE {self.table_name} ADD COLUMN {field_name} {sql_type}"
-                logger.debug(f"  Adding new column: {alter_sql}")
-                await db.execute(alter_sql)
-                await db.commit()
-                
-            # Handle indexes
-            if f.metadata.get('index'):
-                index_name = f"idx_{self.table_name}_{field_name}"
-                index_sql = f"CREATE INDEX IF NOT EXISTS {index_name} ON {self.table_name}({field_name})"
-                indexes.append(index_sql)
-        
-        # Create table if it doesn't exist
-        if not table_exists:
-            # Check for table constraints
-            table_constraints = getattr(self.schema_class, '__table_constraints__', [])
+    async def checkpoint(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        """Run `PRAGMA wal_checkpoint(<mode>)`. Returns (busy, log, checkpointed)."""
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"Invalid checkpoint mode: {mode!r}")
+        writer, _ = await self._ensure_engines()
+        async with writer.connect() as conn:
+            result = await conn.execute(text(f"PRAGMA wal_checkpoint({mode})"))
+            row = result.fetchone()
+            return tuple(row) if row else (0, 0, 0)
 
-            constraints_sql = ""
-            if table_constraints:
-                constraints_sql = ", " + ", ".join(table_constraints)
+    async def list_migrations(self) -> List[Dict[str, Any]]:
+        """List all migrations next to this db with their applied status.
 
-            create_sql = f"""
-                CREATE TABLE IF NOT EXISTS {self.table_name} (
-                    {', '.join(field_defs)}{constraints_sql}
-                )
-            """
-            logger.debug(f"Creating table: {create_sql}")
-            await db.execute(create_sql)
-        
-        # Create indexes
-        for idx_stmt in indexes:
-            await db.execute(idx_stmt)
-            
-        await db.commit()
-        logger.debug(f"Schema initialization complete for {self.schema_class.__name__}")
-    
+        Returns a list of dicts: ``{version, description, source, applied}``.
+        Because the AsyncDB constructor (well, first-use of any method)
+        applies any pending migrations automatically, in normal usage
+        every entry comes back ``applied=True``. The method is most
+        useful right after writing a new migration to verify it was
+        picked up — or in a health-check endpoint that wants to log
+        which schema version is live.
+
+        For pre-apply discovery (e.g. CI dry-runs), call the
+        module-level `discover_migrations(path)` instead.
+        """
+        if not self.migrations_dir.is_dir():
+            return []
+        migs = _discover_migrations(self.migrations_dir)
+        if not migs:
+            return []
+        writer, _ = await self._ensure_engines()
+        async with writer.connect() as conn:
+            current = (await conn.execute(text("PRAGMA user_version"))).scalar() or 0
+        return [
+            {
+                "version": m.version,
+                "description": m.description,
+                "source": m.source.name,
+                "applied": m.version <= current,
+            }
+            for m in migs
+        ]
+
     @contextlib.asynccontextmanager
     async def transaction(self, read_only: bool = False):
-        """Run operations in a transaction.
+        """Yield a SQLA `AsyncConnection`.
 
-        Write paths (default, `read_only=False`) commit on clean exit and
-        roll back on exception. Read paths (`read_only=True`) skip both
-        commit and rollback — for SELECT-only sequences SQLite doesn't
-        auto-start a transaction (with the default deferred isolation),
-        so commit/rollback are pointless round-trips to the aiosqlite
-        worker thread.
+        - Writer (`read_only=False`): wrapped in `engine.begin()` — autocommit
+          on clean exit, rollback on exception.
+        - Reader (`read_only=True`): `engine.connect()` — no BEGIN, no COMMIT,
+          no rollback. SQLite's deferred isolation makes BEGIN unnecessary
+          for SELECT-only sequences.
 
-        On a stale-connection error ("connection is closed", "no active
-        connection") the cached connection is cleared so the next call to
-        `_ensure_connection()` reopens it. Auto-retry is the caller's
-        responsibility — write paths wrap this in a retry loop; read
-        paths surface the error to the caller.
+        Use `await conn.execute(text("...raw SQL..."))` for raw queries; SQLA
+        2.0 requires textual SQL to be wrapped in `text()`.
+
+        Concurrency contract for writes: `transaction(read_only=False)` does
+        NOT acquire the per-loop write lock that the high-level write
+        methods take. Serialisation still happens because the writer
+        engine uses a `StaticPool` of size 1 — only one physical aiosqlite
+        connection exists, so two concurrent writers queue at the pool
+        level rather than at the lock.
+
+        Multi-table atomic writes: to mix several AsyncDB instances inside
+        one transaction (e.g. saving a Company row and an AccrediaCache
+        row in a single commit), use the `conn=` kwarg on the write
+        methods:
+
+            async with DB_COMPANY.transaction() as conn:
+                await DB_COMPANY.save(company,        conn=conn)
+                await DB_CACHE.save(cache_row,        conn=conn)
+            # both writes commit together; either both apply or neither.
+
+        All AsyncDBs in the call chain must point at the SAME .db file —
+        SQLite cannot make writes across separate files atomic. When
+        `conn=` is passed, the inner method skips its own write-lock
+        acquisition and `writer.begin()` (the caller already holds those),
+        and `max_retries` is ignored (a transient failure mid-transaction
+        is the caller's to retry, not ours).
         """
-        db = await self._ensure_connection()
+        writer, reader = await self._ensure_engines()
+        engine = reader if read_only else writer
         try:
-            yield db
-            if not read_only:
-                await db.commit()
+            if read_only:
+                async with engine.connect() as conn:
+                    yield conn
+            else:
+                async with engine.begin() as conn:
+                    yield conn
         except Exception as e:
-            if not read_only:
-                try:
-                    await db.rollback()
-                except Exception:
-                    pass
             if _is_stale_connection(e):
-                self._connection = None
+                # Drop the engines so the next call rebuilds them.
+                state = _db_loop_state()
+                state["engines"].pop(str(self.db_path), None)
+                state["initialized"].discard(self._db_key)
             raise
-    
-    # @lru_cache(maxsize=128)
-    def _serialize_value(self, value: Any) -> Any:
-        """Fast value serialization with type-based optimization."""
-        if value is None or isinstance(value, (int, float, bool, str)):
-            return value
-        if isinstance(value, bytes):
-            return value 
-        if isinstance(value, datetime):
-            return value.isoformat()
-        if isinstance(value, enum.Enum):
-            return value.value
-        if isinstance(value, (list, dict, tuple)):
-            return json.dumps(value, default=lambda v: v.value if isinstance(v, enum.Enum) else str(v))
-        return str(value)
-    
-    def _deserialize_value(self, field_name: str, value: Any) -> Any:
-        """Deserialize values based on field type."""
-        if value is None:
-            return value
 
-        field_type = self._type_hints.get(field_name)
+    # ──────────────── validation helpers ────────────────
 
-        # Handle bytes fields - keep as bytes
-        if field_type == bytes:
-            if isinstance(value, bytes):
-                return value
-            # If somehow stored as string, convert back
-            if isinstance(value, str):
-                try:
-                    return ast.literal_eval(value)
-                except (ValueError, SyntaxError):
-                    return value.encode('utf-8')
-
-        # Handle bool fields - SQLite stores as INTEGER, need to convert back
-        if field_type is bool:
-            return bool(value)
-
-        # Handle string fields - ensure phone numbers are strings
-        if field_type is str or (hasattr(field_type, '__origin__') and field_type.__origin__ is Union and str in getattr(field_type, '__args__', ())):
-            return str(value)
-
-        if field_type is datetime and isinstance(value, str):
-            return datetime.fromisoformat(value)
-
-        # Handle enum types
-        if hasattr(field_type, '__origin__') and field_type.__origin__ is Union:
-            # Handle Optional[EnumType] case
-            args = getattr(field_type, '__args__', ())
-            for arg in args:
-                if arg is not type(None) and isinstance(arg, type) and issubclass(arg, enum.Enum):
-                    try:
-                        return arg(value)
-                    except (ValueError, TypeError):
-                        pass
-        elif isinstance(field_type, type) and issubclass(field_type, enum.Enum):
-            # Handle direct enum types
-            try:
-                return field_type(value)
-            except (ValueError, TypeError):
-                pass
-
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        return value
-    
-    @lru_cache(maxsize=64)
-    def _generate_save_sql(
-        self,
-        field_names: Tuple[str, ...],
-        conflict_target: Union[str, Tuple[str, ...]] = "id",
-    ) -> str:
-        """Generate INSERT ... ON CONFLICT(...) DO UPDATE SQL.
-
-        `conflict_target` selects the UNIQUE / PRIMARY KEY column(s) on
-        which a duplicate triggers the UPDATE branch. Defaults to 'id'.
-        Pass a tuple for composite UNIQUE constraints.
-
-        On UPDATE we refresh every column except `created_at`, so the
-        original row's creation timestamp is preserved across updates.
-        """
-        columns = ','.join(field_names)
-        placeholders = ','.join('?' for _ in field_names)
-
-        set_clause = ','.join(f'{col}=excluded.{col}' for col in field_names if col != 'created_at')
-
-        if isinstance(conflict_target, str):
-            conflict_cols = conflict_target
-        else:
-            conflict_cols = ','.join(conflict_target)
-
-        return f"""
-            INSERT INTO {self.table_name} ({columns},id)
-            VALUES ({placeholders},?)
-            ON CONFLICT({conflict_cols}) DO UPDATE SET {set_clause}
-        """
-
-    def _prepare_item(
-        self,
-        item: SchemaType,
-        conflict_target: Union[str, Tuple[str, ...]] = "id",
-    ) -> Tuple[str, List[Any]]:
-        """Prepare an item for saving. Returns (sql, values).
-
-        `id` and `created_at` are auto-generated only when explicitly None
-        (the missing-value sentinel). Falsy-but-non-None values like `""`
-        or `0` are preserved — the user passed them deliberately, and
-        replacing them silently with a UUID/timestamp would mask schemas
-        that use a non-string id (e.g. `id: int = 0`) or mismatch the
-        caller's expectations.
-        """
-        data = asdict(item)
-        item_id = data.pop('id', None)
-        if item_id is None:
-            item_id = str(uuid.uuid4())
-        now = datetime.now()
-        if data.get('created_at') is None:
-            data['created_at'] = now
-        data['updated_at'] = now
-        field_names = tuple(sorted(data.keys()))
-        sql = self._generate_save_sql(field_names, conflict_target=conflict_target)
-        values = [self._serialize_value(data[name]) for name in field_names]
-        values.append(item_id)
-        return sql, values
-
-    def _resolve_conflict_target(
-        self,
-        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]],
-    ) -> Union[str, Tuple[str, ...]]:
-        """Validate and normalize an `on_conflict` argument.
-
-        Returns 'id' when on_conflict is None (legacy upsert-by-primary-key
-        behaviour). Otherwise verifies every column is declared as
-        primary_key or unique on the schema and returns it normalized.
-        """
-        if on_conflict is None:
-            return "id"
-        if isinstance(on_conflict, str):
-            targets = (on_conflict,)
-        else:
-            targets = tuple(on_conflict)
-        unknown = [c for c in targets if c not in self._conflict_targets]
-        if unknown:
-            raise ValueError(
-                f"on_conflict={on_conflict!r}: column(s) {unknown} are not declared "
-                f"primary_key=True or unique=True on {self.schema_class.__name__}. "
-                f"Available conflict targets: {sorted(self._conflict_targets)}"
-            )
-        return targets[0] if len(targets) == 1 else targets
-
-    async def save_batch(
-        self,
-        items: List[SchemaType],
-        skip_errors: bool = True,
-        *,
-        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
-    ) -> int:
-        """Save multiple items atomically in a single transaction.
-
-        Each row is upserted via INSERT ... ON CONFLICT(...) DO UPDATE.
-
-        Args:
-            items: List of schema objects to save.
-            skip_errors: If True, skip items that cause errors and continue.
-            on_conflict: Column (or tuple of columns) used as the conflict
-                target. Must reference columns declared primary_key=True or
-                unique=True on the schema. Defaults to the primary key
-                ('id'), making save_batch() idempotent on retries. Use a
-                natural key (e.g. on_conflict='external_id') to make the
-                upsert race-free against concurrent writers identifying
-                rows by that key.
-
-        Returns:
-            Number of items successfully saved.
-        """
-        if not items:
-            return 0
-
-        conflict_target = self._resolve_conflict_target(on_conflict)
-
-        saved_count = 0
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                saved_count = 0
-                write_lock = await self._get_write_lock()
-                async with write_lock:
-                    async with self.transaction() as db:
-                        for item in items:
-                            try:
-                                if not isinstance(item, self.schema_class):
-                                    if not skip_errors:
-                                        raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
-                                    continue
-
-                                sql, values = self._prepare_item(item, conflict_target=conflict_target)
-                                await db.execute(sql, values)
-                                saved_count += 1
-
-                            except Exception as e:
-                                if skip_errors:
-                                    logger.warning(f"Save error (skipped): {e}")
-                                    continue
-                                raise
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    if _is_sqlite_busy(e):
-                        wait_time = 0.2 * (2 ** attempt)
-                        logger.debug(f"DB busy/locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    if _is_stale_connection(e):
-                        # transaction() already cleared self._connection;
-                        # next iteration will reopen via _ensure_connection.
-                        logger.debug(f"Stale connection, reconnecting (retry {attempt + 1}/{max_retries})")
-                        continue
-                raise
-
-        return saved_count
-
-    async def save(
-        self,
-        item: SchemaType,
-        skip_errors: bool = True,
-        *,
-        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
-    ) -> bool:
-        """Atomically insert or update a schema object.
-
-        Implemented as INSERT ... ON CONFLICT(...) DO UPDATE, so it is
-        race-free against concurrent writers as long as the conflict
-        target is the same key the caller uses to identify the row.
-
-        Args:
-            item: The schema object to save.
-            skip_errors: If True, silently skip errors and return False.
-                If False, raise errors.
-            on_conflict: Column (or tuple of columns) used as the conflict
-                target. Must reference columns declared primary_key=True or
-                unique=True on the schema. Defaults to the primary key
-                ('id'), making save() idempotent on retries. Use a natural
-                key (e.g. on_conflict='external_id') when the application
-                identifies rows by a field other than id; this makes the
-                upsert atomic and prevents UNIQUE-constraint races where
-                two callers concurrently try to insert the same logical
-                row with different ids.
-
-        Returns:
-            True if save was successful, False if error occurred and
-            skip_errors=True.
-        """
-        try:
-            if not isinstance(item, self.schema_class):
-                if skip_errors:
-                    return False
-                raise TypeError(f"Expected {self.schema_class.__name__}, got {type(item).__name__}")
-
-            conflict_target = self._resolve_conflict_target(on_conflict)
-            sql, values = self._prepare_item(item, conflict_target=conflict_target)
-
-            # Perform save with reliable transaction (retry on "database is
-            # locked" and on stale-connection errors).
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    write_lock = await self._get_write_lock()
-                    async with write_lock:
-                        async with self.transaction() as db:
-                            await db.execute(sql, values)
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        if _is_sqlite_busy(e):
-                            wait_time = 0.2 * (2 ** attempt)
-                            logger.debug(f"DB busy/locked, retry {attempt + 1}/{max_retries} in {wait_time}s")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        if _is_stale_connection(e):
-                            logger.debug(f"Stale connection, reconnecting (retry {attempt + 1}/{max_retries})")
-                            continue
-                    raise
-
-            return True
-
-        except Exception as e:
-            if skip_errors:
-                logger.warning(f"Save error (skipped): {e}")
-                return False
-            raise
-    
-    async def get_by_id(self, record_id: str) -> Optional[SchemaType]:
-        """Fetch an item by ID with reliable connection handling."""
-        async with self.transaction(read_only=True) as db:
-            cursor = await db.execute(f"SELECT * FROM {self.table_name} WHERE id = ?", (record_id,))
-            row = await cursor.fetchone()
-            
-            if not row:
-                return None
-                
-            # Get column names and build data dictionary
-            columns = [desc[0] for desc in cursor.description]
-            return self.schema_class(**{
-                col: self._deserialize_value(col, row[i]) 
-                for i, col in enumerate(columns)
-            })
-    
     def _validate_column(self, name: str) -> str:
-        """Ensure `name` is a column declared on the schema.
-
-        This is the runtime gate for every column identifier interpolated
-        into SQL (where-clause keys, order_by, update_fields kwargs). A
-        permissive regex is not enough because an attacker-controlled but
-        regex-safe name like `id; ATTACH DATABASE` could still target the
-        wrong column or be appended to crafted SQL fragments downstream.
-        Whitelisting against the schema makes the column reference
-        provably safe.
-        """
         if name not in self._valid_columns:
             raise ValueError(
                 f"Unknown column {name!r} on {self.schema_class.__name__}. "
@@ -866,138 +1506,931 @@ class AsyncDB(Generic[SchemaType]):
             )
         return name
 
-    def _build_where_clause(self, filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
-        """Build optimized WHERE clause for queries."""
-        if not filters:
-            return "", []
+    def _resolve_conflict_target(
+        self,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]],
+    ) -> tuple[str, ...]:
+        """Validate and normalise `on_conflict` to a tuple of column names.
 
-        conditions = []
-        values = []
+        Three accepted shapes:
+          1. `None` → defaults to the primary key (`"id"`).
+          2. A single column name (str) → must be declared
+             `primary_key=True` or `unique=True`.
+          3. A tuple/list of column names → either every column is
+             individually unique/PK (rare but legal), OR the set of
+             column names matches a declared `__unique_together__` entry
+             (order-insensitive).
+        """
+        if on_conflict is None:
+            return ("id",)
+        if isinstance(on_conflict, str):
+            targets = (on_conflict,)
+        else:
+            targets = tuple(on_conflict)
 
-        for key, value in filters.items():
-            # Parse field and operator
-            parts = key.split('__', 1)
-            field = self._validate_column(parts[0])
+        # Composite target: prefer matching a declared __unique_together__
+        # (order-insensitive via frozenset). Otherwise fall back to "every
+        # column is individually unique" — rare but harmless.
+        if len(targets) > 1:
+            if frozenset(targets) in self._composite_conflict_targets:
+                return targets
+            unknown = [c for c in targets if c not in self._conflict_targets]
+            if unknown:
+                composites = sorted(
+                    tuple(sorted(s)) for s in self._composite_conflict_targets
+                )
+                raise ValueError(
+                    f"on_conflict={on_conflict!r}: composite target not "
+                    f"declared on {self.schema_class.__name__}. Add "
+                    f"`__unique_together__ = [{tuple(targets)!r}]` to the schema, "
+                    f"or use columns that are individually primary_key=True / "
+                    f"unique=True. Available composite targets: {composites}. "
+                    f"Individually-eligible columns: {sorted(self._conflict_targets)}."
+                )
+            return targets
 
-            if len(parts) > 1 and parts[1] in self.OPERATOR_MAP:
-                op_str = self.OPERATOR_MAP[parts[1]]
+        # Single target: must be individually unique/PK.
+        unknown = [c for c in targets if c not in self._conflict_targets]
+        if unknown:
+            raise ValueError(
+                f"on_conflict={on_conflict!r}: column(s) {unknown} are not "
+                f"declared primary_key=True or unique=True on "
+                f"{self.schema_class.__name__}. "
+                f"Available conflict targets: {sorted(self._conflict_targets)}"
+            )
+        return targets
 
-                # Handle IN operator specially
-                if op_str == 'IN' and isinstance(value, (list, tuple)):
-                    placeholders = ','.join(['?'] * len(value))
-                    conditions.append(f"{field} IN ({placeholders})")
-                    values.extend(value)
-                else:
-                    conditions.append(f"{field} {op_str} ?")
-                    values.append(value)
+    def _item_to_row(self, item: SchemaType) -> dict:
+        """Build the SQLA values dict for an upsert.
+
+        - `id` semantics depend on the PK column type:
+            * Integer PK + id=None → pop the key so SQLite assigns rowid
+              (autoincrement). Falsy non-None values (e.g. 0) are preserved.
+            * String PK + id=None → auto-generate a UUID. Falsy non-None
+              values (e.g. "") are preserved.
+        - `created_at` / `updated_at` are only injected if the schema
+          declares them (composition: IdModel has no timestamps,
+          TimestampedModel does).
+        - All other fields pass through unchanged — TypeDecorators handle
+          the actual roundtripping.
+        """
+        data = asdict(item)
+        if data.get("id") is None and "id" in data:
+            id_col = self._table.c.get("id")
+            if id_col is not None and isinstance(id_col.type, Integer):
+                # Let SQLite assign rowid.
+                data.pop("id")
             else:
-                # Default to equality
-                conditions.append(f"{field} = ?")
-                values.append(value)
+                data["id"] = str(uuid.uuid4())
+        now = utcnow()
+        if "created_at" in self._valid_columns and data.get("created_at") is None:
+            data["created_at"] = now
+        if "updated_at" in self._valid_columns:
+            data["updated_at"] = now
+        return data
 
-        return f"WHERE {' AND '.join(conditions)}", values
-    
-    async def find(self, order_by=None, limit: int = None, offset: int = None, **filters) -> List[SchemaType]:
-        """Query items with reliable connection handling."""
-        where_clause, values = self._build_where_clause(filters)
+    @staticmethod
+    def _apply_op(
+        lhs: ColumnElement, op: str, value: Any, *, _key_for_error: str = "",
+    ) -> ColumnElement:
+        """Compile a single `lhs <op> value` SQLA expression.
 
-        # Build query
-        query = f"SELECT * FROM {self.table_name} {where_clause}"
+        Shared between WHERE (`_build_filter_clause`) and HAVING
+        (`aggregate(having=...)`) so both surfaces support exactly the
+        same operator set. The `_key_for_error` argument is used purely
+        for error messages on `__between` mis-shapes.
+        """
+        if op == "gt":
+            return lhs > value
+        if op == "lt":
+            return lhs < value
+        if op == "gte":
+            return lhs >= value
+        if op == "lte":
+            return lhs <= value
+        if op == "neq":
+            return lhs != value
+        if op == "like":
+            return lhs.like(value)
+        if op == "in":
+            return lhs.in_(value)
+        if op == "not_in":
+            return lhs.not_in(value)
+        if op == "is_null":
+            # is_null=True → IS NULL; is_null=False → IS NOT NULL.
+            return lhs.is_(None) if value else lhs.is_not(None)
+        if op == "not_null":
+            return lhs.is_not(None) if value else lhs.is_(None)
+        if op == "between":
+            try:
+                lo, hi = value
+            except (TypeError, ValueError) as e:
+                key_msg = f"{_key_for_error}: " if _key_for_error else ""
+                raise ValueError(
+                    f"{key_msg}__between requires a 2-element sequence "
+                    f"(lo, hi); got {value!r}"
+                ) from e
+            return lhs.between(lo, hi)
+        # eq (default)
+        return lhs == value
 
-        # Add ORDER BY clause if specified
+    def _build_filter_clause(self, filters: Dict[str, Any]) -> list:
+        """Translate `key__op=value` kwargs into SQLA boolean expressions.
+
+        Supported suffixes:
+          eq (default), neq, gt, gte, lt, lte, like, in, not_in,
+          is_null=bool, not_null=bool, between=(lo, hi).
+
+        `__in` and `__not_in` accept any iterable; an empty iterable
+        compiles to a SQLA expression that always evaluates false
+        (`col IN ()` semantics).
+        """
+        clauses = []
+        for key, value in filters.items():
+            parts = key.split("__", 1)
+            col_name = self._validate_column(parts[0])
+            col = self._table.c[col_name]
+            op = parts[1] if (len(parts) > 1 and parts[1] in self.OPERATOR_MAP) else "eq"
+            clauses.append(self._apply_op(col, op, value, _key_for_error=key))
+        return clauses
+
+    def _build_upsert(self, conflict_target: tuple[str, ...]):
+        """Build the `INSERT ... ON CONFLICT(...) DO UPDATE SET ...` statement.
+
+        `created_at` is excluded from the UPDATE branch so the original
+        row's creation timestamp survives upserts.
+        """
+        stmt = sqlite_insert(self._table)
+        update_cols = {
+            c.name: stmt.excluded[c.name]
+            for c in self._table.columns
+            if c.name != "created_at"
+        }
+        return stmt.on_conflict_do_update(
+            index_elements=list(conflict_target),
+            set_=update_cols,
+        )
+
+    async def _execute_with_retry(self, action, *, max_retries: int = 3):
+        """Run `action` (async no-arg callable) with BUSY/stale retries.
+
+        Exponential backoff on BUSY/LOCKED; stale-connection errors drop
+        the per-loop engine cache so the next attempt builds a fresh pair.
+        """
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return await action()
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    if _is_sqlite_busy(e):
+                        # Exponential backoff with jitter (×0.5..×1.5).
+                        # The randomisation desynchronises concurrent
+                        # retries — otherwise N tasks hitting BUSY at the
+                        # same instant would all retry together and pile
+                        # right back on the lock.
+                        wait_time = (
+                            0.2 * (2 ** attempt) * random.uniform(0.5, 1.5)
+                        )
+                        logger.debug(
+                            f"DB busy/locked, retry {attempt + 1}/{max_retries} "
+                            f"in {wait_time}s"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    if _is_stale_connection(e):
+                        state = _db_loop_state()
+                        state["engines"].pop(str(self.db_path), None)
+                        state["initialized"].discard(self._db_key)
+                        logger.debug(
+                            f"Stale connection, reconnecting "
+                            f"(retry {attempt + 1}/{max_retries})"
+                        )
+                        continue
+                raise
+        raise last_error  # pragma: no cover — loop always raises on last attempt
+
+    # ──────────────── public API ────────────────
+
+    async def save(
+        self,
+        item: SchemaType,
+        skip_errors: bool = True,
+        *,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+    ) -> bool:
+        """Atomically insert or upsert one item.
+
+        With `on_conflict=None` (default), the upsert is by primary key
+        (`id`), so retrying a save is idempotent. Pass a natural-key column
+        (e.g. `on_conflict="external_id"`) — or a composite tuple declared
+        in `__unique_together__` — to make the upsert race-free against
+        concurrent writers identifying rows by that key.
+
+        `max_retries` controls how many times the BUSY/stale-connection
+        retry loop attempts the write before giving up.
+
+        `skip_errors=True` (default) only swallows **DB-level** errors
+        (SQLAlchemy / sqlite3). Programming errors — `TypeError` (wrong
+        item type), `ValueError` (bad `on_conflict`), `AttributeError`,
+        etc. — always propagate so bugs in the caller don't hide as
+        "save failed". Set `skip_errors=False` to surface DB errors too.
+
+        `conn` lets the caller inject their own open `AsyncConnection`
+        (typically from `async with another_db.transaction(): ...`) so
+        multiple AsyncDBs sharing a single SQLite file can write inside
+        one atomic transaction. When `conn` is passed:
+          - the write lock is NOT acquired (caller's `transaction()` already
+            holds the only writer connection via StaticPool);
+          - `writer.begin()` is NOT entered (caller owns the transaction);
+          - `max_retries` is IGNORED (a transient failure mid-transaction
+            requires the caller to retry the whole transaction, not just
+            this statement).
+        Both AsyncDBs must point at the same .db file for the cross-table
+        atomicity to actually hold — esuls does not promise atomicity
+        across separate SQLite files (impossible).
+        """
+        # Type check first — wrong type is a programming error path. When
+        # skip_errors=True we degrade to a warning + False; otherwise raise.
+        if not isinstance(item, self.schema_class):
+            if skip_errors:
+                logger.warning(
+                    f"save(): expected {self.schema_class.__name__}, "
+                    f"got {type(item).__name__}; skipping"
+                )
+                return False
+            raise TypeError(
+                f"Expected {self.schema_class.__name__}, "
+                f"got {type(item).__name__}"
+            )
+
+        # The next three calls can raise (`_resolve_conflict_target` →
+        # ValueError on bad on_conflict; `_item_to_row` / `_build_upsert`
+        # could fail on a malformed schema). These are setup-time
+        # programming errors — let them propagate rather than be silently
+        # swallowed by skip_errors.
+        conflict_target = self._resolve_conflict_target(on_conflict)
+        row = self._item_to_row(item)
+        stmt = self._build_upsert(conflict_target).values(**row)
+
+        if conn is not None:
+            # Inline path: caller owns the transaction. Schema-init must
+            # also run on their conn so the DDL is atomic with the rest.
+            try:
+                await self._ensure_schema_initialized(conn)
+                await conn.execute(stmt)
+                return True
+            except (sa_exc.SQLAlchemyError, sqlite3.Error) as e:
+                if skip_errors:
+                    logger.warning(
+                        f"save(): DB error in caller's transaction (skipped): {e}"
+                    )
+                    return False
+                raise
+
+        async def _do() -> bool:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    await own_conn.execute(stmt)
+            return True
+
+        try:
+            return await self._execute_with_retry(_do, max_retries=max_retries)
+        except (sa_exc.SQLAlchemyError, sqlite3.Error) as e:
+            if skip_errors:
+                logger.warning(f"save(): DB error (skipped): {e}")
+                return False
+            raise
+
+    async def save_batch(
+        self,
+        items: List[SchemaType],
+        *,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+        **deprecated_kwargs,
+    ) -> int:
+        """Save many items atomically via `executemany` — fail-fast.
+
+        All rows go in a single round-trip to SQLite. Any per-row error
+        (type mismatch, constraint violation, …) rolls back the whole
+        batch. This is the path you want for scrapers / pipelines that
+        do many inserts and need to notice failures immediately.
+
+        For best-effort per-item saves (log + skip on error), use
+        `save_each(...)` instead.
+
+        `conn` (optional) lets the caller run this inside their own open
+        transaction — see `save()` for the semantics and caveats.
+
+        ``skip_errors`` kwarg (deprecated): the old `save_batch` accepted
+        ``skip_errors`` to choose between two paths. The fast path is now
+        the default and the per-item loop has moved to `save_each`.
+        Passing ``skip_errors=True`` emits a `DeprecationWarning` and
+        forwards to `save_each`; ``skip_errors=False`` emits a warning
+        and runs the new default path.
+        """
+        if "skip_errors" in deprecated_kwargs:
+            skip = bool(deprecated_kwargs.pop("skip_errors"))
+            warnings.warn(
+                "save_batch(skip_errors=...) is deprecated. "
+                "Use save_each(...) for the per-item loop with skip-and-log, "
+                "or call save_batch(...) (now always fail-fast executemany).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if skip:
+                return await self.save_each(
+                    items, on_conflict=on_conflict, max_retries=max_retries,
+                    conn=conn,
+                )
+            # skip_errors=False is the new default — fall through.
+        if deprecated_kwargs:
+            raise TypeError(
+                f"save_batch() got unexpected keyword arguments: "
+                f"{list(deprecated_kwargs)}"
+            )
+
+        if not items:
+            return 0
+        conflict_target = self._resolve_conflict_target(on_conflict)
+        # Validate all item types up-front so we never partially commit
+        # via the conn path before the type check fires.
+        for item in items:
+            if not isinstance(item, self.schema_class):
+                raise TypeError(
+                    f"Expected {self.schema_class.__name__}, "
+                    f"got {type(item).__name__}"
+                )
+
+        if conn is not None:
+            await self._ensure_schema_initialized(conn)
+            rows = [self._item_to_row(it) for it in items]
+            stmt = self._build_upsert(conflict_target)
+            await conn.execute(stmt, rows)
+            return len(rows)
+
+        async def _do() -> int:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    rows = [self._item_to_row(it) for it in items]
+                    stmt = self._build_upsert(conflict_target)
+                    await own_conn.execute(stmt, rows)
+                    return len(rows)
+
+        return await self._execute_with_retry(_do, max_retries=max_retries)
+
+    async def save_each(
+        self,
+        items: List[SchemaType],
+        *,
+        on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+    ) -> int:
+        """Save items one-by-one inside a single transaction, skipping rotten ones.
+
+        Each row gets its own `execute()` (N round-trips to the aiosqlite
+        worker). Items that fail are logged via `logger.warning` and the
+        loop continues. Returns the count of items successfully written.
+
+        Use this when the batch contains untrusted/mixed data and you'd
+        rather persist the good rows than reject the whole batch. For
+        clean batches prefer `save_batch()` — it's faster and surfaces
+        bugs immediately.
+
+        `conn` (optional) lets the caller run this inside their own open
+        transaction — see `save()` for the semantics and caveats.
+        """
+        if not items:
+            return 0
+        conflict_target = self._resolve_conflict_target(on_conflict)
+
+        async def _loop(c: AsyncConnection) -> int:
+            saved = 0
+            for item in items:
+                try:
+                    if not isinstance(item, self.schema_class):
+                        logger.warning(
+                            f"save_each skipped non-{self.schema_class.__name__} "
+                            f"item ({type(item).__name__})"
+                        )
+                        continue
+                    row = self._item_to_row(item)
+                    stmt = self._build_upsert(conflict_target).values(**row)
+                    await c.execute(stmt)
+                    saved += 1
+                except Exception as e:
+                    logger.warning(f"save_each skipped item: {e}")
+                    continue
+            return saved
+
+        if conn is not None:
+            await self._ensure_schema_initialized(conn)
+            return await _loop(conn)
+
+        async def _do() -> int:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    return await _loop(own_conn)
+
+        return await self._execute_with_retry(_do, max_retries=max_retries)
+
+    async def get_by_id(
+        self, record_id: Union[str, int]
+    ) -> Optional[SchemaType]:
+        """Fetch by primary key. Accepts `str` (UUID/IdModel/TimestampedModel)
+        or `int` (IntIdModel) since the PK type depends on the schema."""
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.execute(
+                select(self._table).where(self._table.c.id == record_id)
+            )
+            row = result.mappings().first()
+        if row is None:
+            return None
+        return self.schema_class(**dict(row))
+
+    async def find(
+        self,
+        order_by: Optional[Union[str, List[str]]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **filters,
+    ) -> List[SchemaType]:
+        """SELECT rows matching `**filters`, with optional ordering / paging.
+
+        ``order_by`` accepts either ``"column"`` (ASC) or ``"-column"``
+        (DESC), or a list mixing both for multi-column sorts. No other
+        syntax (e.g. ``NULLS LAST``, expressions) is supported here —
+        drop to ``transaction(read_only=True)`` + ``text(...)`` for
+        anything more elaborate. Unknown column names raise ``ValueError``.
+
+        ``**filters`` uses the same ``key__op=value`` mini-DSL as
+        ``_build_filter_clause``: ``eq`` (default), ``neq``, ``gt``,
+        ``gte``, ``lt``, ``lte``, ``like``, ``in``, ``not_in``,
+        ``is_null=bool``, ``not_null=bool``, ``between=(lo, hi)``.
+        """
+        stmt = select(self._table)
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
+
         if order_by:
             order_fields = [order_by] if isinstance(order_by, str) else order_by
-            order_clauses = []
             for entry in order_fields:
-                if entry.startswith('-'):
-                    col = self._validate_column(entry[1:])
-                    order_clauses.append(f"{col} DESC")
+                if entry.startswith("-"):
+                    col = self._table.c[self._validate_column(entry[1:])]
+                    stmt = stmt.order_by(col.desc())
                 else:
-                    col = self._validate_column(entry)
-                    order_clauses.append(f"{col} ASC")
-            query += f" ORDER BY {', '.join(order_clauses)}"
+                    col = self._table.c[self._validate_column(entry)]
+                    stmt = stmt.order_by(col.asc())
 
-        # Add LIMIT/OFFSET (SQLite requires LIMIT before OFFSET)
         if limit is not None:
-            query += " LIMIT ?"
-            values.append(limit)
+            stmt = stmt.limit(limit)
         elif offset is not None:
-            query += " LIMIT -1"
+            # SQLite refuses OFFSET without LIMIT. -1 means "no limit".
+            stmt = stmt.limit(-1)
         if offset is not None:
-            query += " OFFSET ?"
-            values.append(offset)
+            stmt = stmt.offset(offset)
 
-        # Execute query with reliable transaction (read-only — no commit needed)
-        async with self.transaction(read_only=True) as db:
-            cursor = await db.execute(query, values)
-            rows = await cursor.fetchall()
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.execute(stmt)
+            return [self.schema_class(**dict(row)) for row in result.mappings()]
 
-            if not rows:
-                return []
+    async def find_columns(
+        self,
+        columns: List[str],
+        *,
+        order_by: Optional[Union[str, List[str]]] = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **filters,
+    ) -> List[Dict[str, Any]]:
+        """Project only `columns`; return raw dicts instead of SchemaType.
 
-            # Process results
-            columns = [desc[0] for desc in cursor.description]
-            return [
-                self.schema_class(**{
-                    col: self._deserialize_value(col, row[i])
-                    for i, col in enumerate(columns)
-                })
-                for row in rows
-            ]
-    
+        Useful for tables with large BLOB/JSON columns when you only need
+        a subset — avoids deserialising fields you'll throw away. Returns
+        `List[Dict]` (not `List[SchemaType]`) because partial rows can't
+        be constructed as the dataclass without fake defaults for the
+        missing fields, which would mislead the caller.
+
+        Same filter / order_by / limit / offset semantics as `find()`.
+        """
+        if not columns:
+            raise ValueError("find_columns() requires at least one column")
+        validated = [self._validate_column(c) for c in columns]
+        stmt = select(*(self._table.c[c] for c in validated))
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
+
+        if order_by:
+            order_fields = [order_by] if isinstance(order_by, str) else order_by
+            for entry in order_fields:
+                if entry.startswith("-"):
+                    col = self._table.c[self._validate_column(entry[1:])]
+                    stmt = stmt.order_by(col.desc())
+                else:
+                    col = self._table.c[self._validate_column(entry)]
+                    stmt = stmt.order_by(col.asc())
+
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        elif offset is not None:
+            stmt = stmt.limit(-1)
+        if offset is not None:
+            stmt = stmt.offset(offset)
+
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.execute(stmt)
+            return [dict(row) for row in result.mappings()]
+
     async def count(self, **filters) -> int:
-        """Count items matching filters with reliable connection handling."""
-        where_clause, values = self._build_where_clause(filters)
-        query = f"SELECT COUNT(*) FROM {self.table_name} {where_clause}"
+        stmt = select(func.count()).select_from(self._table)
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.execute(stmt)
+            return result.scalar_one()
 
-        async with self.transaction(read_only=True) as db:
-            cursor = await db.execute(query, values)
-            result = await cursor.fetchone()
-            return result[0] if result else 0
-    
     async def fetch_all(self) -> List[SchemaType]:
-        """Retrieve all items."""
         return await self.find()
-    
-    async def delete(self, record_id: str) -> bool:
-        """Delete an item by ID with reliable transaction handling."""
-        write_lock = await self._get_write_lock()
-        async with write_lock:
-            async with self.transaction() as db:
-                cursor = await db.execute(f"DELETE FROM {self.table_name} WHERE id = ?", (record_id,))
-                return cursor.rowcount > 0
+
+    async def find_one(
+        self,
+        order_by: Optional[Union[str, List[str]]] = None,
+        **filters,
+    ) -> Optional[SchemaType]:
+        """Return the first row matching `**filters`, or `None`.
+
+        Thin shortcut over `find(limit=1, ...)` — replaces the very common
+        `rows = await db.find(...); row = rows[0] if rows else None`
+        idiom. `order_by` is supported so "most recent matching row" is
+        a one-call operation (`find_one(order_by="-created_at", user=u)`).
+        """
+        rows = await self.find(order_by=order_by, limit=1, **filters)
+        return rows[0] if rows else None
 
     async def exists(self, **filters) -> bool:
-        """Check if any record matches the filters without fetching data."""
-        return await self.count(**filters) > 0
+        """True if at least one row matches `**filters`.
 
-    async def delete_many(self, **filters) -> int:
-        """Delete all items matching filters. Returns count of deleted rows."""
+        Compiles to `SELECT 1 FROM <table> WHERE ... LIMIT 1` — SQLite
+        stops at the first matching row, so this is O(1) when the
+        filtered columns are indexed and O(N) scan only when forced to.
+        Faster than `count(**filters) > 0`, which has to count every
+        match across the full table.
+        """
+        stmt = select(literal(1)).select_from(self._table)
+        clauses = self._build_filter_clause(filters)
+        if clauses:
+            stmt = stmt.where(and_(*clauses))
+        stmt = stmt.limit(1)
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.execute(stmt)
+            return result.first() is not None
+
+    async def aggregate(
+        self,
+        *,
+        group_by: Optional[Union[str, List[str]]] = None,
+        count: bool = False,
+        count_distinct: Optional[Union[str, List[str]]] = None,
+        sum: Optional[Union[str, List[str]]] = None,
+        avg: Optional[Union[str, List[str]]] = None,
+        min: Optional[Union[str, List[str]]] = None,
+        max: Optional[Union[str, List[str]]] = None,
+        having: Optional[Dict[str, Any]] = None,
+        order_by: Optional[Union[str, List[str]]] = None,
+        limit: Optional[int] = None,
+        **filters,
+    ) -> List[Dict[str, Any]]:
+        """Compute aggregations grouped by zero or more columns.
+
+        Returns a list of dicts (column → value). Keys come from
+        `group_by` columns plus aliases for each requested aggregate:
+        `count` / `count_distinct_<col>` / `sum_<col>` / `avg_<col>` /
+        `min_<col>` / `max_<col>`.
+
+        `filters` apply via WHERE (pre-aggregation). `having` applies via
+        HAVING (post-aggregation), using the same `__op` suffix syntax —
+        but on alias names (`count`, `sum_<col>`, ...), not raw columns.
+
+        Example:
+            await db.aggregate(group_by="city",
+                               count=True, count_distinct="user_id",
+                               sum="amount",
+                               amount__gt=0,
+                               having={"count_distinct_user_id__gte": 5})
+        """
+        if not (count or count_distinct or sum or avg or min or max):
+            raise ValueError(
+                "aggregate() requires at least one of: "
+                "count, count_distinct, sum, avg, min, max"
+            )
+
+        def _as_list(v):
+            if v is None:
+                return []
+            return [v] if isinstance(v, str) else list(v)
+
+        group_cols = _as_list(group_by)
+        cdist_cols = _as_list(count_distinct)
+        sum_cols = _as_list(sum)
+        avg_cols = _as_list(avg)
+        min_cols = _as_list(min)
+        max_cols = _as_list(max)
+
+        # Validate every column name against the schema whitelist.
+        for c in group_cols + cdist_cols + sum_cols + avg_cols + min_cols + max_cols:
+            self._validate_column(c)
+
+        # Build projection: group columns first, then aggregates, each
+        # aliased so the result mapping has stable, predictable keys.
+        projection: list = []
+        alias_to_expr: Dict[str, Any] = {}
+        for c in group_cols:
+            col = self._table.c[c]
+            projection.append(col.label(c))
+            alias_to_expr[c] = col
+        if count:
+            expr = func.count().label("count")
+            projection.append(expr)
+            alias_to_expr["count"] = func.count()
+        for c in cdist_cols:
+            alias = f"count_distinct_{c}"
+            # NOTE: SQLite has no `COUNT(DISTINCT a, b)` form — each entry
+            # in `count_distinct` produces its own COUNT(DISTINCT col).
+            expr = func.count(func.distinct(self._table.c[c])).label(alias)
+            projection.append(expr)
+            alias_to_expr[alias] = func.count(func.distinct(self._table.c[c]))
+        for c in sum_cols:
+            alias = f"sum_{c}"
+            expr = func.sum(self._table.c[c]).label(alias)
+            projection.append(expr)
+            alias_to_expr[alias] = func.sum(self._table.c[c])
+        for c in avg_cols:
+            alias = f"avg_{c}"
+            expr = func.avg(self._table.c[c]).label(alias)
+            projection.append(expr)
+            alias_to_expr[alias] = func.avg(self._table.c[c])
+        for c in min_cols:
+            alias = f"min_{c}"
+            expr = func.min(self._table.c[c]).label(alias)
+            projection.append(expr)
+            alias_to_expr[alias] = func.min(self._table.c[c])
+        for c in max_cols:
+            alias = f"max_{c}"
+            expr = func.max(self._table.c[c]).label(alias)
+            projection.append(expr)
+            alias_to_expr[alias] = func.max(self._table.c[c])
+
+        stmt = select(*projection).select_from(self._table)
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
+        for c in group_cols:
+            stmt = stmt.group_by(self._table.c[c])
+
+        # HAVING: same `__op` mini-DSL, but the LHS is an aggregate alias
+        # rather than a column. Resolve via `alias_to_expr`, then dispatch
+        # through `_apply_op` so HAVING gets the full operator set
+        # (in/not_in/like/is_null/between/...), not just numeric comparators.
+        if having:
+            for key, val in having.items():
+                parts = key.split("__", 1)
+                alias = parts[0]
+                if alias not in alias_to_expr:
+                    raise ValueError(
+                        f"having key {key!r} references unknown alias "
+                        f"{alias!r}; available: {sorted(alias_to_expr)}"
+                    )
+                lhs = alias_to_expr[alias]
+                op = parts[1] if len(parts) > 1 and parts[1] in self.OPERATOR_MAP else "eq"
+                stmt = stmt.having(self._apply_op(lhs, op, val, _key_for_error=key))
+
+        # order_by accepts aliases (e.g. "count", "sum_amount") so users
+        # can sort by their aggregates. Falls back to a raw column lookup
+        # if the entry isn't an alias.
+        if order_by:
+            order_entries = [order_by] if isinstance(order_by, str) else list(order_by)
+            for entry in order_entries:
+                desc = entry.startswith("-")
+                name = entry[1:] if desc else entry
+                if name in alias_to_expr:
+                    expr = alias_to_expr[name]
+                else:
+                    expr = self._table.c[self._validate_column(name)]
+                stmt = stmt.order_by(expr.desc() if desc else expr.asc())
+
+        if limit is not None:
+            stmt = stmt.limit(limit)
+
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.execute(stmt)
+            return [dict(row) for row in result.mappings()]
+
+    async def stream(
+        self,
+        order_by: Optional[Union[str, List[str]]] = None,
+        batch_size: int = 1000,
+        **filters,
+    ) -> AsyncIterator[SchemaType]:
+        """Yield rows one at a time without loading everything into memory.
+
+        Uses SQLA's `conn.stream(...)` with `yield_per=batch_size` to
+        fetch in chunks from the cursor. Designed for tables too large
+        to materialise via `find()`.
+
+        Generator cleanup (early `break`, `aclose`, exception) closes the
+        underlying connection via the `async with reader.connect()`
+        context manager.
+        """
+        stmt = select(self._table)
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
+        if order_by:
+            order_fields = [order_by] if isinstance(order_by, str) else order_by
+            for entry in order_fields:
+                if entry.startswith("-"):
+                    col = self._table.c[self._validate_column(entry[1:])]
+                    stmt = stmt.order_by(col.desc())
+                else:
+                    col = self._table.c[self._validate_column(entry)]
+                    stmt = stmt.order_by(col.asc())
+
+        _, reader = await self._ensure_engines()
+        async with reader.connect() as conn:
+            result = await conn.stream(
+                stmt.execution_options(yield_per=batch_size)
+            )
+            async for row in result.mappings():
+                yield self.schema_class(**dict(row))
+
+    async def delete(
+        self,
+        record_id: Union[str, int],
+        *,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+    ) -> bool:
+        """Delete by id. `conn=` runs inline (see `save()` for semantics)."""
+        stmt = delete(self._table).where(self._table.c.id == record_id)
+
+        if conn is not None:
+            await self._ensure_schema_initialized(conn)
+            result = await conn.execute(stmt)
+            return result.rowcount > 0
+
+        async def _do() -> bool:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    result = await own_conn.execute(stmt)
+                    return result.rowcount > 0
+
+        return await self._execute_with_retry(_do, max_retries=max_retries)
+
+    async def delete_many(
+        self,
+        *,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+        **filters,
+    ) -> int:
+        """Delete every row matching `**filters`. `conn=` runs inline."""
         if not filters:
-            raise ValueError("delete_many() requires at least one filter to prevent accidental full table delete")
-        where_clause, values = self._build_where_clause(filters)
-        write_lock = await self._get_write_lock()
-        async with write_lock:
-            async with self.transaction() as db:
-                cursor = await db.execute(f"DELETE FROM {self.table_name} {where_clause}", values)
-                return cursor.rowcount
+            raise ValueError(
+                "delete_many() requires at least one filter to prevent "
+                "accidental full table delete"
+            )
+        stmt = delete(self._table)
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
 
-    async def update_fields(self, record_id: str, **values) -> bool:
-        """Update specific fields on a record by ID without fetching the full record.
+        if conn is not None:
+            await self._ensure_schema_initialized(conn)
+            result = await conn.execute(stmt)
+            return result.rowcount
 
-        `values` is a kwargs mapping of column → new value. The parameter is
-        named `values` (not `fields`) so it doesn't shadow `dataclasses.fields`.
+        async def _do() -> int:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    result = await own_conn.execute(stmt)
+                    return result.rowcount
+
+        return await self._execute_with_retry(_do, max_retries=max_retries)
+
+    async def update_fields(
+        self,
+        record_id: Union[str, int],
+        *,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+        **values,
+    ) -> bool:
+        """Update specific fields by id, without round-tripping the full row.
+
+        `conn=` runs inline (see `save()` for semantics).
         """
         if not values:
             return False
-        values['updated_at'] = datetime.now()
-        set_clause = ', '.join(f"{self._validate_column(k)} = ?" for k in values)
-        sql_values = [self._serialize_value(v) for v in values.values()]
-        sql_values.append(record_id)
-        write_lock = await self._get_write_lock()
-        async with write_lock:
-            async with self.transaction() as db:
-                cursor = await db.execute(
-                    f"UPDATE {self.table_name} SET {set_clause} WHERE id = ?", sql_values
-                )
-                return cursor.rowcount > 0
+        for k in values:
+            self._validate_column(k)
+        # Only auto-set updated_at if the schema actually declares it
+        # (an IdModel-only schema has no timestamp columns).
+        if "updated_at" in self._valid_columns:
+            values["updated_at"] = utcnow()
+        stmt = (
+            update(self._table)
+            .where(self._table.c.id == record_id)
+            .values(**values)
+        )
+
+        if conn is not None:
+            await self._ensure_schema_initialized(conn)
+            result = await conn.execute(stmt)
+            return result.rowcount > 0
+
+        async def _do() -> bool:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    result = await own_conn.execute(stmt)
+                    return result.rowcount > 0
+
+        return await self._execute_with_retry(_do, max_retries=max_retries)
+
+    async def update_many(
+        self,
+        values: Dict[str, Any],
+        *,
+        max_retries: int = 3,
+        conn: Optional[AsyncConnection] = None,
+        **filters,
+    ) -> int:
+        """Update every row matching `**filters` with the `values` dict.
+
+        Returns the count of rows affected. `filters` uses the standard
+        `key__op=value` mini-DSL; `values` is a flat `column → new value`
+        dict. `updated_at` is auto-set if the schema declares it AND the
+        caller hasn't passed an explicit value for it.
+
+        For safety, an empty `filters` raises ValueError — pass at least
+        one filter, or use `transaction(read_only=False)` + raw SQL if
+        you really mean "update every row". This mirrors the
+        `delete_many()` guard.
+
+        `conn=` runs inline (see `save()` for semantics).
+        """
+        if not values:
+            return 0
+        if not filters:
+            raise ValueError(
+                "update_many() requires at least one filter to prevent "
+                "an accidental update-every-row. Use transaction() + text() "
+                "if you really mean it."
+            )
+        for k in values:
+            self._validate_column(k)
+        if (
+            "updated_at" in self._valid_columns
+            and "updated_at" not in values
+        ):
+            values = {**values, "updated_at": utcnow()}
+
+        stmt = update(self._table)
+        for clause in self._build_filter_clause(filters):
+            stmt = stmt.where(clause)
+        stmt = stmt.values(**values)
+
+        if conn is not None:
+            await self._ensure_schema_initialized(conn)
+            result = await conn.execute(stmt)
+            return result.rowcount
+
+        async def _do() -> int:
+            writer, _ = await self._ensure_engines()
+            write_lock = await self._get_write_lock()
+            async with write_lock:
+                async with writer.begin() as own_conn:
+                    result = await own_conn.execute(stmt)
+                    return result.rowcount
+
+        return await self._execute_with_retry(_do, max_retries=max_retries)
