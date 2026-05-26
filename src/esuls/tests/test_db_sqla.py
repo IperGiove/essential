@@ -19,7 +19,7 @@ import logging
 import sqlite3
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -101,6 +101,36 @@ async def test_decimal_precision_roundtrip(temp_db):
         assert rows[0].amount == precise, (
             f"Decimal lost precision: stored {precise}, got {rows[0].amount}"
         )
+    finally:
+        await db.close()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# 2b. datetime.time roundtrip (was lost to the JSON fallback)
+# ────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _WithTime(BaseModel):
+    opens: Optional[time] = None
+
+
+async def test_time_column_roundtrip(temp_db):
+    """`time` fields roundtrip as datetime.time via _TimeDecorator.
+
+    Pre-fix, `time` had no branch in `_python_to_sa_type` and fell through
+    to `_JSONDecorator`; reading an ISO time string back ran
+    `json.loads("12:03:00")` which raises (the colon is not valid JSON).
+    """
+    db = AsyncDB(temp_db, "items", _WithTime)
+    try:
+        await db.save(_WithTime(opens=time(9, 0)))
+        await db.save(_WithTime(opens=time(12, 30, 15, 500000)))
+        await db.save(_WithTime(opens=None))
+        rows = await db.find(order_by="created_at")
+        loaded = [r.opens for r in rows]
+        assert loaded == [time(9, 0), time(12, 30, 15, 500000), None], loaded
+        for v in loaded[:2]:
+            assert isinstance(v, time), f"expected time, got {type(v).__name__}"
     finally:
         await db.close()
 

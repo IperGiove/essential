@@ -32,7 +32,7 @@ import uuid
 import warnings
 import weakref
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import (
@@ -277,6 +277,8 @@ def _json_encode_default(v):
         return v.isoformat()
     if isinstance(v, date):
         return v.isoformat()
+    if isinstance(v, time):
+        return v.isoformat()
     if isinstance(v, bytes):
         return _B64_PREFIX + base64.b64encode(v).decode("ascii")
     if isinstance(v, enum.Enum):
@@ -422,6 +424,32 @@ class _UTCDateTimeDecorator(TypeDecorator):
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+class _TimeDecorator(TypeDecorator):
+    """Time-of-day stored as ISO 8601 (Text column).
+
+    `datetime.time` has no native SQLite storage class, so — like
+    `_UTCDateTimeDecorator` does for `datetime` — we store `isoformat()`
+    ("13:45:00", "09:30:00.500000", optionally "13:45:00+02:00") and parse
+    it back with `time.fromisoformat()`. Without this, a `time` field would
+    fall through to `_JSONDecorator`, whose `json.loads` raises on the
+    colons in an ISO time string. Any tzinfo on the value is preserved.
+    """
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return value.isoformat()
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, time):
+            return value
+        return time.fromisoformat(value)
+
+
 class _DecimalDecorator(TypeDecorator):
     """Lossless Decimal roundtrip via TEXT storage.
 
@@ -500,6 +528,12 @@ def _python_to_sa_type(ftype):
         return _UTCDateTimeDecorator()
     if ftype is date:
         return Date()
+    if ftype is time:
+        # No native SQLite time type and SQLA's Time() doesn't round-trip
+        # on SQLite; store ISO 8601 text (see _TimeDecorator). Without this
+        # branch `time` falls through to the JSON fallback, which can't read
+        # an ISO time string back ("12:03:00" is not valid JSON).
+        return _TimeDecorator()
     if ftype is float:
         return Float()
     if ftype is Decimal:
