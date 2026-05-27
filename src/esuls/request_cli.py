@@ -876,6 +876,27 @@ async def make_request_playwright(
             await stealth_async(page)
             page.set_default_timeout(timeout_request * 1000)
 
+            # Track the final main-frame document response. JS cookie
+            # challenges (Sucuri CloudProxy, some Cloudflare/HSTS 307s)
+            # answer the first request with a 307 + a script that sets a
+            # cookie and calls location.reload(); the real page then loads
+            # with a fresh 200. page.goto() only returns that first
+            # response (the 307), so we follow the main frame's last
+            # navigation response to report the status/headers of the
+            # document actually rendered.
+            final_doc: dict = {"resp": None}
+
+            def _track_main_doc(r):
+                try:
+                    if (r.request.is_navigation_request()
+                            and r.frame is page.main_frame):
+                        final_doc["resp"] = r
+                except Exception:
+                    # Frame/request may already be torn down mid-event.
+                    pass
+
+            page.on("response", _track_main_doc)
+
             resp = await page.goto(url, wait_until="domcontentloaded")
             # Wait for network activity to settle (more robust than a fixed
             # sleep for SPAs). Bounded by `wait_seconds` so pages with
@@ -894,13 +915,14 @@ async def make_request_playwright(
                         f"networkidle wait expired, proceeding: {wait_err}"
                     )
 
+            doc_resp = final_doc["resp"] or resp
             page_source = await page.content()
             final_url = page.url
-            status_code = resp.status if resp else 200
+            status_code = doc_resp.status if doc_resp else 200
 
             response = Response(
                 status_code=status_code,
-                headers=dict(resp.headers) if resp else {},
+                headers=dict(doc_resp.headers) if doc_resp else {},
                 _content=page_source.encode("utf-8"),
                 text=page_source,
                 url=final_url,
