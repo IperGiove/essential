@@ -812,14 +812,19 @@ async def _get_playwright_browser():
         cached = state["playwright_browser"]
         if cached is not None and not cached.is_connected():
             logger.debug("Cached Playwright browser is disconnected; refreshing.")
+            # Bound the teardown: a dead/wedged browser can hang its own
+            # close()/stop(), and this runs while holding playwright_lock —
+            # an unbounded await here would block every other caller.
             try:
-                await cached.close()
+                async with asyncio.timeout(5):
+                    await cached.close()
             except Exception:
                 pass
             try:
                 instance = state["playwright_instance"]
                 if instance is not None:
-                    await instance.stop()
+                    async with asyncio.timeout(5):
+                        await instance.stop()
             except Exception:
                 pass
             state["playwright_browser"] = None
@@ -827,18 +832,67 @@ async def _get_playwright_browser():
 
         if state["playwright_browser"] is None:
             from playwright.async_api import async_playwright
-            state["playwright_instance"] = await async_playwright().start()
-            # Stealth handles fingerprint surface (webdriver flag,
-            # plugins, WebGL, chrome runtime, UA, etc.); browser args
-            # here are only sandbox/IPC concerns for headless runtime.
-            state["playwright_browser"] = await state["playwright_instance"].chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
+            # Bound start()+launch(): a hung driver spawn or Chromium launch
+            # would otherwise hold playwright_lock forever and deadlock every
+            # make_request_playwright caller. On failure, clear any half-built
+            # state so we don't leak a driver subprocess or reuse a broken
+            # cache slot, then re-raise for the caller's retry path.
+            try:
+                async with asyncio.timeout(60):
+                    state["playwright_instance"] = await async_playwright().start()
+                    # Stealth handles fingerprint surface (webdriver flag,
+                    # plugins, WebGL, chrome runtime, UA, etc.); browser args
+                    # here are only sandbox/IPC concerns for headless runtime.
+                    state["playwright_browser"] = await state["playwright_instance"].chromium.launch(
+                        headless=True,
+                        args=[
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                        ],
+                    )
+            except BaseException:
+                inst = state["playwright_instance"]
+                state["playwright_browser"] = None
+                state["playwright_instance"] = None
+                if inst is not None:
+                    try:
+                        async with asyncio.timeout(5):
+                            await inst.stop()
+                    except Exception:
+                        pass
+                raise
         return state["playwright_browser"]
+
+
+async def _reset_playwright_browser() -> None:
+    """Force-discard the cached Chromium so the next _get_playwright_browser()
+    relaunches a fresh process.
+
+    Used when a browser-level await hangs: a single page can wedge the shared
+    browser (the process stays alive, so is_connected() keeps returning True)
+    and then every new_page() on it blocks forever. The cache slot is cleared
+    under the lock first; the actual close() runs *outside* the lock and is
+    bounded, so a hung close() can't stop other callers from acquiring the
+    lock to launch a replacement.
+    """
+    state = _req_loop_state()
+    async with state["playwright_lock"]:
+        browser = state["playwright_browser"]
+        instance = state["playwright_instance"]
+        state["playwright_browser"] = None
+        state["playwright_instance"] = None
+    if browser is not None:
+        try:
+            async with asyncio.timeout(5):
+                await browser.close()
+        except Exception:
+            pass
+    if instance is not None:
+        try:
+            async with asyncio.timeout(5):
+                await instance.stop()
+        except Exception:
+            pass
 
 
 async def make_request_playwright(
@@ -867,82 +921,110 @@ async def make_request_playwright(
     (analytics, polling, websockets) are cut off at `wait_seconds`
     and we proceed with the partial render.
     """
-    browser = await _get_playwright_browser()
+    # set_default_timeout() below governs only Playwright actions issued
+    # AFTER it; it never covers browser.new_page(), stealth_async(), or
+    # page.close(). A wedged Chromium (a prior page hung the process while
+    # is_connected() still reports True) makes those awaits block forever
+    # with no bound, deadlocking every caller that shares the browser. Wrap
+    # each attempt's whole page lifecycle in one hard wall-clock budget so a
+    # single bad site can never hang the process. The budget comfortably
+    # exceeds the sum of the inner per-action timeouts (goto + networkidle +
+    # content), so it only trips on a genuine hang, not a merely slow page.
+    attempt_budget = 2 * timeout_request + wait_seconds + 15
 
     for attempt in range(max_attempt):
         page = None
         try:
-            page = await browser.new_page()
-            await stealth_async(page)
-            page.set_default_timeout(timeout_request * 1000)
+            browser = await _get_playwright_browser()
+            async with asyncio.timeout(attempt_budget):
+                page = await browser.new_page()
+                await stealth_async(page)
+                page.set_default_timeout(timeout_request * 1000)
 
-            # Track the final main-frame document response. JS cookie
-            # challenges (Sucuri CloudProxy, some Cloudflare/HSTS 307s)
-            # answer the first request with a 307 + a script that sets a
-            # cookie and calls location.reload(); the real page then loads
-            # with a fresh 200. page.goto() only returns that first
-            # response (the 307), so we follow the main frame's last
-            # navigation response to report the status/headers of the
-            # document actually rendered.
-            final_doc: dict = {"resp": None}
+                # Track the final main-frame document response. JS cookie
+                # challenges (Sucuri CloudProxy, some Cloudflare/HSTS 307s)
+                # answer the first request with a 307 + a script that sets a
+                # cookie and calls location.reload(); the real page then loads
+                # with a fresh 200. page.goto() only returns that first
+                # response (the 307), so we follow the main frame's last
+                # navigation response to report the status/headers of the
+                # document actually rendered.
+                final_doc: dict = {"resp": None}
 
-            def _track_main_doc(r):
-                try:
-                    if (r.request.is_navigation_request()
-                            and r.frame is page.main_frame):
-                        final_doc["resp"] = r
-                except Exception:
-                    # Frame/request may already be torn down mid-event.
-                    pass
+                def _track_main_doc(r):
+                    try:
+                        if (r.request.is_navigation_request()
+                                and r.frame is page.main_frame):
+                            final_doc["resp"] = r
+                    except Exception:
+                        # Frame/request may already be torn down mid-event.
+                        pass
 
-            page.on("response", _track_main_doc)
+                page.on("response", _track_main_doc)
 
-            resp = await page.goto(url, wait_until="domcontentloaded")
-            # Wait for network activity to settle (more robust than a fixed
-            # sleep for SPAs). Bounded by `wait_seconds` so pages with
-            # endless background traffic don't hang forever.
-            if wait_seconds > 0:
-                try:
-                    await page.wait_for_load_state(
-                        "networkidle",
-                        timeout=int(wait_seconds * 1000),
-                    )
-                except Exception as wait_err:
-                    # Most likely a Playwright TimeoutError: page kept
-                    # making requests beyond wait_seconds. Proceed with
-                    # whatever has rendered so far.
-                    logger.debug(
-                        f"networkidle wait expired, proceeding: {wait_err}"
-                    )
+                resp = await page.goto(url, wait_until="domcontentloaded")
+                # Wait for network activity to settle (more robust than a fixed
+                # sleep for SPAs). Bounded by `wait_seconds` so pages with
+                # endless background traffic don't hang forever.
+                if wait_seconds > 0:
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle",
+                            timeout=int(wait_seconds * 1000),
+                        )
+                    except Exception as wait_err:
+                        # Most likely a Playwright TimeoutError: page kept
+                        # making requests beyond wait_seconds. Proceed with
+                        # whatever has rendered so far.
+                        logger.debug(
+                            f"networkidle wait expired, proceeding: {wait_err}"
+                        )
 
-            doc_resp = final_doc["resp"] or resp
-            page_source = await page.content()
-            final_url = page.url
-            status_code = doc_resp.status if doc_resp else 200
+                doc_resp = final_doc["resp"] or resp
+                page_source = await page.content()
+                final_url = page.url
+                status_code = doc_resp.status if doc_resp else 200
 
-            response = Response(
-                status_code=status_code,
-                headers=dict(doc_resp.headers) if doc_resp else {},
-                _content=page_source.encode("utf-8"),
-                text=page_source,
-                url=final_url,
-            )
-
-            if status_code not in _SUCCESS_STATUS_RANGE:
-                logger.debug(
-                    f"playwright request: {status_code} - {url} "
-                    f"- attempt {attempt + 1}/{max_attempt}"
+                response = Response(
+                    status_code=status_code,
+                    headers=dict(doc_resp.headers) if doc_resp else {},
+                    _content=page_source.encode("utf-8"),
+                    text=page_source,
+                    url=final_url,
                 )
-                if (no_retry_status_codes
-                        and status_code in no_retry_status_codes):
-                    return response if force_response else None
-                if attempt + 1 == max_attempt:
-                    return response if force_response else None
-                await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
-                continue
 
-            return response
+                if status_code not in _SUCCESS_STATUS_RANGE:
+                    logger.debug(
+                        f"playwright request: {status_code} - {url} "
+                        f"- attempt {attempt + 1}/{max_attempt}"
+                    )
+                    if (no_retry_status_codes
+                            and status_code in no_retry_status_codes):
+                        return response if force_response else None
+                    if attempt + 1 == max_attempt:
+                        return response if force_response else None
+                    await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
+                    continue
 
+                return response
+
+        except TimeoutError:
+            # Hard wall-clock budget exceeded. This is the builtin
+            # TimeoutError from asyncio.timeout() — distinct from Playwright's
+            # own TimeoutError (a separate class, caught below as an ordinary
+            # slow-page retry). Reaching here means an await with no inner
+            # bound hung (almost always new_page() on a wedged browser), so
+            # discard the shared browser; the next attempt relaunches a clean
+            # Chromium instead of hanging on the same dead process.
+            logger.debug(
+                f"playwright attempt exceeded {attempt_budget}s budget "
+                f"(browser likely wedged) - {url} "
+                f"- attempt {attempt + 1}/{max_attempt}"
+            )
+            await _reset_playwright_browser()
+            if attempt + 1 == max_attempt:
+                return None
+            await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
         except Exception as e:
             logger.debug(
                 f"playwright request error: {e} - {url} "
@@ -952,14 +1034,14 @@ async def make_request_playwright(
                 return None
             await asyncio.sleep(_apply_jitter(exception_sleep, jitter))
         finally:
-            # page.close() can itself fail when the browser is in a bad
-            # state. Swallow that error so the retry loop can run its
-            # remaining attempts; we'd rather lose the page (it's about
-            # to be GC'd anyway) than abort the request with an unrelated
-            # cleanup exception.
+            # page.close() can itself hang or fail when the browser is in a
+            # bad state. Bound it and swallow errors so the retry loop can run
+            # its remaining attempts; we'd rather lose the page (it's about to
+            # be GC'd anyway) than block on cleanup.
             if page is not None:
                 try:
-                    await page.close()
+                    async with asyncio.timeout(5):
+                        await page.close()
                 except Exception as close_err:
                     logger.debug(f"page.close() failed (ignored): {close_err}")
 
