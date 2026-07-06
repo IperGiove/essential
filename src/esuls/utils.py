@@ -75,18 +75,30 @@ async def run_parallel(
 
 
 def _yaml_sources(config_dir: Path) -> "list[Path]":
-    """Return the *.yaml files in `config_dir` that should be merged into
-    the runtime config. Excludes *.local.example.yaml — those describe
-    the SHAPE of a *.local.yaml, not real values."""
+    """Return the *.yaml files in `config_dir` in merge order (earlier files
+    merged first, so later files win). Excludes *.local.example.yaml — those
+    describe the SHAPE of a *.local.yaml, not real values.
+
+    `*.local.yaml` files are ordered LAST so they merge last and therefore
+    override the committed defaults: local values (secrets + per-environment
+    overrides) win over the version-controlled `config.yaml`. Within each
+    group — non-local first, then local — files keep alphabetical order.
+    """
     return sorted(
-        p for p in config_dir.glob("*.yaml")
-        if "local.example" not in p.stem
+        (p for p in config_dir.glob("*.yaml") if "local.example" not in p.stem),
+        # False (non-local) sorts before True (local), so committed files are
+        # merged first and *.local.yaml last — and last-merged wins in OmegaConf.
+        key=lambda p: (p.name.endswith(".local.yaml"), p.name),
     )
 
 
 def load_config(config_dir: Path):
     """Merge all *.yaml files in `config_dir` into a single OmegaConf
     DictConfig. Excludes *.local.example.yaml stubs.
+
+    Precedence: ``*.local.yaml`` files are merged last and override the
+    committed defaults — ``config.local.yaml`` beats ``config.yaml`` on any
+    shared key. See :func:`_yaml_sources`.
 
     Sets ``cfg.path`` to the parent of `config_dir` (the package root
     that owns the config) so callers can resolve relative paths.

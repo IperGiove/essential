@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.5 — 2026-07-06
+
+### `load_config`: `*.local.yaml` now overrides the committed defaults
+
+`load_config` merged the YAML files in plain alphabetical order. Because
+`config.local.yaml` sorts *before* `config.yaml` (`'l' < 'y'`), the local file
+was merged **first** and the committed `config.yaml` **won** every shared key —
+the exact opposite of what a "local override" file is supposed to do.
+
+`*.local.yaml` files are now ordered to merge **last**, so local values
+(secrets **and** per-environment overrides) take precedence over the
+version-controlled defaults. Non-local files, then local files, each keep
+alphabetical order within their group.
+
+**Behavior change:** if you relied on `config.yaml` winning a key that is also
+present in a `*.local.yaml`, that key now resolves to the local value. The
+common case — disjoint key sets, i.e. secrets *only* in the local file — is
+unaffected. Covered by `tests/test_config_loader.py`.
+
 ## 0.2.0 — 2026-05-15
 
 ### Architecture: AsyncDB now built on SQLAlchemy 2.0 Core async
