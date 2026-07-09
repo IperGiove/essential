@@ -75,8 +75,10 @@ async def test_apply_jitter():
 async def test_get_user_agent_fallback():
     """Test that _get_user_agent returns fallback on failure."""
     with patch("esuls.request_cli._user_agent_cache", {"instance": None}):
+        # UserAgent is imported function-local (fake_useragent is an optional
+        # `scraping` dep), so patch it at its source module, not on request_cli.
         with patch(
-            "esuls.request_cli.UserAgent",
+            "fake_useragent.UserAgent",
             side_effect=OSError("test"),
         ):
             agent = await _get_user_agent()

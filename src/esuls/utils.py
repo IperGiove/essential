@@ -121,8 +121,8 @@ def load_config(config_dir: Path):
         from omegaconf import OmegaConf
     except ImportError as e:
         raise ImportError(
-            "esuls.utils.load_config requires omegaconf "
-            "(`pip install omegaconf`)."
+            "esuls.utils.load_config requires omegaconf — install the config "
+            "feature with `pip install 'esuls[config]'`."
         ) from e
 
     cfg = OmegaConf.merge(*[OmegaConf.load(p) for p in _yaml_sources(config_dir)])
@@ -155,8 +155,8 @@ def generate_example_files(config_dir: Path) -> None:
         from omegaconf import DictConfig, OmegaConf
     except ImportError as e:
         raise ImportError(
-            "esuls.utils.generate_example_files requires omegaconf "
-            "(`pip install omegaconf`)."
+            "esuls.utils.generate_example_files requires omegaconf — install the "
+            "config feature with `pip install 'esuls[config]'`."
         ) from e
 
     try:

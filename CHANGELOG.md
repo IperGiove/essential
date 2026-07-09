@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0 — 2026-07-09
+
+### Optional dependencies: the heavy stack is now behind per-feature extras
+
+The core install used to pull **everything** — httpx, curl_cffi, Pillow, pypdf,
+python-magic, and Playwright (~170 MB with its Node driver). A consumer that
+only used the DB/config layer (e.g. an SSR web app) still dragged the whole
+scraping stack into its virtualenv and, when compiled with Nuitka, into the
+binary. Now the core is just the async utils + the SQLAlchemy DB layer, and each
+heavier surface is an **optional extra**:
+
+| install | adds |
+|---|---|
+| `esuls` | core: `AsyncDB`, models, `run_parallel` |
+| `esuls[config]` | `load_config` / `generate_example_files` (OmegaConf) |
+| `esuls[http]` | `make_request` / `AsyncRequest` (httpx) |
+| `esuls[scraping]` | `make_request_cffi` / `make_request_playwright` (curl_cffi + Playwright) |
+| `esuls[pdf]` | PDF metadata/inspection + the `esuls-pdf` CLI |
+| `esuls[icons]` | `download_icon` (Pillow + libmagic) |
+| `esuls[all]` | everything (the pre-0.4 default) |
+
+**BREAKING (install-time only — the Python API is unchanged).** If you use the
+HTTP/scraping/PDF/icon helpers, add the matching extra. The fastest migration is
+the catch-all: change your dependency `esuls` → **`esuls[all]`** and nothing else
+moves. The `esuls-pdf` console script now requires `esuls[pdf]`.
+
+### Lazy public API (PEP 562)
+
+`from esuls import AsyncDB` (and every other symbol) still works exactly as
+before, but the top-level package now imports the optional submodules **lazily**,
+on first access. So `import esuls` for DB/config work no longer imports
+Playwright at all. Accessing a symbol whose extra isn't installed raises a clear
+`ImportError` that names the extra to install, instead of a cryptic
+`No module named 'playwright_stealth'`.
+
+Internally, `request_cli` moved its `curl_cffi` / `fake_useragent` /
+`playwright_stealth` imports **function-local**, so importing the module (or the
+httpx-only `make_request` path) needs only httpx; `fake_useragent` is now soft
+(falls back to a static UA if absent). Guarded by `tests/test_lazy_imports.py`,
+which asserts `import esuls` never pulls the heavy stack into `sys.modules`.
+
+### Dev tooling → PEP 735 dependency groups
+
+The `dev` **extra** became a `[dependency-groups]` entry, so test tooling no
+longer ships in the wheel or leaks into consumers. Run the suite with
+`uv run --all-extras --group dev pytest`.
+
 ## 0.2.5 — 2026-07-06
 
 ### `load_config`: `*.local.yaml` now overrides the committed defaults

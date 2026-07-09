@@ -1,4 +1,6 @@
 """HTTP request utilities with connection pooling, retry logic, and browser impersonation."""
+from __future__ import annotations
+
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TypeAlias, Union, Optional, Dict, Any, AsyncContextManager, Literal
@@ -11,9 +13,20 @@ import threading
 import weakref
 from loguru import logger
 import httpx
-from fake_useragent import UserAgent
-from curl_cffi.requests import AsyncSession
-from playwright_stealth import stealth_async
+
+# curl_cffi, fake_useragent and playwright_stealth are the heavy, OPTIONAL
+# transports (browser TLS impersonation / JS rendering). They are imported
+# lazily inside the functions that use them, so importing this module — and the
+# httpx-only `make_request` path — never pulls the ~170 MB scraping stack.
+# Install them with `pip install 'esuls[scraping]'`.
+
+
+def _missing(pkg: str, extra: str) -> ModuleNotFoundError:
+    """Build an actionable error for a missing optional dependency."""
+    return ModuleNotFoundError(
+        f"esuls: '{pkg}' is required for this feature — install it with "
+        f"`pip install 'esuls[{extra}]'`."
+    )
 
 # Type definitions
 JsonType: TypeAlias = Dict[str, Any]
@@ -80,8 +93,12 @@ async def _get_user_agent() -> str:
     with _user_agent_lock:
         if _user_agent_cache["instance"] is None:
             try:
+                from fake_useragent import UserAgent
                 _user_agent_cache["instance"] = UserAgent()
-            except (OSError, IOError) as e:
+            except (OSError, IOError, ImportError) as e:
+                # fake_useragent is optional (part of the `scraping` extra); with
+                # it absent we simply fall back to a static UA — httpx-only
+                # callers on `esuls[http]` keep working.
                 logger.warning(f"Failed to initialize UserAgent, using fallback: {e}")
                 return _FALLBACK_USER_AGENT
 
@@ -700,6 +717,10 @@ async def _get_session_cffi(verify_ssl: bool = True) -> AsyncSession:
     async with state["cffi_lock"]:
         sessions: Dict[bool, Optional[AsyncSession]] = state["cffi_sessions"]
         if sessions[verify_ssl] is None:
+            try:
+                from curl_cffi.requests import AsyncSession
+            except ImportError:
+                raise _missing("curl_cffi", "scraping")
             sessions[verify_ssl] = AsyncSession(
                 impersonate="chrome",
                 timeout=30,
@@ -831,7 +852,10 @@ async def _get_playwright_browser():
             state["playwright_instance"] = None
 
         if state["playwright_browser"] is None:
-            from playwright.async_api import async_playwright
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError:
+                raise _missing("playwright", "scraping")
             # Bound start()+launch(): a hung driver spawn or Chromium launch
             # would otherwise hold playwright_lock forever and deadlock every
             # make_request_playwright caller. On failure, clear any half-built
@@ -930,6 +954,11 @@ async def make_request_playwright(
     # single bad site can never hang the process. The budget comfortably
     # exceeds the sum of the inner per-action timeouts (goto + networkidle +
     # content), so it only trips on a genuine hang, not a merely slow page.
+    try:
+        from playwright_stealth import stealth_async
+    except ImportError:
+        raise _missing("playwright_stealth", "scraping")
+
     attempt_budget = 2 * timeout_request + wait_seconds + 15
 
     for attempt in range(max_attempt):

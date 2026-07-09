@@ -1,0 +1,13 @@
+# Assumes GitHub Actions — adjust if the repo lives on GitLab / self-hosted.
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # --all-extras installs every optional feature (config/http/scraping/pdf/
+      # icons) so the whole suite has its deps; --group dev pulls the PEP 735
+      # test tooling (pytest et al.), which is no longer shipped as an extra.
+      - run: uv run --all-extras --group dev pytest -q

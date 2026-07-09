@@ -7,7 +7,7 @@ esuls-pdf = "esuls.pdf.cli:app"
 
 [project]
 name = "esuls"
-version = "0.2.5"
+version = "0.4.0"
 description = "Utility library for async database operations, HTTP requests, and parallel execution"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -21,23 +21,45 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-# All dependencies (always installed)
+# Core: the lightweight, always-installed surface — async utils + the
+# SQLAlchemy-backed DB layer. Everything heavier is an OPTIONAL feature below,
+# so `pip install esuls` stays tiny and the lazy facade (src/esuls/__init__.py)
+# only imports a submodule when its feature is actually used.
 dependencies = [
     "aiosqlite==0.22.1",
-    "click>=8.1",
-    "curl-cffi>=0.13.0",
-    "fake-useragent>=2.2.0",
-    "httpx[http2]>=0.28.1",
-    "loguru>=0.7.3",
-    "pillow>=12.0.0",
-    "playwright>=1.58.0",
-    "pypdf>=6.10.2",
-    "python-magic>=0.4.27",
     "sqlalchemy[asyncio]>=2.0.36",
-    "tf-playwright-stealth>=1.2.0",
+    "loguru>=0.7.3",
 ]
 
+# Per-feature extras: install only what you import. `dep you install == feature
+# you use`. Composable (scraping/icons build on http); `all` = the pre-0.4
+# "batteries included" default, so existing consumers migrate with one token:
+# `esuls` -> `esuls[all]`.
 [project.optional-dependencies]
+# OmegaConf config loader (esuls.utils.load_config / generate_example_files).
+config = ["omegaconf>=2.3.0"]
+# HTTP client: make_request / AsyncRequest (httpx transport only).
+http = ["httpx[http2]>=0.28.1"]
+# Browser-grade scraping on top of `http`: curl_cffi TLS impersonation +
+# Playwright JS rendering (make_request_cffi / make_request_playwright).
+scraping = [
+    "esuls[http]",
+    "curl-cffi>=0.13.0",
+    "fake-useragent>=2.2.0",
+    "playwright>=1.58.0",
+    "tf-playwright-stealth>=1.2.0",
+]
+# PDF metadata/inspection + the `esuls-pdf` console script.
+pdf = ["pypdf>=6.10.2", "click>=8.1"]
+# Icon/avatar download + validation (needs the http client + Pillow + libmagic).
+icons = ["esuls[http]", "pillow>=12.0.0", "python-magic>=0.4.27"]
+# Everything.
+all = ["esuls[config,http,scraping,pdf,icons]"]
+
+# Dev/test tooling (PEP 735 dependency-groups) — NOT an extra, so it never
+# lands in a consumer's dependency tree or the published wheel. Feature deps for
+# the tests come from the extras: `uv run --all-extras --group dev pytest`.
+[dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
