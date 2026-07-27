@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0 — 2026-07-27
+
+### Declared indexes are now actually created on an existing table
+
+`AsyncDB` retrofits missing **columns** onto a table it did not create, then
+called `metadata.create_all` to "pick up any new indexes". It never did:
+SQLAlchemy's `checkfirst` skips an existing table **wholesale**, indexes
+included. So adding `metadata={"index": True}` — or, worse,
+`{"unique": True}` — to a dataclass whose table already existed added the
+column and silently enforced nothing. The declaration read as binding while
+duplicates kept being accepted, and the only way to find out was a corrupted
+invariant much later. Two consumers had already hand-written raw
+`CREATE UNIQUE INDEX` statements in their app startup to work around it.
+
+A new `_ensure_indexes` runs in the existing-table branch of schema init and
+issues `CREATE [UNIQUE] INDEX IF NOT EXISTS` for every declared index the live
+table lacks. Idempotent, and unchanged for freshly created tables.
+
+**A UNIQUE index whose column already holds duplicates is SKIPPED**, not
+attempted: SQLite refuses to build it, and that error would abort schema init —
+i.e. startup — for a database that accumulated duplicates *precisely because*
+the constraint was missing. The column is logged at ERROR with the index name
+instead. Deduplicating is a decision for a human with the domain in mind, not
+for a boot path. Fix the data, restart, and the index is created.
+
+**Minor, not patch:** on an existing deployment this begins creating indexes
+that were silently absent. Expect a one-off cost on the first boot after
+upgrading for large tables, and check the logs for skipped UNIQUE indexes —
+each one is a constraint your code believes it has and does not.
+
 ## 0.4.0 — 2026-07-09
 
 ### Optional dependencies: the heavy stack is now behind per-feature extras

@@ -1296,8 +1296,11 @@ class AsyncDB(Generic[SchemaType]):
                 )
             )
             retrofit_names.add(col.name)
-        # Pick up any new indexes (idempotent: CREATE INDEX IF NOT EXISTS).
-        await conn.run_sync(self._metadata.create_all)
+        # Pick up any index declared since the table was created. NOT
+        # `metadata.create_all`: with checkfirst it skips an existing table
+        # WHOLESALE, indexes included, so a `metadata={"unique": True}` added to
+        # a live table was silently never enforced.
+        await self._ensure_indexes(conn)
 
         # Drift detection: surface mismatches the retrofit cannot fix.
         await self._check_schema_drift(conn, retrofit_names)
@@ -1307,6 +1310,62 @@ class AsyncDB(Generic[SchemaType]):
         # + drift check + every migration. Any failure rolls back the
         # whole thing and leaves `PRAGMA user_version` at its prior value.
         await _apply_pending_migrations(conn, self.migrations_dir)
+
+    async def _ensure_indexes(self, conn: AsyncConnection) -> list[str]:
+        """Create every declared index the live table is missing.
+
+        Needed because SQLAlchemy's `create_all(checkfirst=True)` emits NOTHING
+        for a table it did not create — indexes included. So adding
+        `metadata={"index": True}` (or `"unique": True`) to a dataclass whose
+        table already exists used to add the column and silently never enforce
+        the constraint. `CREATE [UNIQUE] INDEX IF NOT EXISTS` is the SQLite-
+        native way to add one after the fact, and is idempotent.
+
+        A UNIQUE index is pre-checked for existing duplicates: SQLite refuses to
+        build it if any exist, and that error would abort schema init — i.e.
+        boot — for every caller of a database that has been accumulating
+        duplicates precisely BECAUSE the constraint was missing. Deduplicating
+        is a decision for a human with the domain in mind, not for a startup
+        path, so such an index is skipped and its column reported instead.
+
+        Returns the columns left unenforced (empty when everything is in place).
+        """
+        rows = await conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :t"
+        ), {"t": self.table_name})
+        present = {r[0] for r in rows.fetchall()}
+
+        skipped: list[str] = []
+        for index in self._table.indexes:
+            if index.name in present:
+                continue
+            cols = [c.name for c in index.columns]
+            quoted = ", ".join(f'"{c}"' for c in cols)
+
+            if index.unique:
+                dupes = await conn.execute(text(
+                    f'SELECT COUNT(*) FROM (SELECT 1 FROM "{self.table_name}" '
+                    f"GROUP BY {quoted} HAVING COUNT(*) > 1)"
+                ))
+                if dupes.scalar():
+                    skipped.extend(cols)
+                    logger.error(
+                        f"{self.table_name}: duplicate values in "
+                        f"({', '.join(cols)}) — UNIQUE index {index.name!r} NOT "
+                        "created. Deduplicate, then restart to enforce it."
+                    )
+                    continue
+
+            unique_sql = "UNIQUE " if index.unique else ""
+            await conn.execute(text(
+                f'CREATE {unique_sql}INDEX IF NOT EXISTS "{index.name}" '
+                f'ON "{self.table_name}" ({quoted})'
+            ))
+            logger.info(
+                f"{self.table_name}: created missing {unique_sql.lower()}index "
+                f"{index.name!r} on ({', '.join(cols)})"
+            )
+        return skipped
 
     async def _check_schema_drift(
         self,
