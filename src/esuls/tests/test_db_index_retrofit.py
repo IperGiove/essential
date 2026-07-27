@@ -90,6 +90,60 @@ async def test_existing_duplicates_skip_the_unique_index_instead_of_failing_boot
         await db.close()
 
 
+async def test_many_nulls_do_not_count_as_duplicates(temp_db: Path):
+    """NULLs are distinct in SQL, so a UNIQUE index tolerates any number of them
+    — that is what makes an optional-but-unique column possible at all. Counting
+    them as a conflict would refuse an index SQLite builds happily, and it is
+    the COMMON case: such a column is mostly NULL before the feature ships."""
+    await _make_v1(temp_db, rows=[("a", None), ("b", None), ("c", "x@y.z")])
+
+    db = AsyncDB(temp_db, "t", Indexed)
+    await db.get_by_id("a")
+    try:
+        assert "idx_t_email_unique" in _indexes(temp_db)
+        # ...and the index still permits further NULLs afterwards.
+        await db.save(Indexed(id="d", email=None))
+        assert await db.get_by_id("d") is not None
+    finally:
+        await db.close()
+
+
+async def test_unique_together_is_NOT_retrofitted_onto_an_existing_table(temp_db: Path):
+    """Documents a REMAINING gap, so nobody assumes index retrofit covers it.
+
+    `__unique_together__` compiles to a table-level `UniqueConstraint`, not an
+    `Index`, and SQLite cannot ALTER-add a table constraint — so on a
+    pre-existing table it stays unenforced, exactly as before. Adding one to a
+    live model still needs a migration (or a hand-written composite
+    `CREATE UNIQUE INDEX`). Only per-field `metadata={"unique": True}` is
+    retrofitted.
+    """
+    @dataclass
+    class Pair(IdModel):
+        a: Optional[str] = field(default=None)
+        b: Optional[str] = field(default=None)
+
+    @dataclass
+    class PairUnique(IdModel):
+        __unique_together__ = (("a", "b"),)
+        a: Optional[str] = field(default=None)
+        b: Optional[str] = field(default=None)
+
+    assert AsyncDB(temp_db, "t", PairUnique)._table.indexes == set()
+
+    db1 = AsyncDB(temp_db, "t", Pair)
+    await db1.save(Pair(id="x", a="same", b="same"))
+    await db1.close()
+
+    db2 = AsyncDB(temp_db, "t", PairUnique)
+    await db2.get_by_id("x")  # must not raise
+    try:
+        await db2.save(PairUnique(id="y", a="same", b="same"))
+        assert len(await db2.find()) == 2  # still accepted — the gap
+    finally:
+        await db2.close()
+
+
 async def test_retrofit_is_idempotent_across_reopens(temp_db: Path):
     await _make_v1(temp_db, rows=[("a", "x@y.z")])
     for _ in range(3):

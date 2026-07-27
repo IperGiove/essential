@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.1 — 2026-07-27
+
+### Fix: NULLs were counted as duplicates, refusing valid UNIQUE indexes
+
+0.5.0's duplicate pre-check ran `GROUP BY col HAVING COUNT(*) > 1` over the
+whole table. SQL groups all NULLs together, so N rows with a NULL in the indexed
+column looked like N duplicates and the index was skipped — even though SQL
+treats NULLs as DISTINCT and SQLite would have built it without complaint.
+
+This hit the common case, not an edge one: an optional-but-unique column (a
+handle, a slug, an external id) is mostly NULL before the feature that fills it
+ships, so 0.5.0 would refuse the very index the column was declared to have. The
+pre-check now excludes rows with a NULL in any indexed column, matching SQLite's
+own rule (a row is exempt from a composite UNIQUE if ANY of its columns is NULL).
+
+Found by running 0.5.0 against a real database whose `handle` column was
+entirely NULL.
+
+### Known gap, now documented and tested
+
+`__unique_together__` compiles to a table-level `UniqueConstraint`, not an
+`Index`, and SQLite cannot ALTER-add a table constraint — so it is still NOT
+retrofitted onto an existing table. Adding one to a live model needs a migration
+or a hand-written composite `CREATE UNIQUE INDEX`. Only per-field
+`metadata={"unique": True}` / `{"index": True}` is retrofitted.
+
 ## 0.5.0 — 2026-07-27
 
 ### Declared indexes are now actually created on an existing table

@@ -1343,9 +1343,19 @@ class AsyncDB(Generic[SchemaType]):
             quoted = ", ".join(f'"{c}"' for c in cols)
 
             if index.unique:
+                # NULLs are NOT duplicates: SQL treats them as distinct, so a
+                # UNIQUE index permits any number of rows with a NULL in the
+                # indexed column(s) — which is the whole reason a nullable
+                # column can be unique at all. Excluding them matters in the
+                # common case: an optional-but-unique column (a handle, a slug,
+                # an external id) is mostly NULL early on, and counting those
+                # NULLs as a conflict would refuse an index SQLite builds
+                # happily. For a composite index the row is exempt if ANY of its
+                # columns is NULL, matching SQLite's own rule.
+                not_null = " AND ".join(f'"{c}" IS NOT NULL' for c in cols)
                 dupes = await conn.execute(text(
                     f'SELECT COUNT(*) FROM (SELECT 1 FROM "{self.table_name}" '
-                    f"GROUP BY {quoted} HAVING COUNT(*) > 1)"
+                    f"WHERE {not_null} GROUP BY {quoted} HAVING COUNT(*) > 1)"
                 ))
                 if dupes.scalar():
                     skipped.extend(cols)
