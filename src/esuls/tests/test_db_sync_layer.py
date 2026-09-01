@@ -236,3 +236,83 @@ async def test_col_compares_two_columns_in_a_filter(db):
 async def test_col_rejects_an_unknown_column(db):
     with pytest.raises(ValueError, match="Unknown column"):
         db.col("nope")
+
+
+# ---- the shared read connection -----------------------------------------
+
+
+async def test_a_read_sees_a_write_made_by_another_process(db, tmp_path):
+    """The failure this connection is one mistake away from.
+
+    Bounded reads share one connection for the life of the loop. SQLAlchemy opens
+    a transaction on first execute and holds it, so without ending it the reader
+    would serve the snapshot it first saw — forever, and silently. An outside
+    writer is the sharpest way to ask: sqlite3 knows nothing about our pools.
+    """
+    import sqlite3
+
+    await db.save(_Row(id="x", name="before", n=1), skip_errors=False)
+    assert (await db.get_by_id("x")).name == "before"      # opens the connection
+
+    raw = sqlite3.connect(str(db.db_path))
+    raw.execute("UPDATE rows SET name='after' WHERE id='x'")
+    raw.commit()
+    raw.close()
+
+    assert (await db.get_by_id("x")).name == "after"
+
+
+async def test_the_shared_connection_does_not_pin_the_wal(db):
+    """An open read transaction stops SQLite checkpointing, and the -wal file then
+    grows across restarts. Reading through the shared connection must not."""
+    from pathlib import Path
+
+    await db.save_batch([_Row(name="x" * 50, n=i) for i in range(2000)])
+    for _ in range(20):
+        await db.find(name="x" * 50, limit=1)              # keeps the reader busy
+    await db.close()
+    wal = Path(f"{db.db_path}-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
+async def test_a_broken_shared_connection_is_replaced(db):
+    """Close it under the layer's feet: the next read must reconnect, not raise."""
+    await db.save(_Row(id="y", name="a"), skip_errors=False)
+    assert await db.get_by_id("y") is not None
+
+    from esuls.db_cli import _db_loop_state
+    conns = _db_loop_state()["read_conns"]
+    conns[str(db.db_path)].close()
+
+    assert (await db.get_by_id("y")).name == "a"
+
+
+async def test_threaded_reads_do_not_borrow_the_loop_connection(db):
+    """Unbounded reads run in a worker thread and must take their own connection:
+    a SQLite connection used from two threads at once is undefined behaviour."""
+    import threading
+
+    await db.save(_Row(name="a", other="scan-me"), skip_errors=False)
+    await db.get_by_id("nope")                              # opens the shared one
+
+    from esuls.db_cli import _db_loop_state
+    shared = _db_loop_state()["read_conns"][str(db.db_path)]
+
+    seen = {}
+
+    async def watched():
+        real = shared.execute
+
+        def spy(*a, **kw):                                  # pragma: no cover
+            seen["used_shared_off_loop"] = threading.get_ident()
+            return real(*a, **kw)
+
+        shared.execute = spy
+        try:
+            return await db.find(other="scan-me")           # unindexed -> thread
+        finally:
+            shared.execute = real
+
+    rows = await watched()
+    assert len(rows) == 1
+    assert "used_shared_off_loop" not in seen

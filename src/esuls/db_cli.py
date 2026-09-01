@@ -43,7 +43,8 @@ from typing import (
 
 from loguru import logger
 from sqlalchemy import (
-    Boolean, Column, Date, DateTime, Float, ForeignKey, Index, Integer,
+    Boolean,
+    bindparam, Column, Date, DateTime, Float, ForeignKey, Index, Integer,
     LargeBinary, MetaData, Table, Text, UniqueConstraint, and_, delete, event,
     func, literal, select, text, update,
 )
@@ -266,12 +267,13 @@ def _db_loop_state() -> dict:
     Keys:
       - "locks"            dict[str, asyncio.Lock]   per-db-path write lock
       - "schema_init_lock" asyncio.Lock              serialises schema init
+      - "read_conns"       dict[str, Connection]     shared read connection
     """
     loop = asyncio.get_running_loop()
     with _db_state_guard:
         state = _db_state_by_loop.get(loop)
         if state is None:
-            state = {"locks": {}, "schema_init_lock": asyncio.Lock()}
+            state = {"locks": {}, "schema_init_lock": asyncio.Lock(), "read_conns": {}}
             _db_state_by_loop[loop] = state
         return state
 
@@ -1261,6 +1263,19 @@ class AsyncDB(Generic[SchemaType]):
 
     # ──────────────── engines + write lock ────────────────
 
+    @property
+    def _stmt_by_id(self):
+        """`SELECT * FROM <table> WHERE id = :pk_value`, built once per instance.
+
+        The bind name is deliberately not a column name, so it cannot collide
+        with the schema whatever it declares.
+        """
+        stmt = self.__dict__.get("_stmt_by_id_cache")
+        if stmt is None:
+            stmt = select(self._table).where(self._table.c.id == bindparam("pk_value"))
+            self.__dict__["_stmt_by_id_cache"] = stmt
+        return stmt
+
     def _bounded(self, filters: Dict[str, Any], limit: Optional[int]) -> bool:
         """Is this read guaranteed to touch a bounded slice of the table?
 
@@ -1292,9 +1307,69 @@ class AsyncDB(Generic[SchemaType]):
             with reader.connect() as conn:
                 return fn(conn)
 
-        if bounded:
-            return _run()
-        return await asyncio.to_thread(_run)
+        if not bounded:
+            return await asyncio.to_thread(_run)
+
+        # Bounded reads share ONE connection per (db file, event loop) instead of
+        # checking one out per query: the pool checkout, the Connection object and
+        # the checkout/checkin events cost more than the query itself. Measured on
+        # a point read, 0.076 ms per checkout against 0.044 shared — 1.7x.
+        #
+        # Safe for exactly the reason the sync layer exists: a bounded read has no
+        # `await` inside, so the loop cannot interleave a second query onto this
+        # connection, and the connection never leaves the loop's thread (the
+        # thread path above keeps taking its own from the pool).
+        conn = self._loop_read_conn(reader)
+        try:
+            result = fn(conn)
+        except Exception as e:
+            # Any DB-level failure retires the shared connection rather than
+            # leaving a broken one cached for every later read.
+            if isinstance(e, (sa_exc.SQLAlchemyError, sqlite3.Error)):
+                self._drop_loop_read_conn()
+            raise
+        # END THE READ TRANSACTION — not optional, and not obvious. SQLAlchemy
+        # opens one on first execute and holds it until told otherwise, so a
+        # connection living for the life of the process would keep serving the
+        # snapshot it first saw (a row written a second ago invisible forever) and
+        # SQLite could never checkpoint the WAL past that open read.
+        # `isolation_level="AUTOCOMMIT"` does NOT prevent it here: the `begin`
+        # listener this module installs — so migrations get transactional DDL —
+        # fires anyway and emits a real BEGIN. Measured: with the rollback the
+        # shared connection is still 1.7x a checkout, so the snapshot was the
+        # expensive part, not the rollback.
+        conn.rollback()
+        return result
+
+    def _loop_read_conn(self, reader: Engine) -> Connection:
+        """The per-loop shared read connection, opened on first use.
+
+        Opened with AUTOCOMMIT as a belt-and-braces measure; what actually keeps
+        it honest is the `rollback()` after every read in `_read` — see the note
+        there, because the option alone does NOT stop this module's own `begin`
+        listener from opening a transaction.
+        """
+        state = _db_loop_state()
+        conns = state.setdefault("read_conns", {})
+        key = str(self.db_path)
+        conn = conns.get(key)
+        if conn is None or conn.closed:
+            conn = reader.connect().execution_options(isolation_level="AUTOCOMMIT")
+            conns[key] = conn
+        return conn
+
+    def _drop_loop_read_conn(self) -> None:
+        """Close and forget the shared read connection (error recovery, close())."""
+        try:
+            state = _db_loop_state()
+        except RuntimeError:
+            return
+        conn = state.get("read_conns", {}).pop(str(self.db_path), None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     async def _get_write_lock(self) -> asyncio.Lock:
         """Return the per-loop, per-db-path write lock.
@@ -1591,6 +1666,7 @@ class AsyncDB(Generic[SchemaType]):
         recognises this as a clean teardown and does NOT emit the
         "engine GC'd without close" `ResourceWarning`.
         """
+        self._drop_loop_read_conn()
         key = str(self.db_path)
         with _db_state_guard:
             pair = _engines_by_path.pop(key, None)
@@ -1734,6 +1810,7 @@ class AsyncDB(Generic[SchemaType]):
                         yield _AwaitableConn(conn)
         except Exception as e:
             if _is_stale_connection(e):
+                self._drop_loop_read_conn()
                 _drop_engines(self.db_path)
                 self._engines = None
                 self._schema_ready = False
@@ -1980,6 +2057,7 @@ class AsyncDB(Generic[SchemaType]):
                         await asyncio.sleep(wait_time)
                         continue
                     if _is_stale_connection(e):
+                        self._drop_loop_read_conn()
                         _drop_engines(self.db_path)
                         self._engines = None
                         self._schema_ready = False
@@ -2238,9 +2316,14 @@ class AsyncDB(Generic[SchemaType]):
     ) -> Optional[SchemaType]:
         """Fetch by primary key. Accepts `str` (UUID/IdModel/TimestampedModel)
         or `int` (IntIdModel) since the PK type depends on the schema."""
-        stmt = select(self._table).where(self._table.c.id == record_id)
+        # The statement is built ONCE (see `_stmt_by_id`) and the id travels as a
+        # bound parameter. Rebuilding it per call meant SQLAlchemy coercing the
+        # comparison and re-deriving the statement's cache key every time —
+        # together the largest single entry in a profile of this method.
+        stmt = self._stmt_by_id
         row = await self._read(
-            lambda c: c.execute(stmt).mappings().first(), bounded=True
+            lambda c: c.execute(stmt, {"pk_value": record_id}).mappings().first(),
+            bounded=True,
         )
         if row is None:
             return None

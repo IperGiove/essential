@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.7.0 — 2026-09-01
+
+### The hot read path stops rebuilding what it can keep
+
+Two changes, both inside `AsyncDB`, no API surface touched. A profile of
+`get_by_id` said esuls' own code was **2.7% of the call** — everything else was
+SQLAlchemy being asked to do the same work again on every query. So the work is
+done once instead.
+
+**One shared read connection per (database file, event loop).** Bounded reads no
+longer check a connection out of the pool per query: the checkout, the
+`Connection` object and the checkout/checkin events cost more than the query
+itself. It is safe for the same reason the synchronous layer is: a bounded read
+has no `await` inside, so the loop cannot interleave a second query onto it, and
+the connection never leaves the loop's thread — threaded reads (`stream`,
+`aggregate`, unindexed scans) keep taking their own.
+
+That connection ends its read transaction after every query, and **this is the
+part that is one mistake away from a silent bug**: SQLAlchemy opens a transaction
+on first execute and holds it, so a connection living for the life of the process
+would keep serving the snapshot it first saw — a row written a second ago
+invisible for ever — and SQLite could never checkpoint the WAL past that open
+read. `isolation_level="AUTOCOMMIT"` does not prevent it: this module's own
+`begin` listener (which exists so migrations get transactional DDL) fires anyway
+and emits a real `BEGIN`. `tests/test_db_sync_layer.py` pins it with an outside
+`sqlite3` writer, and the test fails if the `rollback()` is removed.
+
+**`get_by_id`'s statement is built once**, with the id as a bound parameter.
+Rebuilding it per call meant coercing the comparison and re-deriving the
+statement's cache key every time — the largest single entry in the profile.
+
+Measured with `benchmarks/db_bench.py`, same machine, across the three versions:
+
+| workload | 0.5.1 | 0.6.0 | 0.7.0 |
+|---|---|---|---|
+| 50 sequential `get_by_id` | 1,867/s | 4,912/s | **17,247/s** |
+| 25 concurrent `find(limit=100)` | 259/s | 1,499/s | **1,951/s** |
+| 50 filtered `find` | 503/s | 850/s | **1,140/s** |
+| 50 sequential `count()` | 1,856/s | 2,599/s | **5,093/s** |
+| 50 `update_fields` | 1,527/s | 4,767/s | **6,071/s** |
+| 50 sequential `save()` | 940/s | 2,240/s | **2,369/s** |
+| batch insert | 29,756/s | 39,142/s | **44,749/s** |
+
+End to end on a FastAPI page issuing 11 queries: **122 → 372 → 645 req/s**. The
+same page written against raw `sqlite3` by hand reaches 1,165, so what this layer
+now costs is 1.8x — it was 3.9x when the measuring started.
+
 ## 0.6.0 — 2026-09-01
 
 ### The execution layer is synchronous; the API is unchanged
