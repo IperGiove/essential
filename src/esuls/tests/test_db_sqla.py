@@ -30,7 +30,8 @@ from sqlalchemy import event, text
 
 from esuls.db_cli import (
     AsyncDB, BaseModel, IdModel, IntIdModel, TimestampedIntModel,
-    TimestampedModel, _db_state_by_loop, discover_migrations, utcnow,
+    TimestampedModel, _db_state_by_loop, _engines_by_path, _initialized_dbs,
+    discover_migrations, utcnow,
 )
 
 
@@ -259,15 +260,25 @@ async def test_close_runs_pragma_optimize(temp_db):
     writer, _ = await db._ensure_engines()
     executed: list[str] = []
 
-    @event.listens_for(writer.sync_engine, "before_cursor_execute")
+    @event.listens_for(writer, "before_cursor_execute")
     def _capture(_conn, _cursor, statement, *_):
         executed.append(statement)
 
     await db.close()
     optimize_seen = any("optimize" in s.lower() for s in executed)
-    checkpoint_seen = any("wal_checkpoint" in s.lower() for s in executed)
     assert optimize_seen, f"PRAGMA optimize not executed; saw: {executed}"
-    assert checkpoint_seen, f"PRAGMA wal_checkpoint not executed; saw: {executed}"
+
+    # The checkpoint is asserted by its RESULT, not by the statement being
+    # emitted: it runs on a connection of its own, after both pools are
+    # disposed, because TRUNCATE needs every other connection to the file
+    # closed. Spying on the engine is precisely how the previous version could
+    # "see" a checkpoint that SQLite was in fact refusing with "database table
+    # is locked" — the statement went out, the WAL stayed.
+    from pathlib import Path as _Path
+    wal = _Path(f"{temp_db}-wal")
+    assert not wal.exists() or wal.stat().st_size == 0, (
+        f"-wal was not folded back into the db: {wal.stat().st_size} bytes"
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -327,8 +338,7 @@ async def test_no_silent_schema_drift_recovery(temp_db):
     c.close()
 
     # Force schema re-init in this loop so the AsyncDB rebuilds engines.
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     db2 = AsyncDB(temp_db, "items", _WithOptBytes)
     try:
@@ -445,9 +455,7 @@ async def test_drift_warning_on_required_retrofit(temp_db):
         await db1.close()
 
     # Force schema re-init in this loop.
-    from esuls.db_cli import _db_state_by_loop
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     captured: list[str] = []
     sink_id = logger.add(captured.append, level="WARNING")
@@ -474,9 +482,7 @@ async def test_strict_schema_raises_on_drift(temp_db):
     finally:
         await db1.close()
 
-    from esuls.db_cli import _db_state_by_loop
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     db2 = AsyncDB(temp_db, "items", _V2, strict_schema=True)
     try:
@@ -1269,8 +1275,7 @@ async def test_list_migrations_reports_applied_status(tmp_path):
         "async def upgrade(conn):\n"
         "    await conn.execute(text('CREATE TABLE side (id INT)'))\n"
     )
-    for s in _state.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     db2 = AsyncDB(db_path, "items", _SimpleRow)
     try:
@@ -1393,8 +1398,7 @@ async def test_strict_schema_false_permits_drift_with_warning(temp_db):
     finally:
         await db1.close()
 
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     captured: list[str] = []
     sink_id = _logger.add(captured.append, level="WARNING")
@@ -1598,7 +1602,7 @@ async def test_exists_uses_select_1_not_count(temp_db, db, monkeypatch):
     _, reader = await db._ensure_engines()
     from sqlalchemy import event as _event
 
-    @_event.listens_for(reader.sync_engine, "before_cursor_execute")
+    @_event.listens_for(reader, "before_cursor_execute")
     def _capture(_conn, _cursor, statement, *_):
         captured.append(statement)
 
@@ -1723,10 +1727,8 @@ async def test_schema_init_atomically_with_caller_transaction(tmp_path):
     finally:
         await bootstrap.close()
 
-    # Re-init state so the per-loop registry sees these AsyncDBs fresh.
-    from esuls.db_cli import _db_state_by_loop as _state
-    for s in _state.values():
-        s["initialized"].clear()
+    # Re-init state so these AsyncDBs run their schema init fresh.
+    _initialized_dbs.clear()
 
     db_o = AsyncDB(p, "orders", _OrderRow)
     # db_i has NEVER been initialised in this loop. Its schema doesn't exist.

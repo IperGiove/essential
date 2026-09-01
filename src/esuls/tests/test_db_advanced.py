@@ -41,6 +41,8 @@ from esuls.db_cli import (
     _B64_PREFIX,
     _is_bytes_field,
     _json_encode_default as _json_default,  # renamed in the refactor
+    _engines_by_path,
+    _initialized_dbs,
 )
 
 
@@ -893,9 +895,7 @@ async def test_schema_migration_adds_columns_and_indexes():
             await db1.close()
 
         # Phase 2: reopen with V2 schema — should ALTER TABLE the new columns
-        from esuls.db_cli import _db_state_by_loop
-        for s in _db_state_by_loop.values():
-            s["initialized"].clear()
+        _initialized_dbs.clear()
 
         db2 = AsyncDB(p, "items", V2)
         try:
@@ -983,10 +983,10 @@ async def test_context_manager_closes_connection():
         async with AsyncDB(p, "items", WithNaturalKey) as db:
             await db.save(WithNaturalKey(external_id="x", payload="v"))
             state = _db_state_by_loop[asyncio.get_running_loop()]
-            assert key in state["engines"]
+            assert key in _engines_by_path
         # After __aexit__, the engine pair has been removed.
         state = _db_state_by_loop[asyncio.get_running_loop()]
-        assert key not in state["engines"]
+        assert key not in _engines_by_path
 
 
 # ────────────────────────────────────────────────────────────────────────

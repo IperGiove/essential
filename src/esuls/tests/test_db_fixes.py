@@ -15,6 +15,8 @@ from esuls.db_cli import (
     AsyncDB,
     BaseModel,
     _db_state_by_loop,
+    _engines_by_path,
+    _initialized_dbs,
     _is_sqlite_busy,
     _is_stale_connection,
     _validate_identifier,
@@ -334,26 +336,26 @@ async def test_connection_pooling(temp_db):
     # First operation creates the engine pair
     await db.save(TestItem(name="first", value=1))
     state = _db_state_by_loop[asyncio.get_running_loop()]
-    pair1 = state["engines"][key]
+    pair1 = _engines_by_path[key]
     assert pair1 is not None
 
     # Subsequent operations reuse the same engines
     await db.find()
-    assert state["engines"][key] is pair1, "engines should be reused"
+    assert _engines_by_path[key] is pair1, "engines should be reused"
 
     await db.count()
-    assert state["engines"][key] is pair1
+    assert _engines_by_path[key] is pair1
 
     await db.save(TestItem(name="second", value=2))
-    assert state["engines"][key] is pair1
+    assert _engines_by_path[key] is pair1
 
     # Explicit close clears the cache
     await db.close()
-    assert key not in state["engines"]
+    assert key not in _engines_by_path
 
     # Next operation creates a fresh engine pair
     await db.find()
-    pair2 = state["engines"][key]
+    pair2 = _engines_by_path[key]
     assert pair2 is not None and pair2 is not pair1, "fresh engines after close"
 
     await db.close()
@@ -473,7 +475,7 @@ async def test_context_manager(temp_db):
 
     # After __aexit__, the engine pair is no longer in the registry.
     state = _db_state_by_loop[asyncio.get_running_loop()]
-    assert key not in state["engines"]
+    assert key not in _engines_by_path
 
     # Should still work when reopened
     async with AsyncDB(temp_db, "items", TestItem) as db:
@@ -500,12 +502,12 @@ async def test_read_paths_skip_commit(temp_db):
         reader_commits = 0
         writer_commits = 0
 
-        @event.listens_for(reader.sync_engine, "commit")
+        @event.listens_for(reader, "commit")
         def _on_reader_commit(_conn):
             nonlocal reader_commits
             reader_commits += 1
 
-        @event.listens_for(writer.sync_engine, "commit")
+        @event.listens_for(writer, "commit")
         def _on_writer_commit(_conn):
             nonlocal writer_commits
             writer_commits += 1

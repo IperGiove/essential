@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.6.0 — 2026-09-01
+
+### The execution layer is synchronous; the API is unchanged
+
+`AsyncDB` now drives SQLAlchemy's **synchronous** engine and runs bounded queries
+inline on the event loop. Every public method is still `async def`, every call
+site keeps its `await`, and `transaction()` still yields something you
+`await conn.execute(...)` on — including the migration files sitting in consumer
+repos, which get an adapter rather than a bare connection.
+
+The reason is a measurement. A point SELECT on a warm page cache is **4
+microseconds**; reaching it through aiosqlite + SQLAlchemy's async bridge cost
+**247**. aiosqlite hands each statement to a worker thread and back — one full
+event-loop yield per statement — and the async bridge adds greenlet round trips
+on top, all to keep the loop free during a wait that does not exist for a local
+file. The loop was being suspended for 4 microseconds of work and 240 of
+ceremony.
+
+What keeps this honest is that "bounded" is checked, not assumed. `_bounded()`
+asks the SCHEMA whether the query can be answered from the primary key, a
+declared index, a unique column or a LIMIT. If it can, it runs inline. If it
+cannot — `fetch_all()`, `aggregate()`, `stream()`, a filter on an unindexed
+column, a batch write whose size the caller chose — it goes to a worker thread,
+because that is the query that can hold the loop for as long as the table is big.
+
+Measured with `benchmarks/db_bench.py`, same machine, same run:
+
+| workload | 0.5.1 | 0.6.0 |
+|---|---|---|
+| 50 sequential `get_by_id` | 1,867/s | **4,912/s** |
+| 25 concurrent `find(limit=100)` | 259/s | **1,499/s** |
+| 50 filtered `find` | 503/s | **850/s** |
+| 50 sequential `save()` | 940/s | **2,240/s** (p99 6.65 ms → 1.13 ms) |
+| 50 `update_fields` | 1,527/s | **4,767/s** |
+| batch insert | 29,756/s | **39,142/s** |
+
+End to end on a FastAPI page issuing 11 queries: 122 → 335 req/s. Hand-written
+`sqlite3` on the same page reaches 471, so the gap that used to argue for
+dropping this layer in favour of raw SQL is now 1.4x.
+
+### Fix: `transaction()` could hand two callers one transaction
+
+This is why 0.6.0 is not merely a speed release. `transaction()` deliberately did
+not take the write lock, on the grounds that "the writer engine uses a StaticPool
+of size 1, so two concurrent writers queue at the pool level". StaticPool does
+not queue — it hands the **same connection** to every caller. Two overlapping
+transactions therefore shared one connection and one transaction: the second
+`BEGIN` raised `cannot start a transaction within a transaction`, and when the
+timing let both through, a rollback in one erased writes the other had already
+been told were committed. On a signup endpoint under a 200-caller rush that
+produced 36 success responses against 30 rows — the data consistent, the answers
+not.
+
+A write transaction now holds the per-loop write lock for the whole block, so
+concurrent transactions queue. Callers who had noticed and wrapped their own
+mutex around it can drop it. `tests/test_db_sync_layer.py` pins the three
+properties (no interleaving, no cross-transaction rollback, single writes queue
+behind an open transaction); all three fail against 0.5.1.
+
+### Fix: `close()` never actually checkpointed the WAL
+
+`PRAGMA wal_checkpoint(TRUNCATE)` ran while both connection pools were still
+open, so SQLite refused it with "database table is locked" — logged at DEBUG,
+i.e. nowhere — and the `-wal` file carried across restarts instead of folding
+back into the database. The checkpoint now runs last, on its own connection,
+after both engines are disposed. Measured: a 1.8 MB `-wal` that used to survive
+`close()` is now gone.
+
+### New: `db.col("name")`
+
+The column object, for the write the database must compute itself:
+`update_many({"taken": db.col("taken") + 1}, id=x, taken__lt=db.col("capacity"))`.
+Read-modify-write in Python is the most common way to lose data on this layer,
+and it does not take multiple processes: 200 coroutines each reading a counter
+before any of them writes land 200 increments as one. Measured on a real
+endpoint, 200 concurrent claims on a 30-seat course wrote 91 rows through
+read-then-write and exactly 30 through a single atomic statement. Naming a column
+also lets a filter compare two of them, which is what removes the window between
+"check the capacity" and "insert".
+
+### Also
+
+- Engines are process-global instead of per-event-loop (a synchronous engine has
+  no loop to be bound to), which removes the "bound to a different event loop"
+  class of failure the per-loop registry existed to work around. The write locks
+  stay per-loop, because `asyncio.Lock` does bind.
+- Engines and the schema-init flag are cached on the instance: reaching them used
+  to cost a WeakKeyDictionary lookup keyed on the running loop plus a dict lookup
+  on every call.
+
 ## 0.5.1 — 2026-07-27
 
 ### Fix: NULLs were counted as duplicates, refusing valid UNIQUE indexes

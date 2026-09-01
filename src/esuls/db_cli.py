@@ -22,6 +22,7 @@ import contextlib
 import dataclasses
 import enum
 import importlib.util
+import inspect
 import json
 import random
 import re
@@ -46,10 +47,9 @@ from sqlalchemy import (
     LargeBinary, MetaData, Table, Text, UniqueConstraint, and_, delete, event,
     func, literal, select, text, update,
 )
+from sqlalchemy import create_engine
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.ext.asyncio import (
-    AsyncConnection, AsyncEngine, create_async_engine,
-)
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import TypeDecorator
@@ -225,41 +225,104 @@ def _types_equivalent(live: str, declared: str) -> bool:
     return frozenset({a, b}) in _EQUIVALENT_TYPES
 
 
-# ─── per-loop registry ───────────────────────────────────────────────────
+# ─── engines (process-global, SYNCHRONOUS) + per-loop locks ──────────────
 #
-# asyncio.Lock and SQLA AsyncEngine both bind to the running event loop on
-# first use; reusing across loops fails with `bound to a different event
-# loop`. State is keyed in a WeakKeyDictionary on the loop object — when a
-# loop is GC'd its entry is dropped automatically.
+# The engines are SQLAlchemy's SYNCHRONOUS engines, and the public API stays
+# `async def`. That combination is deliberate, and it is where most of this
+# layer's speed comes from.
+#
+# A local SQLite query is not I/O in any sense asyncio cares about: measured on
+# a warm page cache, a point SELECT is **4 microseconds**. Reaching it through
+# the async stack cost 247 — aiosqlite hands the statement to a worker thread
+# and back (one full event-loop yield per statement), and SQLA's async layer
+# bridges every call through greenlets on top. Both exist to keep the loop free
+# during a wait that, here, does not exist: the loop was being suspended for
+# 4 microseconds of work and 240 of ceremony.
+#
+# So the driver work happens inline, on the loop, and the awaitable surface is
+# kept for the callers (and because the operations that CAN be slow still need
+# it). The contract that keeps this honest is bounded work — see
+# `AsyncDB._in_thread`: anything that can touch a whole table (fetch_all,
+# stream, aggregate, unfiltered scans, batch writes) is off-loaded to a thread;
+# anything bounded by a primary key, an index or a LIMIT runs inline.
+#
+# Engines are process-global because a synchronous engine has no event loop to
+# be bound to — which also removes the "bound to a different event loop" class
+# of failure the per-loop registry existed to work around. What still binds to
+# a loop is `asyncio.Lock`, so the write locks stay per-loop.
+
+_engines_by_path: "dict[str, tuple[Engine, Engine]]" = {}
+_initialized_dbs: "set[str]" = set()
+_db_state_guard = threading.Lock()
 
 _db_state_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict]" = (
     weakref.WeakKeyDictionary()
 )
-_db_state_guard = threading.Lock()
 
 
 def _db_loop_state() -> dict:
-    """Return per-loop state.
+    """Return per-loop lock state.
 
     Keys:
-      - "locks"            dict[str, asyncio.Lock]            per-db-path write lock
-      - "schema_init_lock" asyncio.Lock                       serialises schema init
-      - "initialized"      set[str]                            _db_key dedupe
-      - "engines"          dict[str, tuple[AsyncEngine, AsyncEngine]]
-                           (writer, reader) keyed by absolute db_path str
+      - "locks"            dict[str, asyncio.Lock]   per-db-path write lock
+      - "schema_init_lock" asyncio.Lock              serialises schema init
     """
     loop = asyncio.get_running_loop()
     with _db_state_guard:
         state = _db_state_by_loop.get(loop)
         if state is None:
-            state = {
-                "locks": {},
-                "schema_init_lock": asyncio.Lock(),
-                "initialized": set(),
-                "engines": {},
-            }
+            state = {"locks": {}, "schema_init_lock": asyncio.Lock()}
             _db_state_by_loop[loop] = state
         return state
+
+
+def _drop_engines(db_path: Path) -> None:
+    """Forget the cached engines for `db_path` (stale connection recovery)."""
+    key = str(db_path)
+    with _db_state_guard:
+        _engines_by_path.pop(key, None)
+        for k in [k for k in _initialized_dbs if k.startswith(key)]:
+            _initialized_dbs.discard(k)
+
+
+class _AwaitableConn:
+    """A synchronous `Connection` that still answers `await conn.execute(...)`.
+
+    The connection handed to `transaction()` and to a migration's `upgrade()`
+    is now synchronous, but every caller in the wild writes
+    `await conn.execute(text(...))` — including migration files sitting in
+    other repositories, which this package cannot edit and must not break. So
+    `execute` stays a coroutine function that does its work inline and hands
+    back the very same `CursorResult` the async API returned (SQLAlchemy's
+    async `execute` buffers into a sync result anyway, so `.fetchall()`,
+    `.scalar()`, `.mappings()` and `.rowcount` behave identically).
+
+    Everything else is proxied straight through, so `conn.begin()`,
+    `conn.in_transaction()`, `conn.exec_driver_sql()` keep working.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: Connection):
+        self._conn = conn
+
+    async def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    async def run_sync(self, fn, *args, **kwargs):
+        """Mirror of AsyncConnection.run_sync — the connection IS sync now."""
+        return fn(self._conn, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+ConnLike = Union[Connection, _AwaitableConn]
+
+
+def _raw_conn(conn: "ConnLike") -> Connection:
+    """Unwrap a caller-supplied connection to the synchronous one underneath."""
+    return conn._conn if isinstance(conn, _AwaitableConn) else conn
 
 
 # ─── TypeDecorators ──────────────────────────────────────────────────────
@@ -673,7 +736,7 @@ _PRAGMAS: tuple[str, ...] = (
 )
 
 
-def _attach_pragmas(engine: AsyncEngine) -> None:
+def _attach_pragmas(engine: Engine) -> None:
     """Install `connect` + `begin` event listeners on the engine.
 
     The `connect` listener sets all PRAGMAs on each new physical SQLite
@@ -685,10 +748,10 @@ def _attach_pragmas(engine: AsyncEngine) -> None:
     setting `isolation_level=None` switches us to manual transaction
     control. Without this, a failing migration that issued DDL would
     leave the DDL committed even though SQLA "rolled back" the txn —
-    because pysqlite/aiosqlite had implicitly committed it first.
+    because pysqlite had implicitly committed it first.
     """
 
-    @event.listens_for(engine.sync_engine, "connect")
+    @event.listens_for(engine, "connect")
     def _on_connect(dbapi_conn, _record):
         cur = dbapi_conn.cursor()
         try:
@@ -697,23 +760,13 @@ def _attach_pragmas(engine: AsyncEngine) -> None:
         finally:
             cur.close()
         # Make DDL transactional. See SQLA "Serializable isolation /
-        # Savepoints / Transactional DDL" recipe for pysqlite/aiosqlite.
+        # Savepoints / Transactional DDL" recipe for pysqlite.
         try:
             dbapi_conn.isolation_level = None
         except AttributeError:
             pass
-        # StaticPool keeps its conn forever. If the loop that created it
-        # dies, the aiosqlite worker thread (non-daemon by default) can
-        # keep the process alive. Mark it daemon so it dies with the
-        # process. This is the only aiosqlite-internal we still touch.
-        thread = getattr(dbapi_conn, "_thread", None)
-        if thread is not None and hasattr(thread, "daemon"):
-            try:
-                thread.daemon = True
-            except (AttributeError, TypeError):
-                pass
 
-    @event.listens_for(engine.sync_engine, "begin")
+    @event.listens_for(engine, "begin")
     def _do_begin(conn):
         # With isolation_level=None we issue BEGIN ourselves so SQLA's
         # transactional semantics work for DDL too.
@@ -724,7 +777,7 @@ class _EngineDisposalMarker:
     """Mutable token shared between `close()` and the GC finalizer.
 
     Stored in `_engine_markers` (a WeakKeyDictionary keyed on the engine,
-    because SQLA's AsyncEngine uses __slots__ and we can't tack on a
+    because SQLA's Engine does not accept arbitrary attributes, so we can't
     private attribute). `close()` flips `disposed=True` BEFORE actually
     disposing; the GC finalizer, when it later fires, checks the flag:
     still False ⇒ the user dropped the engine without calling `close()`,
@@ -739,7 +792,7 @@ class _EngineDisposalMarker:
 # Engine → marker map. WeakKeyDictionary auto-drops entries when the
 # engine is GC'd; the marker survives until the finalizer also runs
 # (the finalizer closes over the marker via its arg list).
-_engine_markers: "weakref.WeakKeyDictionary[AsyncEngine, _EngineDisposalMarker]" = (
+_engine_markers: "weakref.WeakKeyDictionary[Engine, _EngineDisposalMarker]" = (
     weakref.WeakKeyDictionary()
 )
 
@@ -764,31 +817,27 @@ def _maybe_warn_undisposed_engine(db_path: str, marker: _EngineDisposalMarker) -
     )
 
 
-def _get_engines(db_path: Path) -> tuple[AsyncEngine, AsyncEngine]:
-    """Return (writer, reader) engines for `db_path` in the current loop.
+def _get_engines(db_path: Path) -> tuple[Engine, Engine]:
+    """Return the process-wide (writer, reader) engines for `db_path`.
 
-    No active disposal happens from a finalizer — aiosqlite's close path
-    needs a running event loop / greenlet context and a finalizer
-    triggered at GC may be outside any. Instead we register a
-    `ResourceWarning` finalizer that fires only when the engine was
-    dropped without `close()`, surfacing the leak instead of letting it
-    go silent. The aiosqlite worker thread is daemon-marked in the
-    PRAGMA hook, so process exit is never blocked even on a leak.
+    No active disposal happens from a finalizer — a finalizer triggered at GC
+    may run at an arbitrary point. Instead we register a `ResourceWarning`
+    finalizer that fires only when the engine was dropped without `close()`,
+    surfacing the leak instead of letting it go silent.
     """
-    state = _db_loop_state()
-    engines = state["engines"]
     key = str(db_path)
-    pair = engines.get(key)
-    if pair is not None:
-        return pair
+    with _db_state_guard:
+        pair = _engines_by_path.get(key)
+        if pair is not None:
+            return pair
 
-    url = f"sqlite+aiosqlite:///{db_path}"
-    writer = create_async_engine(
+    url = f"sqlite:///{db_path}"
+    writer = create_engine(
         url,
         poolclass=StaticPool,           # one underlying conn; write lock serialises
         connect_args={"timeout": 30.0, "check_same_thread": False},
     )
-    reader = create_async_engine(
+    reader = create_engine(
         url,
         pool_size=4,
         max_overflow=4,
@@ -799,8 +848,7 @@ def _get_engines(db_path: Path) -> tuple[AsyncEngine, AsyncEngine]:
     _attach_pragmas(writer)
     _attach_pragmas(reader)
 
-    # Attach a disposal marker per engine via a WeakKeyDictionary (can't
-    # set arbitrary attrs on AsyncEngine — it uses __slots__). The
+    # Attach a disposal marker per engine via a WeakKeyDictionary. The
     # finalizer captures the marker in its arg list so it survives even
     # after the WKD entry is auto-cleaned on engine GC.
     for engine in (writer, reader):
@@ -808,7 +856,15 @@ def _get_engines(db_path: Path) -> tuple[AsyncEngine, AsyncEngine]:
         _engine_markers[engine] = marker
         weakref.finalize(engine, _maybe_warn_undisposed_engine, key, marker)
 
-    engines[key] = (writer, reader)
+    with _db_state_guard:
+        # Another thread may have built the pair while we were: keep theirs and
+        # drop ours, so the process never holds two engines for one file.
+        existing = _engines_by_path.get(key)
+        if existing is not None:
+            writer.dispose()
+            reader.dispose()
+            return existing
+        _engines_by_path[key] = (writer, reader)
     return writer, reader
 
 
@@ -823,7 +879,7 @@ def _get_engines(db_path: Path) -> tuple[AsyncEngine, AsyncEngine]:
 #     description = "Add email column to users"
 #
 #     async def upgrade(conn):
-#         await conn.execute(text("ALTER TABLE users ADD COLUMN email TEXT"))
+#         conn.execute(text("ALTER TABLE users ADD COLUMN email TEXT"))
 #
 # Validation rules:
 #   - filenames match `NNN_*.py` where NNN is the version (zero-padded ok)
@@ -845,7 +901,7 @@ _MIGRATION_FILENAME = re.compile(r"^(\d+)_[A-Za-z0-9_]+\.py$")
 class _Migration:
     version: int
     description: str
-    upgrade: Callable[["AsyncConnection"], Awaitable[None]]
+    upgrade: Callable[["ConnLike"], Awaitable[None]]
     source: Path
 
 
@@ -961,7 +1017,7 @@ def discover_migrations(migrations_dir: Path) -> List[Dict[str, Any]]:
 
 
 async def _apply_pending_migrations(
-    conn: "AsyncConnection", migrations_dir: Path
+    conn: "ConnLike", migrations_dir: Path
 ) -> List[int]:
     """Apply all migrations whose `version` > current `PRAGMA user_version`.
 
@@ -975,7 +1031,7 @@ async def _apply_pending_migrations(
     migrations = _discover_migrations(migrations_dir)
     if not migrations:
         return []
-    current = (await conn.execute(text("PRAGMA user_version"))).scalar() or 0
+    current = (conn.execute(text("PRAGMA user_version"))).scalar() or 0
     applied: List[int] = []
     for m in migrations:
         if m.version <= current:
@@ -983,10 +1039,14 @@ async def _apply_pending_migrations(
         logger.info(
             f"applying migration {m.version}: {m.description} ({m.source.name})"
         )
-        await m.upgrade(conn)
+        # Migration files live in the SITE's repo and are written
+        # `async def upgrade(conn): await conn.execute(...)`. They must keep
+        # working untouched, so they get the awaitable adapter, never the
+        # bare connection.
+        await m.upgrade(_AwaitableConn(_raw_conn(conn)))
         # PRAGMA user_version doesn't accept bound parameters; embed an
         # already-validated int directly.
-        await conn.execute(text(f"PRAGMA user_version = {int(m.version)}"))
+        conn.execute(text(f"PRAGMA user_version = {int(m.version)}"))
         applied.append(m.version)
     return applied
 
@@ -1183,11 +1243,68 @@ class AsyncDB(Generic[SchemaType]):
         self._table: Table = _table_from_schema(
             self._metadata, self.table_name, schema_class
         )
+        # Engines + schema flag cached on the instance: every call used to walk
+        # a WeakKeyDictionary keyed on the running loop and a dict keyed on the
+        # path just to reach them, and at 4 microseconds of actual query that
+        # bookkeeping is not a rounding error.
+        self._engines: Optional[tuple[Engine, Engine]] = None
+        self._schema_ready = False
+        # Columns a query can be BOUNDED by: the primary key and anything
+        # declared `index` or `unique`. `_bounded()` reads this to decide
+        # whether a read runs inline or goes to a thread.
+        self._indexed_columns: set[str] = {c.name for c in self._table.primary_key}
+        for _idx in self._table.indexes:
+            self._indexed_columns.update(c.name for c in _idx.columns)
+        self._indexed_columns.update(
+            c.name for c in self._table.columns if c.unique or c.primary_key
+        )
 
-    # ──────────────── engines + write lock (per-loop) ────────────────
+    # ──────────────── engines + write lock ────────────────
+
+    def _bounded(self, filters: Dict[str, Any], limit: Optional[int]) -> bool:
+        """Is this read guaranteed to touch a bounded slice of the table?
+
+        The whole point of executing inline is that a point read is 4
+        microseconds — a thread hop costs ten times that. But the same code path
+        also serves `find()` over a million rows, and THAT must not sit on the
+        event loop. So the split is by what the query can touch, not by which
+        method was called: a LIMIT, or a filter on the primary key / an indexed
+        / a unique column, means SQLite walks an index and stops. Anything else
+        may scan, and a scan goes to a thread.
+
+        Deliberately conservative: an unindexed filter is treated as a scan even
+        when it happens to match two rows, because the schema is what we can
+        check and the data is not.
+        """
+        if limit is not None:
+            return True
+        if not filters:
+            return False
+        return any(
+            key.split("__", 1)[0] in self._indexed_columns for key in filters
+        )
+
+    async def _read(self, fn, *, bounded: bool):
+        """Execute a read: inline when bounded, in a worker thread otherwise."""
+        _, reader = await self._ensure_engines()
+
+        def _run():
+            with reader.connect() as conn:
+                return fn(conn)
+
+        if bounded:
+            return _run()
+        return await asyncio.to_thread(_run)
 
     async def _get_write_lock(self) -> asyncio.Lock:
-        """Return the per-loop, per-db-path write lock."""
+        """Return the per-loop, per-db-path write lock.
+
+        Still an `asyncio.Lock` and still per-loop, because that is the one
+        thing a synchronous engine does NOT make unnecessary. A single
+        statement no longer needs it — it runs inline with no await inside, so
+        the loop cannot interleave two of them — but `transaction()` yields to
+        caller code that awaits, and that is where writers must queue.
+        """
         state = _db_loop_state()
         locks = state["locks"]
         key = str(self.db_path)
@@ -1197,20 +1314,22 @@ class AsyncDB(Generic[SchemaType]):
             locks[key] = lock
         return lock
 
-    async def _ensure_engines(self) -> tuple[AsyncEngine, AsyncEngine]:
+    async def _ensure_engines(self) -> tuple[Engine, Engine]:
         """Get/create the (writer, reader) pair; run schema init if needed."""
-        writer, reader = _get_engines(self.db_path)
-        await self._ensure_schema_initialized()
-        return writer, reader
+        if self._engines is None:
+            self._engines = _get_engines(self.db_path)
+        if not self._schema_ready:
+            await self._ensure_schema_initialized()
+        return self._engines
 
     async def _ensure_schema_initialized(
-        self, conn: Optional[AsyncConnection] = None,
+        self, conn: Optional["ConnLike"] = None,
     ) -> None:
-        """Run schema init + pending migrations once per (instance, loop).
+        """Run schema init + pending migrations once per (instance, process).
 
         When called without `conn` (the normal path), it opens its own
         `writer.begin()` and does the work inside that transaction, then
-        caches the result in `state["initialized"]` so subsequent calls
+        caches the result in `_initialized_dbs` so subsequent calls
         are no-ops.
 
         When called WITH `conn` (the `save(conn=...)` path), it runs on
@@ -1222,11 +1341,13 @@ class AsyncDB(Generic[SchemaType]):
         ALTER ADD COLUMN only on missing columns, migrations gated by
         PRAGMA user_version), so re-running is safe and cheap.
         """
-        state = _db_loop_state()
-        if self._db_key in state["initialized"]:
+        if self._db_key in _initialized_dbs:
+            self._schema_ready = True
             return
+        state = _db_loop_state()
         async with state["schema_init_lock"]:
-            if self._db_key in state["initialized"]:
+            if self._db_key in _initialized_dbs:
+                self._schema_ready = True
                 return
             if conn is not None:
                 # Inline path: schema-init runs on the caller's conn so
@@ -1234,14 +1355,15 @@ class AsyncDB(Generic[SchemaType]):
                 # deliberately don't mark as initialized — if the caller
                 # rolls back, the CREATE TABLE rolls back too and the
                 # next call must redo it.
-                await self._init_or_migrate_schema(conn)
+                await self._init_or_migrate_schema(_raw_conn(conn))
                 return
             writer, _ = _get_engines(self.db_path)
-            async with writer.begin() as own_conn:
+            with writer.begin() as own_conn:
                 await self._init_or_migrate_schema(own_conn)
-            state["initialized"].add(self._db_key)
+            _initialized_dbs.add(self._db_key)
+            self._schema_ready = True
 
-    async def _init_or_migrate_schema(self, conn: AsyncConnection) -> None:
+    async def _init_or_migrate_schema(self, conn: Connection) -> None:
         """Create-on-first-run or add missing columns on schema drift.
 
         Order is load-bearing: ALTER TABLE ADD COLUMN must run BEFORE the
@@ -1253,7 +1375,7 @@ class AsyncDB(Generic[SchemaType]):
         orphan columns) as warnings — or as `RuntimeError` when
         `strict_schema=True`.
         """
-        result = await conn.execute(
+        result = conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='table' AND name=:n"),
             {"n": self.table_name},
         )
@@ -1261,7 +1383,7 @@ class AsyncDB(Generic[SchemaType]):
 
         if not table_exists:
             # Fresh table — create_all handles columns and indexes in one shot.
-            await conn.run_sync(self._metadata.create_all)
+            self._metadata.create_all(conn)
             # Fresh DB: the dataclass-driven schema is by definition "at
             # the latest version", so we leap-frog `PRAGMA user_version`
             # to the max declared migration. Otherwise the next start
@@ -1272,7 +1394,7 @@ class AsyncDB(Generic[SchemaType]):
                 migs = _discover_migrations(self.migrations_dir)
                 if migs:
                     max_version = migs[-1].version
-                    await conn.execute(
+                    conn.execute(
                         text(f"PRAGMA user_version = {int(max_version)}")
                     )
             return
@@ -1280,7 +1402,7 @@ class AsyncDB(Generic[SchemaType]):
         # Existing table — retrofit missing columns. SQLite's ADD COLUMN
         # cannot enforce NOT NULL retroactively, so all retrofits are
         # NULL-able regardless of `required=True` on the dataclass.
-        info = await conn.execute(
+        info = conn.execute(
             text(f'PRAGMA table_info("{self.table_name}")')
         )
         existing = {row[1] for row in info.fetchall()}
@@ -1289,7 +1411,7 @@ class AsyncDB(Generic[SchemaType]):
             if col.name in existing:
                 continue
             type_ddl = col.type.compile(dialect=conn.dialect)
-            await conn.execute(
+            conn.execute(
                 text(
                     f'ALTER TABLE "{self.table_name}" '
                     f'ADD COLUMN "{col.name}" {type_ddl}'
@@ -1311,7 +1433,7 @@ class AsyncDB(Generic[SchemaType]):
         # whole thing and leaves `PRAGMA user_version` at its prior value.
         await _apply_pending_migrations(conn, self.migrations_dir)
 
-    async def _ensure_indexes(self, conn: AsyncConnection) -> list[str]:
+    async def _ensure_indexes(self, conn: Connection) -> list[str]:
         """Create every declared index the live table is missing.
 
         Needed because SQLAlchemy's `create_all(checkfirst=True)` emits NOTHING
@@ -1330,7 +1452,7 @@ class AsyncDB(Generic[SchemaType]):
 
         Returns the columns left unenforced (empty when everything is in place).
         """
-        rows = await conn.execute(text(
+        rows = conn.execute(text(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :t"
         ), {"t": self.table_name})
         present = {r[0] for r in rows.fetchall()}
@@ -1353,7 +1475,7 @@ class AsyncDB(Generic[SchemaType]):
                 # happily. For a composite index the row is exempt if ANY of its
                 # columns is NULL, matching SQLite's own rule.
                 not_null = " AND ".join(f'"{c}" IS NOT NULL' for c in cols)
-                dupes = await conn.execute(text(
+                dupes = conn.execute(text(
                     f'SELECT COUNT(*) FROM (SELECT 1 FROM "{self.table_name}" '
                     f"WHERE {not_null} GROUP BY {quoted} HAVING COUNT(*) > 1)"
                 ))
@@ -1367,7 +1489,7 @@ class AsyncDB(Generic[SchemaType]):
                     continue
 
             unique_sql = "UNIQUE " if index.unique else ""
-            await conn.execute(text(
+            conn.execute(text(
                 f'CREATE {unique_sql}INDEX IF NOT EXISTS "{index.name}" '
                 f'ON "{self.table_name}" ({quoted})'
             ))
@@ -1379,7 +1501,7 @@ class AsyncDB(Generic[SchemaType]):
 
     async def _check_schema_drift(
         self,
-        conn: AsyncConnection,
+        conn: Connection,
         retrofit_names: set[str],
     ) -> None:
         """Diff live schema against dataclass and surface issues.
@@ -1400,7 +1522,7 @@ class AsyncDB(Generic[SchemaType]):
         """
         issues: list[str] = []
 
-        info = await conn.execute(
+        info = conn.execute(
             text(f'PRAGMA table_info("{self.table_name}")')
         )
         live_by_name = {row[1]: row for row in info.fetchall()}
@@ -1460,24 +1582,21 @@ class AsyncDB(Generic[SchemaType]):
     async def close(self) -> None:
         """Run PRAGMA optimize + checkpoint, then dispose both engines.
 
-        Idempotent — a second call is a no-op. The per-loop `initialized`
-        flag is cleared too so the next operation re-runs schema init
-        against fresh engines.
+        Idempotent — a second call is a no-op. The `initialized` flag is
+        cleared too so the next operation re-runs schema init against fresh
+        engines.
 
         Flips each engine's `_EngineDisposalMarker.disposed` flag BEFORE
         calling `dispose()` so the GC finalizer, when it later fires,
         recognises this as a clean teardown and does NOT emit the
         "engine GC'd without close" `ResourceWarning`.
         """
-        try:
-            state = _db_loop_state()
-        except RuntimeError:
-            # Called outside an event loop (e.g. atexit). Nothing to do —
-            # the GC finalizer's ResourceWarning is the only signal here.
-            return
         key = str(self.db_path)
-        pair = state["engines"].pop(key, None)
-        state["initialized"].discard(self._db_key)
+        with _db_state_guard:
+            pair = _engines_by_path.pop(key, None)
+            _initialized_dbs.discard(self._db_key)
+        self._engines = None
+        self._schema_ready = False
         if pair is None:
             return
         writer, reader = pair
@@ -1489,27 +1608,37 @@ class AsyncDB(Generic[SchemaType]):
             if marker is not None:
                 marker.disposed = True
         try:
-            async with writer.connect() as conn:
-                await conn.execute(text("PRAGMA optimize"))
-                await conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+            with writer.connect() as conn:
+                conn.execute(text("PRAGMA optimize"))
         except Exception as e:
-            logger.debug(f"close(): PRAGMA optimize/checkpoint skipped: {e}")
+            logger.debug(f"close(): PRAGMA optimize skipped: {e}")
+        for engine in (reader, writer):
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+        # The checkpoint runs LAST, on a connection of its own, because
+        # `wal_checkpoint(TRUNCATE)` needs every other connection to the file
+        # closed — and both pools were still holding theirs. It has been failing
+        # this whole time, logging "database table is locked" at DEBUG (i.e.
+        # nowhere) and leaving the -wal file to carry across restarts instead of
+        # folding back into the database. Cheap to do right, invisible when wrong.
         try:
-            await writer.dispose()
-        except Exception:
-            pass
-        try:
-            await reader.dispose()
-        except Exception:
-            pass
+            raw = sqlite3.connect(str(self.db_path), timeout=5.0)
+            try:
+                raw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                raw.close()
+        except Exception as e:
+            logger.debug(f"close(): wal_checkpoint skipped: {e}")
 
     async def checkpoint(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
         """Run `PRAGMA wal_checkpoint(<mode>)`. Returns (busy, log, checkpointed)."""
         if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
             raise ValueError(f"Invalid checkpoint mode: {mode!r}")
         writer, _ = await self._ensure_engines()
-        async with writer.connect() as conn:
-            result = await conn.execute(text(f"PRAGMA wal_checkpoint({mode})"))
+        with writer.connect() as conn:
+            result = conn.execute(text(f"PRAGMA wal_checkpoint({mode})"))
             row = result.fetchone()
             return tuple(row) if row else (0, 0, 0)
 
@@ -1533,8 +1662,8 @@ class AsyncDB(Generic[SchemaType]):
         if not migs:
             return []
         writer, _ = await self._ensure_engines()
-        async with writer.connect() as conn:
-            current = (await conn.execute(text("PRAGMA user_version"))).scalar() or 0
+        with writer.connect() as conn:
+            current = (conn.execute(text("PRAGMA user_version"))).scalar() or 0
         return [
             {
                 "version": m.version,
@@ -1547,7 +1676,7 @@ class AsyncDB(Generic[SchemaType]):
 
     @contextlib.asynccontextmanager
     async def transaction(self, read_only: bool = False):
-        """Yield a SQLA `AsyncConnection`.
+        """Yield a connection whose `execute()` you still `await`.
 
         - Writer (`read_only=False`): wrapped in `engine.begin()` — autocommit
           on clean exit, rollback on exception.
@@ -1558,12 +1687,22 @@ class AsyncDB(Generic[SchemaType]):
         Use `await conn.execute(text("...raw SQL..."))` for raw queries; SQLA
         2.0 requires textual SQL to be wrapped in `text()`.
 
-        Concurrency contract for writes: `transaction(read_only=False)` does
-        NOT acquire the per-loop write lock that the high-level write
-        methods take. Serialisation still happens because the writer
-        engine uses a `StaticPool` of size 1 — only one physical aiosqlite
-        connection exists, so two concurrent writers queue at the pool
-        level rather than at the lock.
+        Concurrency contract for writes: the write transaction HOLDS the
+        per-loop write lock for the whole block. It has to, and the version
+        that did not was actively dangerous. The reasoning that excused it —
+        "the writer engine is a StaticPool of size 1, so writers queue at the
+        pool" — is wrong about StaticPool: it does not queue, it hands the SAME
+        connection to every caller. Two requests whose transactions overlapped
+        therefore shared one connection and one transaction, so the second one's
+        `BEGIN` raised "cannot start a transaction within a transaction", and
+        when the timing let both in, a rollback in one erased writes the other
+        had already been told were committed. Measured on a signup endpoint:
+        36 callers got a success response, 30 rows existed. Holding the lock
+        makes concurrent transactions queue instead — which is what the callers
+        that had noticed were already doing by hand with their own mutex.
+
+        The lock is per PROCESS (per loop, per db path). Across processes the
+        arbiter is SQLite's own file lock plus `busy_timeout`, exactly as before.
 
         Multi-table atomic writes: to mix several AsyncDB instances inside
         one transaction (e.g. saving a Company row and an AccrediaCache
@@ -1583,23 +1722,48 @@ class AsyncDB(Generic[SchemaType]):
         is the caller's to retry, not ours).
         """
         writer, reader = await self._ensure_engines()
-        engine = reader if read_only else writer
         try:
             if read_only:
-                async with engine.connect() as conn:
-                    yield conn
+                # Readers never conflict under WAL: no lock, no BEGIN.
+                with reader.connect() as conn:
+                    yield _AwaitableConn(conn)
             else:
-                async with engine.begin() as conn:
-                    yield conn
+                lock = await self._get_write_lock()
+                async with lock:
+                    with writer.begin() as conn:
+                        yield _AwaitableConn(conn)
         except Exception as e:
             if _is_stale_connection(e):
-                # Drop the engines so the next call rebuilds them.
-                state = _db_loop_state()
-                state["engines"].pop(str(self.db_path), None)
-                state["initialized"].discard(self._db_key)
+                _drop_engines(self.db_path)
+                self._engines = None
+                self._schema_ready = False
             raise
 
     # ──────────────── validation helpers ────────────────
+
+    def col(self, name: str) -> ColumnElement:
+        """The SQL column, for the write the database must compute ITSELF.
+
+            taken = DB_COURSE.col("taken")
+            claimed = await DB_COURSE.update_many(
+                {"taken": taken + 1},                    # SET taken = taken + 1
+                id=course_id, taken__lt=DB_COURSE.col("capacity"),
+            )
+
+        Read-modify-write in Python — read the row, add one, write it back — is
+        the single most common way to lose data on this layer, and concurrency
+        does not have to mean processes: 200 coroutines each reading the same
+        counter before any of them writes lands 200 increments as one. Measured
+        on a real endpoint: 200 concurrent claims on a 30-seat course produced 91
+        rows through the read-then-write path, and exactly 30 through this one.
+
+        Naming a column also lets a filter compare two columns
+        (`taken__lt=self.col("capacity")`), which is what turns "check the
+        capacity, then insert" into a single statement with no window in it.
+
+        Raises `ValueError` for a name the schema doesn't declare.
+        """
+        return self._table.c[self._validate_column(name)]
 
     def _validate_column(self, name: str) -> str:
         if name not in self._valid_columns:
@@ -1774,16 +1938,29 @@ class AsyncDB(Generic[SchemaType]):
             set_=update_cols,
         )
 
-    async def _execute_with_retry(self, action, *, max_retries: int = 3):
-        """Run `action` (async no-arg callable) with BUSY/stale retries.
+    async def _execute_with_retry(self, action, *, max_retries: int = 3,
+                                  in_thread: bool = False):
+        """Run `action` (a SYNCHRONOUS no-arg callable) with BUSY/stale retries.
 
-        Exponential backoff on BUSY/LOCKED; stale-connection errors drop
-        the per-loop engine cache so the next attempt builds a fresh pair.
+        Exponential backoff on BUSY/LOCKED; stale-connection errors drop the
+        engine cache so the next attempt builds a fresh pair. The action runs
+        inline — the sleep between attempts is the only await, which is exactly
+        what it should be: the loop is released while WAITING, not while working.
         """
         last_error = None
         for attempt in range(max_retries):
             try:
-                return await action()
+                # A batch is the one write whose size the caller chooses, so it
+                # is the one that can hold the loop for as long as the list is
+                # long. It runs in a thread — safely, because the caller holds
+                # the write lock, so no other writer can reach the connection.
+                result = await asyncio.to_thread(action) if in_thread else action()
+                # The action is normally synchronous now, but an async one still
+                # works: callers outside this module (and the tests that pin the
+                # retry policy) predate the change.
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
@@ -1803,9 +1980,9 @@ class AsyncDB(Generic[SchemaType]):
                         await asyncio.sleep(wait_time)
                         continue
                     if _is_stale_connection(e):
-                        state = _db_loop_state()
-                        state["engines"].pop(str(self.db_path), None)
-                        state["initialized"].discard(self._db_key)
+                        _drop_engines(self.db_path)
+                        self._engines = None
+                        self._schema_ready = False
                         logger.debug(
                             f"Stale connection, reconnecting "
                             f"(retry {attempt + 1}/{max_retries})"
@@ -1823,7 +2000,7 @@ class AsyncDB(Generic[SchemaType]):
         *,
         on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
     ) -> bool:
         """Atomically insert or upsert one item.
 
@@ -1842,7 +2019,7 @@ class AsyncDB(Generic[SchemaType]):
         etc. — always propagate so bugs in the caller don't hide as
         "save failed". Set `skip_errors=False` to surface DB errors too.
 
-        `conn` lets the caller inject their own open `AsyncConnection`
+        `conn` lets the caller inject their own open connection
         (typically from `async with another_db.transaction(): ...`) so
         multiple AsyncDBs sharing a single SQLite file can write inside
         one atomic transaction. When `conn` is passed:
@@ -1884,7 +2061,7 @@ class AsyncDB(Generic[SchemaType]):
             # also run on their conn so the DDL is atomic with the rest.
             try:
                 await self._ensure_schema_initialized(conn)
-                await conn.execute(stmt)
+                _raw_conn(conn).execute(stmt)
                 return True
             except (sa_exc.SQLAlchemyError, sqlite3.Error) as e:
                 if skip_errors:
@@ -1894,16 +2071,17 @@ class AsyncDB(Generic[SchemaType]):
                     return False
                 raise
 
-        async def _do() -> bool:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    await own_conn.execute(stmt)
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
+
+        def _do() -> bool:
+            with writer.begin() as own_conn:
+                own_conn.execute(stmt)
             return True
 
         try:
-            return await self._execute_with_retry(_do, max_retries=max_retries)
+            async with write_lock:
+                return await self._execute_with_retry(_do, max_retries=max_retries)
         except (sa_exc.SQLAlchemyError, sqlite3.Error) as e:
             if skip_errors:
                 logger.warning(f"save(): DB error (skipped): {e}")
@@ -1916,7 +2094,7 @@ class AsyncDB(Generic[SchemaType]):
         *,
         on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
         **deprecated_kwargs,
     ) -> int:
         """Save many items atomically via `executemany` — fail-fast.
@@ -1976,20 +2154,23 @@ class AsyncDB(Generic[SchemaType]):
             await self._ensure_schema_initialized(conn)
             rows = [self._item_to_row(it) for it in items]
             stmt = self._build_upsert(conflict_target)
-            await conn.execute(stmt, rows)
+            _raw_conn(conn).execute(stmt, rows)
             return len(rows)
 
-        async def _do() -> int:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    rows = [self._item_to_row(it) for it in items]
-                    stmt = self._build_upsert(conflict_target)
-                    await own_conn.execute(stmt, rows)
-                    return len(rows)
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
 
-        return await self._execute_with_retry(_do, max_retries=max_retries)
+        def _do() -> int:
+            with writer.begin() as own_conn:
+                rows = [self._item_to_row(it) for it in items]
+                stmt = self._build_upsert(conflict_target)
+                own_conn.execute(stmt, rows)
+                return len(rows)
+
+        async with write_lock:
+            return await self._execute_with_retry(
+                _do, max_retries=max_retries, in_thread=True
+            )
 
     async def save_each(
         self,
@@ -1997,7 +2178,7 @@ class AsyncDB(Generic[SchemaType]):
         *,
         on_conflict: Optional[Union[str, Tuple[str, ...], List[str]]] = None,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
     ) -> int:
         """Save items one-by-one inside a single transaction, skipping rotten ones.
 
@@ -2017,7 +2198,7 @@ class AsyncDB(Generic[SchemaType]):
             return 0
         conflict_target = self._resolve_conflict_target(on_conflict)
 
-        async def _loop(c: AsyncConnection) -> int:
+        def _loop(c: Connection) -> int:
             saved = 0
             for item in items:
                 try:
@@ -2029,7 +2210,7 @@ class AsyncDB(Generic[SchemaType]):
                         continue
                     row = self._item_to_row(item)
                     stmt = self._build_upsert(conflict_target).values(**row)
-                    await c.execute(stmt)
+                    c.execute(stmt)
                     saved += 1
                 except Exception as e:
                     logger.warning(f"save_each skipped item: {e}")
@@ -2038,28 +2219,29 @@ class AsyncDB(Generic[SchemaType]):
 
         if conn is not None:
             await self._ensure_schema_initialized(conn)
-            return await _loop(conn)
+            return _loop(_raw_conn(conn))
 
-        async def _do() -> int:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    return await _loop(own_conn)
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
 
-        return await self._execute_with_retry(_do, max_retries=max_retries)
+        def _do() -> int:
+            with writer.begin() as own_conn:
+                return _loop(own_conn)
+
+        async with write_lock:
+            return await self._execute_with_retry(
+                _do, max_retries=max_retries, in_thread=True
+            )
 
     async def get_by_id(
         self, record_id: Union[str, int]
     ) -> Optional[SchemaType]:
         """Fetch by primary key. Accepts `str` (UUID/IdModel/TimestampedModel)
         or `int` (IntIdModel) since the PK type depends on the schema."""
-        _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.execute(
-                select(self._table).where(self._table.c.id == record_id)
-            )
-            row = result.mappings().first()
+        stmt = select(self._table).where(self._table.c.id == record_id)
+        row = await self._read(
+            lambda c: c.execute(stmt).mappings().first(), bounded=True
+        )
         if row is None:
             return None
         return self.schema_class(**dict(row))
@@ -2106,10 +2288,11 @@ class AsyncDB(Generic[SchemaType]):
         if offset is not None:
             stmt = stmt.offset(offset)
 
-        _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.execute(stmt)
-            return [self.schema_class(**dict(row)) for row in result.mappings()]
+        rows = await self._read(
+            lambda c: c.execute(stmt).mappings().all(),
+            bounded=self._bounded(filters, limit),
+        )
+        return [self.schema_class(**dict(row)) for row in rows]
 
     async def find_columns(
         self,
@@ -2154,19 +2337,20 @@ class AsyncDB(Generic[SchemaType]):
         if offset is not None:
             stmt = stmt.offset(offset)
 
-        _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.execute(stmt)
-            return [dict(row) for row in result.mappings()]
+        rows = await self._read(
+            lambda c: c.execute(stmt).mappings().all(),
+            bounded=self._bounded(filters, limit),
+        )
+        return [dict(row) for row in rows]
 
     async def count(self, **filters) -> int:
         stmt = select(func.count()).select_from(self._table)
         for clause in self._build_filter_clause(filters):
             stmt = stmt.where(clause)
-        _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.execute(stmt)
-            return result.scalar_one()
+        return await self._read(
+            lambda c: c.execute(stmt).scalar_one(),
+            bounded=self._bounded(filters, None),
+        )
 
     async def fetch_all(self) -> List[SchemaType]:
         return await self.find()
@@ -2200,10 +2384,7 @@ class AsyncDB(Generic[SchemaType]):
         if clauses:
             stmt = stmt.where(and_(*clauses))
         stmt = stmt.limit(1)
-        _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.execute(stmt)
-            return result.first() is not None
+        return await self._read(lambda c: c.execute(stmt).first() is not None, bounded=True)
 
     async def aggregate(
         self,
@@ -2340,10 +2521,8 @@ class AsyncDB(Generic[SchemaType]):
         if limit is not None:
             stmt = stmt.limit(limit)
 
-        _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.execute(stmt)
-            return [dict(row) for row in result.mappings()]
+        rows = await self._read(lambda c: c.execute(stmt).mappings().all(), bounded=False)
+        return [dict(row) for row in rows]
 
     async def stream(
         self,
@@ -2353,13 +2532,13 @@ class AsyncDB(Generic[SchemaType]):
     ) -> AsyncIterator[SchemaType]:
         """Yield rows one at a time without loading everything into memory.
 
-        Uses SQLA's `conn.stream(...)` with `yield_per=batch_size` to
-        fetch in chunks from the cursor. Designed for tables too large
-        to materialise via `find()`.
+        Fetches `batch_size` rows at a time from a server-side cursor, so a
+        table too large to materialise via `find()` never lands in memory at
+        once. Each FETCH runs in a worker thread: this is the unbounded read by
+        definition, so it is exactly the case that must not sit on the loop.
 
         Generator cleanup (early `break`, `aclose`, exception) closes the
-        underlying connection via the `async with reader.connect()`
-        context manager.
+        underlying connection via the `with reader.connect()` context manager.
         """
         stmt = select(self._table)
         for clause in self._build_filter_clause(filters):
@@ -2375,43 +2554,46 @@ class AsyncDB(Generic[SchemaType]):
                     stmt = stmt.order_by(col.asc())
 
         _, reader = await self._ensure_engines()
-        async with reader.connect() as conn:
-            result = await conn.stream(
-                stmt.execution_options(yield_per=batch_size)
-            )
-            async for row in result.mappings():
-                yield self.schema_class(**dict(row))
+        with reader.connect() as conn:
+            result = conn.execution_options(yield_per=batch_size).execute(stmt)
+            while True:
+                rows = await asyncio.to_thread(result.mappings().fetchmany, batch_size)
+                if not rows:
+                    break
+                for row in rows:
+                    yield self.schema_class(**dict(row))
 
     async def delete(
         self,
         record_id: Union[str, int],
         *,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
     ) -> bool:
         """Delete by id. `conn=` runs inline (see `save()` for semantics)."""
         stmt = delete(self._table).where(self._table.c.id == record_id)
 
         if conn is not None:
             await self._ensure_schema_initialized(conn)
-            result = await conn.execute(stmt)
+            result = _raw_conn(conn).execute(stmt)
             return result.rowcount > 0
 
-        async def _do() -> bool:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    result = await own_conn.execute(stmt)
-                    return result.rowcount > 0
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
 
-        return await self._execute_with_retry(_do, max_retries=max_retries)
+        def _do() -> bool:
+            with writer.begin() as own_conn:
+                result = own_conn.execute(stmt)
+                return result.rowcount > 0
+
+        async with write_lock:
+            return await self._execute_with_retry(_do, max_retries=max_retries)
 
     async def delete_many(
         self,
         *,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
         **filters,
     ) -> int:
         """Delete every row matching `**filters`. `conn=` runs inline."""
@@ -2426,25 +2608,26 @@ class AsyncDB(Generic[SchemaType]):
 
         if conn is not None:
             await self._ensure_schema_initialized(conn)
-            result = await conn.execute(stmt)
+            result = _raw_conn(conn).execute(stmt)
             return result.rowcount
 
-        async def _do() -> int:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    result = await own_conn.execute(stmt)
-                    return result.rowcount
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
 
-        return await self._execute_with_retry(_do, max_retries=max_retries)
+        def _do() -> int:
+            with writer.begin() as own_conn:
+                result = own_conn.execute(stmt)
+                return result.rowcount
+
+        async with write_lock:
+            return await self._execute_with_retry(_do, max_retries=max_retries)
 
     async def update_fields(
         self,
         record_id: Union[str, int],
         *,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
         **values,
     ) -> bool:
         """Update specific fields by id, without round-tripping the full row.
@@ -2467,25 +2650,26 @@ class AsyncDB(Generic[SchemaType]):
 
         if conn is not None:
             await self._ensure_schema_initialized(conn)
-            result = await conn.execute(stmt)
+            result = _raw_conn(conn).execute(stmt)
             return result.rowcount > 0
 
-        async def _do() -> bool:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    result = await own_conn.execute(stmt)
-                    return result.rowcount > 0
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
 
-        return await self._execute_with_retry(_do, max_retries=max_retries)
+        def _do() -> bool:
+            with writer.begin() as own_conn:
+                result = own_conn.execute(stmt)
+                return result.rowcount > 0
+
+        async with write_lock:
+            return await self._execute_with_retry(_do, max_retries=max_retries)
 
     async def update_many(
         self,
         values: Dict[str, Any],
         *,
         max_retries: int = 3,
-        conn: Optional[AsyncConnection] = None,
+        conn: Optional["ConnLike"] = None,
         **filters,
     ) -> int:
         """Update every row matching `**filters` with the `values` dict.
@@ -2525,15 +2709,16 @@ class AsyncDB(Generic[SchemaType]):
 
         if conn is not None:
             await self._ensure_schema_initialized(conn)
-            result = await conn.execute(stmt)
+            result = _raw_conn(conn).execute(stmt)
             return result.rowcount
 
-        async def _do() -> int:
-            writer, _ = await self._ensure_engines()
-            write_lock = await self._get_write_lock()
-            async with write_lock:
-                async with writer.begin() as own_conn:
-                    result = await own_conn.execute(stmt)
-                    return result.rowcount
+        writer, _ = await self._ensure_engines()
+        write_lock = await self._get_write_lock()
 
-        return await self._execute_with_retry(_do, max_retries=max_retries)
+        def _do() -> int:
+            with writer.begin() as own_conn:
+                result = own_conn.execute(stmt)
+                return result.rowcount
+
+        async with write_lock:
+            return await self._execute_with_retry(_do, max_retries=max_retries)

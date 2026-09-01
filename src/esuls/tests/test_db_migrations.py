@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import text
 
 from esuls.db_cli import (
-    AsyncDB, BaseModel, _discover_migrations,
+    AsyncDB, BaseModel, _discover_migrations, _engines_by_path, _initialized_dbs,
 )
 
 
@@ -165,9 +165,7 @@ async def test_pending_migrations_applied(tmp_path):
                      description="create side table")
 
     # Force schema re-init in this loop.
-    from esuls.db_cli import _db_state_by_loop
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     db2 = AsyncDB(db_path, "items", _Row)
     try:
@@ -207,9 +205,7 @@ async def test_already_applied_migrations_are_skipped(tmp_path):
         "    raise RuntimeError('this migration was already applied!')\n"
     )
 
-    from esuls.db_cli import _db_state_by_loop
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     db2 = AsyncDB(db_path, "items", _Row)
     try:
@@ -242,9 +238,7 @@ async def test_failing_migration_rolls_back(tmp_path):
                      "    raise RuntimeError('boom')",
                      description="boom")
 
-    from esuls.db_cli import _db_state_by_loop
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     db2 = AsyncDB(db_path, "items", _Row)
     try:
@@ -258,8 +252,7 @@ async def test_failing_migration_rolls_back(tmp_path):
 
     # Verify rollback: user_version still 0, `attempted` table not present,
     # seed row still there.
-    for s in _db_state_by_loop.values():
-        s["initialized"].clear()
+    _initialized_dbs.clear()
 
     # Remove the failing migration so the next open succeeds.
     (mdir / "001_test_v1.py").unlink()
