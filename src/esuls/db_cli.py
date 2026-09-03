@@ -15,6 +15,10 @@ SQLite-specific concerns kept custom:
   - PRAGMA optimize + wal_checkpoint(TRUNCATE) on close
   - Two-engine model: StaticPool writer (single conn; lock pre-serialises)
     + pooled reader (pool_size=4 for concurrent WAL reads)
+  - One shared `MetaData` per database FILE (`_shared_table`), so a
+    `foreign_key` declared on one AsyncDB can resolve a table declared on
+    another — the file being the only boundary inside which SQLite can hold
+    a constraint at all
 """
 import asyncio
 import base64
@@ -255,6 +259,79 @@ def _types_equivalent(live: str, declared: str) -> bool:
 _engines_by_path: "dict[str, tuple[Engine, Engine]]" = {}
 _initialized_dbs: "set[str]" = set()
 _db_state_guard = threading.Lock()
+
+# One MetaData per database FILE, shared by every AsyncDB pointing at it.
+#
+# It has to be shared, and the reason is foreign keys. SQLAlchemy resolves
+# `ForeignKey("parent.id")` by looking `parent` up in the SAME MetaData as the
+# child, so with a MetaData per AsyncDB — the natural shape here, one instance
+# per table — a cross-table FK could never resolve and DDL died with
+# `NoReferencedTableError`. The `foreign_key` field metadata was effectively
+# undeclarable in the only layout the library encourages.
+#
+# The file is the right boundary and not a compromise: SQLite cannot express a
+# constraint across two database files any more than it can make a transaction
+# atomic across them, so two tables that can reference each other are exactly
+# two tables in one file.
+#
+# Never evicted. A MetaData is a pure in-memory description (no connections, no
+# per-loop state), one per path, and paths are resolved and bounded by the
+# application's own set of databases.
+_metadata_by_path: "dict[str, MetaData]" = {}
+# (path, table_name) → the schema class that registered it, so a second AsyncDB
+# claiming the same table can be told apart from a re-import of the same one.
+_table_owners: "dict[tuple[str, str], type]" = {}
+
+
+def _shared_table(db_path: Path, table_name: str, schema_class: type) -> tuple[MetaData, Table]:
+    """The MetaData for `db_path` and this schema's Table inside it.
+
+    Re-declaring a table is normal and has two shapes, both supported:
+
+      * the SAME schema class again — a module imported twice, a fixture
+        rebuilt. The Table already there is returned, so the two AsyncDB
+        instances share one object instead of fighting over the name. The test
+        is identity, not shape: see the note at the rebuild below.
+      * a DIFFERENT schema on the same table — which is what schema DRIFT
+        looks like from inside one process: a dataclass that gained a column
+        since the table was created. The new declaration REPLACES the old one
+        in the MetaData, because it is the one describing what the caller now
+        wants; the retrofit path (`ALTER TABLE ADD COLUMN` + the drift check)
+        is what reconciles it with the live database.
+
+    Replacing rather than refusing keeps the second case working, and it is
+    also the honest default: before the MetaData was shared, each AsyncDB
+    silently had its own view of the table anyway, so "the newest declaration
+    describes the table" is what the library already did — only now the other
+    tables on this file can see it, which is the whole point.
+    """
+    key = str(db_path)
+    with _db_state_guard:
+        metadata = _metadata_by_path.get(key)
+        if metadata is None:
+            metadata = _metadata_by_path[key] = MetaData()
+
+        existing = metadata.tables.get(table_name)
+        if existing is not None:
+            if _table_owners.get((key, table_name)) is schema_class:
+                return metadata, existing
+            # A DIFFERENT class: rebuild, always. Comparing the two by column
+            # names would look like a safe shortcut and is not — v1 and v2 of a
+            # schema routinely have identical columns and differ only in the
+            # field metadata (`index`, `unique`), which lives in the Table's
+            # indexes rather than its columns. Reusing v1's Table there means
+            # the declared index is never created and the constraint reads as
+            # enforced while duplicates keep being accepted.
+            logger.debug(
+                f"table {table_name!r} on {key} re-declared by "
+                f"{schema_class.__name__}; the previous declaration is replaced"
+            )
+            metadata.remove(existing)
+
+        table = _table_from_schema(metadata, table_name, schema_class)
+        _table_owners[(key, table_name)] = schema_class
+        return metadata, table
+
 
 _db_state_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict]" = (
     weakref.WeakKeyDictionary()
@@ -642,6 +719,21 @@ def _table_from_schema(metadata: MetaData, table_name: str, schema_class: type) 
     `foreign_key` (+ optional `on_delete`). `unique` and `index` become
     separate `Index` objects (not inline) so schema-drift `ALTER TABLE ADD
     COLUMN` + a fresh `CREATE INDEX IF NOT EXISTS` keep working uniformly.
+
+    `foreign_key` takes `"<table>.<column>"` and resolves against the OTHER
+    tables declared on the same database file, which the shared MetaData
+    (`_shared_table`) is what makes possible:
+
+        parent_id: str = field(default=None, metadata={
+            "index": True, "foreign_key": "parent.id", "on_delete": "CASCADE"})
+
+    Declaration order does not matter (SQLAlchemy resolves the reference when
+    the DDL is emitted, not here), but the referenced model's AsyncDB must
+    have been CONSTRUCTED — normally: its module imported — before the first
+    use of this one, and must point at the same file. `PRAGMA foreign_keys=ON`
+    is already set on every connection, so the constraint is enforced by
+    SQLite: an orphan INSERT raises IntegrityError and `ON DELETE CASCADE`
+    happens in the database, not in the application.
 
     Two optional class-level attributes are honoured:
       - `__unique_together__`: list of column-name tuples, e.g.
@@ -1240,10 +1332,11 @@ class AsyncDB(Generic[SchemaType]):
         }
         self._db_key = f"{self.db_path}:{self.table_name}:{self.schema_class.__name__}"
 
-        # Build the SQLA Table synchronously — pure-Python, no I/O.
-        self._metadata = MetaData()
-        self._table: Table = _table_from_schema(
-            self._metadata, self.table_name, schema_class
+        # Build the SQLA Table synchronously — pure-Python, no I/O. The
+        # MetaData is shared with every other AsyncDB on this file so that a
+        # `foreign_key` can find the table it points at (see `_shared_table`).
+        self._metadata, self._table = _shared_table(
+            self.db_path, self.table_name, schema_class
         )
         # Engines + schema flag cached on the instance: every call used to walk
         # a WeakKeyDictionary keyed on the running loop and a dict keyed on the
@@ -1456,22 +1549,72 @@ class AsyncDB(Generic[SchemaType]):
         )
         table_exists = result.fetchone() is not None
 
+        # Whether the DATABASE is new, which is a different question from
+        # whether this TABLE is new — and the distinction decides whether the
+        # migration pointer may be leap-frogged below. Read BEFORE create_all,
+        # because create_all is what stops it from being empty.
+        db_is_empty = not table_exists and conn.execute(text(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+        )).fetchone() is None
+
         if not table_exists:
             # Fresh table — create_all handles columns and indexes in one shot.
-            self._metadata.create_all(conn)
-            # Fresh DB: the dataclass-driven schema is by definition "at
-            # the latest version", so we leap-frog `PRAGMA user_version`
-            # to the max declared migration. Otherwise the next start
-            # would try to re-apply migrations that already match the
-            # live schema (typically ALTER ADD COLUMN of a column the
-            # dataclass already declared).
-            if self.migrations_dir.is_dir():
-                migs = _discover_migrations(self.migrations_dir)
-                if migs:
-                    max_version = migs[-1].version
-                    conn.execute(
-                        text(f"PRAGMA user_version = {int(max_version)}")
-                    )
+            #
+            # It runs over the WHOLE shared MetaData (every table declared on
+            # this file), not just this one, and that is deliberate: SQLAlchemy
+            # emits CREATE TABLE in foreign-key dependency order, so a child
+            # declared before its parent still lands after it. Restricting it to
+            # `tables=[self._table]` would create a child whose parent table does
+            # not exist yet, and with `foreign_keys=ON` the failure would surface
+            # much later, as "no such table" on the first INSERT.
+            #
+            # `checkfirst` (the default) makes the sibling creations no-ops once
+            # they exist, so this stays idempotent.
+            try:
+                self._metadata.create_all(conn)
+            except sa_exc.NoReferencedTableError as e:
+                raise sa_exc.NoReferencedTableError(
+                    f"{e.args[0] if e.args else e}\n\n"
+                    f"esuls: {self.table_name!r} declares a foreign key to a table "
+                    f"that has no AsyncDB on {self.db_path}. A FK is resolved "
+                    f"against the other AsyncDBs declared for the SAME file, so "
+                    f"the module defining the referenced model must be imported "
+                    f"before this one is first used — and both must point at "
+                    f"{self.db_path}, since SQLite cannot reference across files.",
+                    e.table_name,
+                ) from e
+            if db_is_empty:
+                # Fresh DATABASE: the dataclass-driven schema is by definition
+                # "at the latest version", so leap-frog `PRAGMA user_version` to
+                # the max declared migration. Otherwise the next start would try
+                # to re-apply migrations that already match the live schema
+                # (typically ALTER ADD COLUMN of a column the dataclass already
+                # declared).
+                if self.migrations_dir.is_dir():
+                    migs = _discover_migrations(self.migrations_dir)
+                    if migs:
+                        max_version = migs[-1].version
+                        conn.execute(
+                            text(f"PRAGMA user_version = {int(max_version)}")
+                        )
+                return
+
+            # A NEW TABLE in an EXISTING database, which must NOT leap-frog.
+            # `user_version` is a property of the DATABASE while "is it new?" was
+            # asked about one TABLE, so leap-frogging here would burn the pending
+            # migrations of every OTHER table in the file — and burn them
+            # silently: nothing fails, the migration simply never runs and
+            # `user_version` is already past it, so it never runs again either.
+            # Adding a table to a live schema is one of the most ordinary things
+            # a project does, which is what made this quiet.
+            #
+            # The right answer is the same one the existing-table path gives:
+            # apply what is pending. This table is already at the latest version
+            # (create_all built it from the current dataclass), so a migration
+            # that touches it is a no-op or an ALTER it can absorb; the ones that
+            # matter are the ones aimed at its neighbours.
+            await _apply_pending_migrations(conn, self.migrations_dir)
             return
 
         # Existing table — retrofit missing columns. SQLite's ADD COLUMN

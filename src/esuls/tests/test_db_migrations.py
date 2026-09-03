@@ -24,6 +24,11 @@ class _Row(BaseModel):
     name: str = ""
 
 
+@dataclass
+class _Other(BaseModel):
+    label: str = ""
+
+
 def _write_migration(
     migrations_dir: Path, version: int, body: str, *,
     description: str = "test migration",
@@ -177,6 +182,67 @@ async def test_pending_migrations_applied(tmp_path):
             assert row == "world"
     finally:
         await db2.close()
+
+
+async def test_a_new_table_does_not_burn_the_other_tables_migrations(tmp_path):
+    """`PRAGMA user_version` belongs to the DATABASE; "is it new?" was asked
+    about one TABLE. Leap-frogging on a new table in an existing database
+    therefore skipped every pending migration in the file — silently: nothing
+    failed, the migration simply never ran, and user_version was already past
+    it so it never ran again either. Adding a table to a live schema is one of
+    the most ordinary things a project does, which is what made it quiet."""
+    db_path = tmp_path / "app.db"
+    mdir = tmp_path / "migrations"
+
+    # Phase 1: a database with one table and no migrations yet.
+    mdir.mkdir()
+    first = AsyncDB(db_path, "items", _Row)
+    try:
+        await first.save(_Row(name="seed"))
+    finally:
+        await first.close()
+
+    # Phase 2: a migration lands AND a second table is added at the same time.
+    _write_migration(mdir, 1,
+                     "    await conn.execute(text(\"ALTER TABLE items "
+                     "ADD COLUMN extra TEXT\"))",
+                     description="add items.extra")
+    _initialized_dbs.clear()
+
+    # The NEW table's init is what runs first — the path that used to leap-frog.
+    second = AsyncDB(db_path, "other", _Other)
+    try:
+        await second.save(_Other(label="x"))
+        async with second.transaction(read_only=True) as conn:
+            assert (await conn.execute(text("PRAGMA user_version"))).scalar() == 1
+            cols = {r[1] for r in (await conn.execute(
+                text('PRAGMA table_info("items")')
+            )).fetchall()}
+            assert "extra" in cols, "the other table's migration was burned"
+    finally:
+        await second.close()
+
+
+async def test_a_brand_new_database_still_leapfrogs(tmp_path):
+    """The other half of the same rule: when the DATABASE itself is new, the
+    dataclass-built schema is by definition current, so migrations that would
+    only re-do what CREATE TABLE just did must still be skipped."""
+    db_path = tmp_path / "fresh.db"
+    mdir = tmp_path / "migrations"
+    mdir.mkdir()
+    _write_migration(mdir, 1,
+                     "    await conn.execute(text(\"ALTER TABLE items "
+                     "ADD COLUMN name TEXT\"))",
+                     description="would duplicate an existing column")
+    _initialized_dbs.clear()
+
+    db = AsyncDB(db_path, "items", _Row)
+    try:
+        await db.save(_Row(name="seed"))       # would have failed if m1 ran
+        async with db.transaction(read_only=True) as conn:
+            assert (await conn.execute(text("PRAGMA user_version"))).scalar() == 1
+    finally:
+        await db.close()
 
 
 async def test_already_applied_migrations_are_skipped(tmp_path):

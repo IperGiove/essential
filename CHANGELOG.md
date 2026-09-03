@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.9.0 — 2026-09-03
+
+### Foreign keys become declarable
+
+`metadata={"foreign_key": "parent.id"}` has been in the schema builder since the
+SQLAlchemy port, and in the layout this library encourages — one `AsyncDB` per
+table — it could never work. Each instance built its own `MetaData`, and
+SQLAlchemy resolves a `ForeignKey` by looking the referenced table up in the
+*same* `MetaData`, so the reference had nothing to resolve against and DDL died
+with `NoReferencedTableError`. The feature was documented, tested only for the
+PRAGMA being live, and undeclarable in practice.
+
+**One `MetaData` per database file now, shared by every `AsyncDB` on it.** The
+file is the right boundary and not a compromise: SQLite cannot hold a constraint
+across two database files any more than it can make a transaction atomic across
+them, so two tables that can reference each other are exactly two tables in one
+file.
+
+```python
+@dataclass
+class Enrollment(TimestampedModel):
+    group_id: str = field(default=None, metadata={
+        "index": True, "foreign_key": "class_group.id", "on_delete": "CASCADE"})
+
+DB_GROUP      = AsyncDB("app.db", "class_group", Group)
+DB_ENROLLMENT = AsyncDB("app.db", "enrollment", Enrollment)
+```
+
+The constraint reaches the schema, so `PRAGMA foreign_keys=ON` finally has
+something to enforce: an orphan INSERT raises `IntegrityError`, and
+`ON DELETE CASCADE` runs in the database instead of being an application's
+job to remember.
+
+Declaration order does not matter — a reference resolves when the DDL is
+emitted, not when the dataclass is read — but the referenced model's `AsyncDB`
+must have been constructed before the first *use* of the referring one. When it
+has not been, the `NoReferencedTableError` now says so and says what to do,
+instead of naming a table the caller never wrote.
+
+`create_all` deliberately runs over the whole file's `MetaData` rather than the
+one table: SQLAlchemy emits `CREATE TABLE` in dependency order, so a child
+declared before its parent still lands after it. Restricting it would create a
+child whose parent table does not exist, and with `foreign_keys=ON` that
+surfaces much later, as `no such table` on the first INSERT.
+
+Re-declaring a table with a *different* dataclass keeps working and keeps
+meaning what it meant: that is what schema drift looks like from inside one
+process (a model that gained a column since the table was created), so the new
+declaration replaces the old one and the retrofit path reconciles it with the
+live database. Two `AsyncDB` built from the *same* class share one `Table`.
+
+### A new table no longer burns its neighbours' migrations
+
+`PRAGMA user_version` is a property of the DATABASE. "Is it new?" was asked
+about one TABLE. So adding a table to a database that already existed took the
+fresh-schema path and **leap-frogged `user_version` to the highest declared
+migration**, skipping every migration still pending for every *other* table in
+the file.
+
+It skipped them silently. Nothing raised, nothing logged: the migration simply
+never ran, and because the pointer had already moved past it, it never ran on
+any later start either. Adding a table to a live schema is one of the most
+ordinary things a project does, which is exactly what kept this quiet.
+
+A new table in an existing database now applies what is pending, like every
+other path. A brand-new *database* still leap-frogs, which was always the
+correct half of the rule: a schema `create_all` just built from the current
+dataclasses is by definition current, and re-running migrations against it would
+only re-do what CREATE TABLE did.
+
+**Upgrading:** on the first start after this release, any migration that was
+silently skipped will actually run. That is the point, and it is also the thing
+to look at before deploying — if one of those was applied by hand in the
+meantime, it will be applied again. Check `PRAGMA user_version` against your
+`migrations/` directory on each live database first.
+
+### Notes
+
+No API surface changed, and nothing needs updating in a project that declares
+no foreign keys and has no `migrations/` directory.
+
+## 0.8.0 — 2026-09-03
+
+### Foreign keys become declarable
+
+`metadata={"foreign_key": "parent.id"}` has been in the schema builder since the
+SQLAlchemy port, and in the layout this library encourages — one `AsyncDB` per
+table — it could never work. Each instance built its own `MetaData`, and
+SQLAlchemy resolves a `ForeignKey` by looking the referenced table up in the
+*same* `MetaData`, so the reference had nothing to resolve against and DDL died
+with `NoReferencedTableError`. The feature was documented, tested only for the
+PRAGMA being live, and undeclarable in practice.
+
+**One `MetaData` per database file now, shared by every `AsyncDB` on it.** The
+file is the right boundary and not a compromise: SQLite cannot hold a constraint
+across two database files any more than it can make a transaction atomic across
+them, so two tables that can reference each other are exactly two tables in one
+file.
+
+```python
+@dataclass
+class Enrollment(TimestampedModel):
+    group_id: str = field(default=None, metadata={
+        "index": True, "foreign_key": "class_group.id", "on_delete": "CASCADE"})
+
+DB_GROUP      = AsyncDB("app.db", "class_group", Group)
+DB_ENROLLMENT = AsyncDB("app.db", "enrollment", Enrollment)
+```
+
+The constraint reaches the schema, so `PRAGMA foreign_keys=ON` finally has
+something to enforce: an orphan INSERT raises `IntegrityError`, and
+`ON DELETE CASCADE` runs in the database instead of being an application's
+job to remember.
+
+Declaration order does not matter — a reference resolves when the DDL is
+emitted, not when the dataclass is read — but the referenced model's `AsyncDB`
+must have been constructed before the first *use* of the referring one. When it
+has not been, the `NoReferencedTableError` now says so and says what to do,
+instead of naming a table the caller never wrote.
+
+`create_all` deliberately runs over the whole file's `MetaData` rather than the
+one table: SQLAlchemy emits `CREATE TABLE` in dependency order, so a child
+declared before its parent still lands after it. Restricting it would create a
+child whose parent table does not exist, and with `foreign_keys=ON` that
+surfaces much later, as `no such table` on the first INSERT.
+
+### Notes
+
+Re-declaring a table with a *different* dataclass keeps working and keeps
+meaning what it meant: that is what schema drift looks like from inside one
+process (a model that gained a column since the table was created), so the new
+declaration replaces the old one and the retrofit path reconciles it with the
+live database. Two `AsyncDB` built from the *same* class share one `Table`.
+
+No API surface changed, and nothing needs updating in a project that declares no
+foreign keys.
+
 ## 0.7.0 — 2026-09-01
 
 ### The hot read path stops rebuilding what it can keep
