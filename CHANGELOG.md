@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.10.0 — 2026-09-04
+
+### The writer takes its lock up front, so a second process can exist
+
+A plain `BEGIN` is DEFERRED: the transaction takes no lock until its first
+statement, and a read-only one. A transaction that reads and then writes — which
+is nearly every interesting one, `save()` and `update_fields()` included — has to
+UPGRADE that shared lock partway through, and SQLite refuses the upgrade with
+SQLITE_BUSY **immediately**, without consulting `busy_timeout`. Honouring the
+timeout there would deadlock: both connections would sit holding a read lock,
+each waiting for the other to drop one. So the caller gets "database is locked"
+with no waiting and no retry.
+
+Inside ONE process it never shows. The writer is a `StaticPool` of a single
+connection, so writers already queue in Python and no two ever race. It appears
+the moment a second PROCESS opens the same file — N uvicorn workers, a cron job,
+a maintenance script run while the site is up. Measured on a real site during a
+load test, 6 workers, 70 seconds:
+
+| | writes accepted | "database is locked" | throughput |
+|---|---|---|---|
+| `BEGIN` (deferred) | 44% | 246.910 | — |
+| `BEGIN IMMEDIATE` | **100%** | **0** | **+40%** |
+
+The writer engine now begins with `BEGIN IMMEDIATE`. The lock is taken at the
+start, there is nothing to upgrade, and `busy_timeout` does the job it was
+always meant to: writers queue instead of failing. The READER keeps the deferred
+`BEGIN` — it never upgrades, and a deferred read is what lets WAL readers run
+beside the writer.
+
+`src/esuls/tests/test_multiprocess_writes.py` is the regression: six forked
+processes, a hundred read-then-write transactions each, and not one lost. It
+fails on the old behaviour with 438 of 600 writes rejected.
+
+### `checkpoint()` no longer runs inside a write transaction
+
+Fallout from the above, and a latent bug it made visible: `checkpoint()` used
+`writer.connect()`, so with `BEGIN IMMEDIATE` its first statement took a write
+lock and `PRAGMA wal_checkpoint` failed with SQLITE_LOCKED. A checkpoint is a
+file-level operation, not a query, and has no business inside a transaction —
+it now runs on a raw connection, the same shape `close()` already used.
+
 ## 0.9.0 — 2026-09-03
 
 ### Foreign keys become declarable
