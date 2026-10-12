@@ -2182,7 +2182,12 @@ class AsyncDB(Generic[SchemaType]):
             parts = key.split("__", 1)
             col_name = self._validate_column(parts[0])
             col = self._table.c[col_name]
-            op = parts[1] if (len(parts) > 1 and parts[1] in self.OPERATOR_MAP) else "eq"
+            if len(parts) > 1 and parts[1] not in self.OPERATOR_MAP:
+                raise ValueError(
+                    f"filter key {key!r}: unknown operator {parts[1]!r}; "
+                    f"valid: {sorted(self.OPERATOR_MAP)}"
+                )
+            op = parts[1] if len(parts) > 1 else "eq"
             clauses.append(self._apply_op(col, op, value, _key_for_error=key))
         return clauses
 
@@ -2772,7 +2777,12 @@ class AsyncDB(Generic[SchemaType]):
                         f"{alias!r}; available: {sorted(alias_to_expr)}"
                     )
                 lhs = alias_to_expr[alias]
-                op = parts[1] if len(parts) > 1 and parts[1] in self.OPERATOR_MAP else "eq"
+                if len(parts) > 1 and parts[1] not in self.OPERATOR_MAP:
+                    raise ValueError(
+                        f"having key {key!r}: unknown operator {parts[1]!r}; "
+                        f"valid: {sorted(self.OPERATOR_MAP)}"
+                    )
+                op = parts[1] if len(parts) > 1 else "eq"
                 stmt = stmt.having(self._apply_op(lhs, op, val, _key_for_error=key))
 
         # order_by accepts aliases (e.g. "count", "sum_amount") so users

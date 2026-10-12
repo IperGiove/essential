@@ -475,6 +475,20 @@ async def test_invalid_column_raises():
             await db.close()
 
 
+async def test_invalid_operator_raises():
+    """Typo in operator suffix → ValueError, not silent eq fallback."""
+    with tempfile.TemporaryDirectory() as d:
+        db = await _seed_numeric_table(d)
+        try:
+            try:
+                await db.find(count__gten=5)
+                raise AssertionError("expected ValueError")
+            except ValueError as e:
+                assert "gten" in str(e)
+        finally:
+            await db.close()
+
+
 # ────────────────────────────────────────────────────────────────────────
 # 7. ORDER BY / LIMIT / OFFSET
 # ────────────────────────────────────────────────────────────────────────
