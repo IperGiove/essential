@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.11.0 — 2026-11-03
+
+### `esuls.pdf` verifies signatures instead of counting them
+
+Until now a signed PDF earned one line in the summary — `1 signature(s)` — and
+an exemption: `structure.incremental_updates` skips signed files, because
+signing *is* an incremental update. So the cheapest forgery there is, editing a
+signed invoice and leaving the signature dictionary in place, came out
+**clean**.
+
+The new `pdf-sign` extra (`pip install 'esuls[pdf-sign]'`, pulled in by `all`)
+adds `verify_pdf_signatures()` / `async_verify_pdf_signatures()`, built on
+pyHanko. Each embedded signature and document timestamp becomes a
+`SignatureCheck`: `intact` (digest over `/ByteRange`), `valid` (CMS signature
+against the signer key), `trusted` (chain to a root you supply), `revoked`,
+`coverage`, `modification_level` / `docmdp_ok` (pyHanko's diff analysis of the
+revisions appended afterwards), and the embedded timestamp's trust.
+
+`check_pdf()` runs it whenever the file has signatures, and the results become
+findings:
+
+| code | severity | when |
+|---|---|---|
+| `signature.digest_mismatch` | critical | a signed byte was changed |
+| `signature.invalid` | critical | the signature was not made by the certificate's key |
+| `signature.revoked` | critical | signer certificate revoked (from data embedded in the file) |
+| `signature.modified_after_signing` | critical | later revisions go beyond what the signature permits |
+| `signature.unparseable` | critical | pyHanko cannot validate this signature at all |
+| `signature.untrusted` | warning | valid, but does not chain to a trust root |
+| `signature.timestamp_untrusted` | warning | the embedded timestamp token is not trusted |
+| `signature.read_error` | warning | pypdf sees signatures, pyHanko cannot parse the file |
+| `signature.unsigned_updates` | info | revisions after the last signature that pyHanko deems harmless |
+| `signature.not_verified` | info | pyHanko missing, or `verify_signatures=False` |
+
+`PdfReport.signatures` carries the per-signature results (and `to_dict()`
+serialises them). `esuls-pdf check` gains `--trust-root PEM/DER` (repeatable)
+and `--no-verify-signatures`, and prints one line per signature.
+
+Two deliberate choices:
+
+- **Trust is explicit.** Only the roots passed in are trusted; the OS store is
+  never used. It holds TLS server CAs, not document-signing trust lists, it
+  differs between machines, and pyHanko is removing the fallback. Without
+  `trust_roots` a signed file is therefore at best `suspicious`.
+- **Validation is offline.** No OCSP/CRL/AIA fetching: those URLs come from
+  the (untrusted) file, and network I/O would make the verdict depend on when
+  you ran it.
+
+Known gap, surfaced rather than hidden: pyHanko classifies an Info-dict edit
+after signing as a metadata-only update, the same bucket as LTV data, so the
+signature stays valid. Such a file gets `signature.unsigned_updates` (info)
+with the modification level, not a worse verdict.
+
+`import esuls.pdf` still does not import pyHanko; it loads on first use.
+`src/esuls/tests/test_pdf_signatures.py` covers it on synthetic PDFs signed
+with self-signed and CA-issued certificates minted per test: byte tampering, a
+key that does not match its certificate, a same-name impostor certificate,
+edits after signing, countersignatures, expiry and `validation_time`, signature
+and document timestamps (pyHanko's dummy TSA), use inside a running event
+loop, and the CLI exit codes.
+
+### Fonts and images as evidence of editing
+
+Typing onto an existing PDF needs glyphs the original font subset does not
+have, so editors add a NEW font; pasting a logo or a patch over a number adds
+a new image. New module `esuls.pdf.content`:
+
+- `read_pdf_fonts()` / `read_pdf_images()` / `read_pdf_content()` — what page
+  content uses (resources inherited from `/Pages`, nested Form XObjects
+  included): font family, subset prefix, type, embedded or not; image size,
+  filters, colour space, and the image editor named in a JPEG's metadata.
+- `read_pdf_revision_content()` — rebuilds each earlier revision (the file
+  cut at its `%%EOF`, skipping the extra one of linearized files) and reports
+  the fonts/images each update added, plus fonts rewritten in place under the
+  same object number. Capped at the last 32 updates.
+
+Annotation appearances (signature widgets, form-field values, comments) are
+deliberately not page content: they are legitimate later additions.
+
+| code | severity | when |
+|---|---|---|
+| `content.fonts_added_in_update` | warning | a later revision added a font to page content |
+| `content.fonts_modified_in_update` | warning | a later revision rewrote a font object (e.g. new subset) |
+| `content.images_added_in_update` | warning | a later revision added an image to page content |
+| `content.image_editor_metadata` | warning | a JPEG says Photoshop, GIMP, Paint.NET, … |
+| `content.duplicate_font_subset` | info | two subsets of one face, same type, on one page |
+| `content.mixed_font_embedding` | info | a non-embedded, non-standard font next to embedded ones |
+
+The single-revision heuristics are info on purpose: run over 42 real-world
+PDFs, the only hits were duplicate subsets from Chromium/Skia and an Acrobat
+"combine files" — legitimate producers. The revision diff is the strong signal,
+and it only exists while the file has not been fully re-saved.
+
+`PdfReport.content` carries the inventory; `esuls-pdf inspect --full` prints
+fonts, images and per-revision additions. Tests: `test_pdf_content.py`.
+
 ## 0.10.0 — 2026-09-04
 
 ### The writer takes its lock up front, so a second process can exist

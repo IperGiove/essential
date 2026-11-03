@@ -1,9 +1,11 @@
 import json
+import logging
 import sys
 
 import click
 
 from .checker import PdfReport, check_pdf
+from .content import read_pdf_content, read_pdf_revision_content
 from .inspect import read_pdf_dynamic, read_pdf_revisions, read_pdf_summary
 from .metadata import (
     _normalize_key,
@@ -29,8 +31,25 @@ def app():
               help="Emit JSON instead of human report.")
 @click.option("--profile", default="default", show_default=True,
               help="Reserved for future per-issuer profiles.")
-def check_cmd(files, as_json, profile):
-    """Verify PDF legitimacy. Exit: 0=clean, 1=suspicious, 2=tampered, 3=error."""
+@click.option("--trust-root", "trust_roots", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="PEM/DER certificate(s) to trust for signature validation "
+                   "(repeatable). Without it no signer is trusted.")
+@click.option("--no-verify-signatures", is_flag=True,
+              help="Skip cryptographic validation of embedded signatures.")
+def check_cmd(files, as_json, profile, trust_roots, no_verify_signatures):
+    """Verify PDF legitimacy. Exit: 0=clean, 1=suspicious, 2=tampered, 3=error.
+
+    Signed files are validated cryptographically when the `pdf-sign` extra
+    (pyHanko) is installed: integrity, signer key, trust chain, and changes
+    made after signing.
+    """
+    # pyHanko logs every validation failure with a traceback; on the CLI the
+    # outcome is already in the report. Handlers the caller set up still work.
+    for name in ("pyhanko", "pyhanko_certvalidator"):
+        logging.getLogger(name).addHandler(logging.NullHandler())
+        logging.getLogger(name).propagate = False
+
     verdict_rank = {"clean": 0, "suspicious": 1, "tampered": 2}
     worst = "clean"
     reports = []
@@ -38,7 +57,11 @@ def check_cmd(files, as_json, profile):
 
     for f in files:
         try:
-            report = check_pdf(f, profile=profile)
+            report = check_pdf(
+                f, profile=profile,
+                verify_signatures=not no_verify_signatures,
+                trust_roots=list(trust_roots) or None,
+            )
         except Exception as e:
             errored = True
             click.echo(f"❌ {f}: read error — {e}", err=True)
@@ -148,6 +171,8 @@ def _render_check(report: PdfReport) -> None:
     label = _VERDICT_LABEL.get(report.verdict, report.verdict)
     click.echo(f"\n📄 {report.path}  →  {label}")
     click.echo(f"   {_summary_line(report.summary)}")
+    for s in report.signatures or []:
+        click.echo(f"   {_signature_line(s)}")
 
     if not report.findings:
         click.echo("   no tampering signals detected.")
@@ -159,6 +184,20 @@ def _render_check(report: PdfReport) -> None:
             if f.severity != sev:
                 continue
             click.echo(f"   {icons[sev]} [{f.code}] {f.message}")
+
+
+def _signature_line(s) -> str:
+    if s.error:
+        state = "❌ unreadable"
+    elif not (s.intact and s.valid) or s.revoked or s.docmdp_ok is False:
+        state = "❌ INVALID"
+    elif s.trusted:
+        state = "🔏 valid, trusted"
+    else:
+        state = "🔓 valid, untrusted"
+    kind = "doc timestamp" if s.kind == "doc_timestamp" else "signature"
+    when = f" @ {s.signing_time.isoformat()}" if s.signing_time else ""
+    return f"{state} {kind} {s.field_name!r} by {s.signer or '?'}{when}"
 
 
 def _render_inspect(pdf: str, *, full: bool) -> None:
@@ -237,6 +276,42 @@ def _render_inspect(pdf: str, *, full: bool) -> None:
         click.echo(f"  JavaScript actions:{dyn['javascript_actions']}")
     except Exception as e:
         click.echo(f"  ⚠️  error: {e}")
+
+    try:
+        content = read_pdf_content(pdf)
+        content_revs = read_pdf_revision_content(pdf)
+    except Exception as e:
+        click.echo(f"\n  ⚠️  content inventory error: {e}")
+    else:
+        _section("Fonts (page content)")
+        if not content["fonts"]:
+            click.echo("  (none)")
+        for f in content["fonts"]:
+            emb = "embedded" if f["embedded"] else (
+                "standard-14" if f["standard14"] else "NOT embedded")
+            click.echo(f"  p.{f['page']} {f['name']}: {f['base_font']} "
+                       f"[{f['subtype']}, {emb}]")
+
+        _section("Images (page content)")
+        if not content["images"]:
+            click.echo("  (none)")
+        for i in content["images"]:
+            ed = f"  ⚠️ edited with {i['editor']}" if i["editor"] else ""
+            click.echo(f"  p.{i['page']} {i['name']}: {i['width']}x{i['height']} "
+                       f"{'/'.join(i['filters']) or 'raw'} {i['color_space'] or ''}{ed}")
+
+        if content_revs:
+            _section("Added by later revisions")
+            for r in content_revs:
+                if r.get("error"):
+                    click.echo(f"  rev {r['revision']}: ⚠️  {r['error']}")
+                    continue
+                parts = (
+                    [f"+font {f['base_font']}" for f in r["added_fonts"]]
+                    + [f"~font {f['previous_base_font']}→{f['base_font']}" for f in r["modified_fonts"]]
+                    + [f"+image {i['width']}x{i['height']}" for i in r["added_images"]]
+                )
+                click.echo(f"  rev {r['revision']}: " + (", ".join(parts) or "no page fonts/images"))
 
     _section("Hash")
     click.echo(f"  sha256: {summary['sha256']}")

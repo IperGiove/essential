@@ -36,9 +36,27 @@ def test_import_esuls_does_not_pull_the_heavy_stack():
         assert esuls.AsyncDB is not None
         assert esuls.run_parallel is not None
 
-        leaked = [m for m in ("playwright", "playwright_stealth", "curl_cffi", "pypdf")
+        leaked = [m for m in ("playwright", "playwright_stealth", "curl_cffi", "pypdf",
+                              "pyhanko")
                   if m in sys.modules]
         assert not leaked, f"import esuls eagerly pulled optional deps: {leaked}"
+        print("OK")
+        """
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+
+
+def test_pdf_package_does_not_import_pyhanko():
+    """`esuls.pdf` must work with only the `pdf` extra: pyHanko (`pdf-sign`)
+    loads on the first signature validation, not on import."""
+    proc = _run(
+        """
+        import sys
+        import esuls.pdf
+        assert esuls.pdf.verify_pdf_signatures is not None
+        leaked = [m for m in sys.modules if m.split(".")[0] in ("pyhanko", "pyhanko_certvalidator")]
+        assert not leaked, f"import esuls.pdf eagerly pulled pyHanko: {leaked[:3]}"
         print("OK")
         """
     )

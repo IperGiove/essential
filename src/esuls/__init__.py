@@ -13,6 +13,7 @@ consumer installs only the features it uses::
     pip install 'esuls[http]'      # + make_request (httpx)
     pip install 'esuls[scraping]'  # + curl_cffi / playwright transports
     pip install 'esuls[pdf]'       # + PDF metadata/inspection + esuls-pdf CLI
+    pip install 'esuls[pdf-sign]'  # + cryptographic PDF signature validation
     pip install 'esuls[icons]'     # + download_icon
     pip install 'esuls[all]'       # everything (the pre-0.4 default)
 
@@ -66,6 +67,11 @@ _LAZY = {
     "remove_pdf_metadata":        ("pdf", "pdf"),
     "replace_pdf_metadata":       ("pdf", "pdf"),
     "update_pdf_metadata":        ("pdf", "pdf"),
+    # PDF signature validation: the module imports pyHanko lazily, so the
+    # symbol resolves with just `pdf`; calling it needs `pdf-sign`.
+    "SignatureCheck":              ("pdf", "pdf"),
+    "verify_pdf_signatures":       ("pdf", "pdf"),
+    "async_verify_pdf_signatures": ("pdf", "pdf"),
 }
 
 
@@ -109,4 +115,5 @@ __all__ = [
     'read_pdf_dynamic', 'check_metadata_coherence', 'check_pdf', 'Finding', 'PdfReport',
     'find_non_standard_metadata', 'STANDARD_METADATA_KEYS', 'edit_pdf_metadata',
     'update_pdf_metadata', 'replace_pdf_metadata', 'remove_pdf_metadata',
+    'SignatureCheck', 'verify_pdf_signatures', 'async_verify_pdf_signatures',
 ]
