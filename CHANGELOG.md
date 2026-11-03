@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.12.0 — 2026-11-03
+
+### Text hidden under images
+
+The cheapest edit of a PDF is not editing the text — that needs a font with
+the right glyphs — but painting an image over a value (a screenshot of the new
+number, or a plain box) and typing the new value on top. Nothing is added to
+the fonts, so the font checks stay silent, while the original text is still in
+the file, underneath.
+
+New `esuls.pdf.layout.read_pdf_image_placements()`: a small content-stream
+interpreter (graphics-state stack, CTM, text matrices and `TJ` kerning, Form
+XObjects with their `/Matrix`, inline `BI…EI` images) that returns every image
+placement with its box on the page, its share of the page, whether it has an
+alpha/colour-key mask, the **earlier** visible text it covers and the
+**later** text drawn over it. Text is decoded with pypdf's font tables;
+undecodable runs still count, as `[n glyphs]`.
+
+Paint order is the discriminator: an image only "covers" text painted before
+it. Backgrounds and letterheads (painted first) and OCR layers (invisible
+text, `Tr 3`) never count.
+
+| code | severity | when |
+|---|---|---|
+| `content.text_covered_by_image` | warning | an opaque image is painted over earlier text — the finding quotes the hidden text and what was drawn on top |
+| `content.text_covered_by_image` | info | the same, but the image is transparent (stamps, logos with alpha) |
+
+`PdfReport.content["placements"]` carries the data; `esuls-pdf inspect --full`
+prints each placement in paint order. Tests: `test_pdf_layout.py`. Positions
+are estimates (glyph widths, centre-in-box rule); vector shapes (a white
+rectangle drawn with `re f`) are not considered yet.
+
 ## 0.11.0 — 2026-11-03
 
 ### `esuls.pdf` verifies signatures instead of counting them

@@ -6,6 +6,7 @@ import click
 
 from .checker import PdfReport, check_pdf
 from .content import read_pdf_content, read_pdf_revision_content
+from .layout import read_pdf_image_placements
 from .inspect import read_pdf_dynamic, read_pdf_revisions, read_pdf_summary
 from .metadata import (
     _normalize_key,
@@ -299,6 +300,23 @@ def _render_inspect(pdf: str, *, full: bool) -> None:
             ed = f"  ⚠️ edited with {i['editor']}" if i["editor"] else ""
             click.echo(f"  p.{i['page']} {i['name']}: {i['width']}x{i['height']} "
                        f"{'/'.join(i['filters']) or 'raw'} {i['color_space'] or ''}{ed}")
+
+        try:
+            placements = read_pdf_image_placements(pdf)
+        except Exception as e:
+            placements = []
+            click.echo(f"  ⚠️  placement error: {e}")
+        if placements:
+            _section("Image placement (paint order)")
+            for p in placements:
+                x0, y0, x1, y1 = p["bbox"]
+                frac = f" ({p['page_fraction']:.0%} of page)" if p["page_fraction"] is not None else ""
+                alpha = " alpha" if p["transparent"] else ""
+                click.echo(f"  p.{p['page']} {p['name']}: [{x0:g},{y0:g} → {x1:g},{y1:g}]{frac}{alpha}")
+                if p["covered_text"]:
+                    click.echo(f"      🚨 covers earlier text: {p['covered_text']!r}")
+                if p["text_on_top"]:
+                    click.echo(f"      text drawn over it: {p['text_on_top']!r}")
 
         if content_revs:
             _section("Added by later revisions")

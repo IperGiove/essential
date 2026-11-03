@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Literal, Optional, Union
 
 from .content import read_pdf_content, read_pdf_revision_content
+from .layout import read_pdf_image_placements
 from .inspect import (
     parse_pdf_date,
     read_pdf_dynamic,
@@ -479,6 +480,37 @@ def _check_images(*, content=None, **_) -> List[Finding]:
     )]
 
 
+def _check_text_under_images(*, content=None, **_) -> List[Finding]:
+    """An image painted over text that was already on the page.
+
+    The classic patch: cover a value with a picture of a different one (or a
+    plain box) and, often, type the new value on top. The original text is
+    still in the file, underneath — the finding quotes it. Opaque images are
+    a warning; images with an alpha/colour-key mask (stamps, logos) only info,
+    since the text under them may remain visible.
+    """
+    if not content or not content.get("placements"):
+        return []
+    out: List[Finding] = []
+    for p in content["placements"]:
+        if not p.get("covered_text"):
+            continue
+        sev = "info" if p["transparent"] else "warning"
+        on_top = f"; text painted over it: {p['text_on_top']!r}" if p.get("text_on_top") else ""
+        out.append(Finding(
+            severity=sev, category="content",
+            code="content.text_covered_by_image",
+            message=(
+                f"{'transparent ' if p['transparent'] else ''}image {p['name']} on p.{p['page']} "
+                f"is painted over earlier text {p['covered_text']!r}{on_top}"
+            ),
+            evidence={k: p[k] for k in (
+                "page", "name", "obj_id", "bbox", "page_fraction", "transparent",
+                "covered_text", "covered_runs", "text_on_top", "paint_order")},
+        ))
+    return out
+
+
 _CHECKS: List[Callable] = [
     _check_producer_xmp,
     _check_creator_xmp,
@@ -493,6 +525,7 @@ _CHECKS: List[Callable] = [
     _check_revision_content,
     _check_fonts,
     _check_images,
+    _check_text_under_images,
 ]
 
 
@@ -548,6 +581,7 @@ def check_pdf(
     try:
         content = {
             **read_pdf_content(pdf_path),
+            "placements": read_pdf_image_placements(pdf_path),
             "revisions": (read_pdf_revision_content(pdf_path)
                           if revisions["eof_count"] > 1 else []),
         }
