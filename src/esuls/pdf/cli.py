@@ -310,7 +310,9 @@ def _render_inspect(pdf: str, *, full: bool) -> None:
             _section("Image placement (paint order)")
             for p in placements:
                 x0, y0, x1, y1 = p["bbox"]
-                frac = f" ({p['page_fraction']:.0%} of page)" if p["page_fraction"] is not None else ""
+                pf = p["page_fraction"]
+                # Small images (logos, icons) would all print as "0%".
+                frac = "" if pf is None else f" ({pf:.1%} of page)" if pf < 0.1 else f" ({pf:.0%} of page)"
                 alpha = " alpha" if p["transparent"] else ""
                 click.echo(f"  p.{p['page']} {p['name']}: [{x0:g},{y0:g} → {x1:g},{y1:g}]{frac}{alpha}")
                 if p["covered_text"]:

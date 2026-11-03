@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.1 — 2026-11-03
+
+### `inspect --full` no longer prints every logo as "0% of page"
+
+Image placements below 10% of the page are shown with one decimal
+(`0.4% of page`); whole-number rounding made every logo and icon read "0%".
+Display only: `page_fraction` in the report was already exact.
+
 ## 0.12.0 — 2026-11-03
 
 ### Text hidden under images
