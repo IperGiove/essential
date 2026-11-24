@@ -11,7 +11,6 @@ from ._http import ProbeOptions, normalize_target
 from .auth import check_auth
 from .email import check_email
 from .ports import check_ports
-from .subdomains import check_subdomains
 from .tls import check_tls
 from .cors import check_cors
 from .dnscheck import check_dns
@@ -23,7 +22,7 @@ from .ratelimit import check_ratelimit
 from .report import ProbeReport
 
 # auth goes last: it deliberately triggers lockouts/bans against the source IP.
-ALL_CHECKS = ("headers", "exposed", "cors", "methods", "paths", "ratelimit", "ports", "tls", "email", "dns", "subdomains", "auth")
+ALL_CHECKS = ("headers", "exposed", "cors", "methods", "paths", "ratelimit", "ports", "tls", "email", "dns", "auth")
 
 
 HTTP_CHECKS = ("headers", "exposed", "cors", "methods", "paths", "ratelimit", "auth")
@@ -109,7 +108,6 @@ async def run_full_probe(
                         if target.strip().lower().startswith("http://") and not tls_port
                         else check_tls(target, o, port=tls_port)),
         "dns": lambda o: check_dns(target, o),
-        "subdomains": lambda o: check_subdomains(target, o, client=client),
         "email": lambda o: check_email(target, o, selectors=selectors),
         "auth": lambda o: check_auth(target, o, client=client, path=auth_path, method=auth_method,
                                    user_field=auth_user_field, pass_field=auth_pass_field,

@@ -16,13 +16,12 @@ from .methods import check_methods
 from .paths import check_paths
 from .ports import check_ports
 from .ratelimit import check_ratelimit
-from .subdomains import check_subdomains
 from .tls import check_tls
 from .report import ProbeFinding, ProbeReport
 
 __all__ = [
     "ProbeOptions", "ProbeFinding", "ProbeReport",
     "check_paths", "check_exposed", "check_headers", "check_ratelimit", "check_cors",
-    "check_ports", "check_dns", "check_methods", "check_subdomains", "check_auth", "check_tls", "check_email",
+    "check_ports", "check_dns", "check_methods", "check_auth", "check_tls", "check_email",
     "run_full_probe",
 ]

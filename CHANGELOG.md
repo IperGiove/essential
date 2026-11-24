@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### `esuls-probe`: drop the `subdomains` check
+
+- Removed the `subdomains` check and its `esuls-probe subdomains` command. Its
+  only data source was crt.sh, which is too often slow, rate-limited or 5xx to
+  be dependable; `full` no longer runs it. A crt.sh timeout also wrongly made
+  `full` exit 3 (error) about the target, which is gone with it.
+- `check_subdomains` is no longer exported from `esuls.probe` / `esuls`.
+
 ## 0.17.0 — 2026-11-24
 
 ### `esuls-probe`: dns, subdomains, open relay, HTTP methods

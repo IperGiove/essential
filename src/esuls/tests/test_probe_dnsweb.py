@@ -1,4 +1,4 @@
-"""dns / subdomains / open relay / methods / directory listing / security.txt."""
+"""dns / open relay / methods / directory listing / security.txt."""
 import asyncio
 
 import httpx
@@ -134,144 +134,10 @@ def test_real_recursion_probe_against_a_local_udp_dns_server():
     assert axfr_probe("127.0.0.1", "example.it", 0.5, port=1)[0] in ("error", "refused")
 
 
-# ── subdomains ────────────────────────────────────────────────────────────
+# ── dns cli ─────────────────────────────────────────────────────────────
 
-import json
-
-from esuls.probe import check_subdomains
-
-CT = [{"name_value": "example.it\nwww.example.it"}, {"name_value": "*.example.it\napp.example.it"},
-      {"name_value": "old.example.it"}, {"name_value": "blog.example.it"}, {"name_value": "evil.other.com"}]
-
-
-def ct_client(handler_extra=None, ct_status=200, ct_body=None):
-    seen = []
-
-    def h(req):
-        seen.append(req)
-        if req.url.host == "crt.sh":
-            assert "%25.example.it" in str(req.url) or "%.example.it" in req.url.params["q"]
-            return httpx.Response(ct_status, text=json.dumps(CT) if ct_body is None else ct_body)
-        if handler_extra:
-            return handler_extra(req)
-        return httpx.Response(404)
-    return httpx.AsyncClient(transport=httpx.MockTransport(h)), seen
-
-
-async def test_subdomain_enumeration_dedupes_and_scopes():
-    client, seen = ct_client()
-    rep = await check_subdomains("https://www.example.it", client=client, resolver=FakeResolver({}))
-    f = by_title(rep)["5 subdomain(s) in Certificate Transparency logs"]
-    assert f.severity == "info" and "app.example.it" in f.detail and "other.com" not in f.detail
-    assert [r.url.host for r in seen] == ["crt.sh"]            # the target itself is never queried
-
-
-async def test_subdomain_list_is_capped():
-    big = [{"name_value": f"s{i}.example.it"} for i in range(80)]
-    client, _ = ct_client(ct_body=json.dumps(big))
-    rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}), list_cap=50)
-    f = rep.findings[0]
-    assert f.title.startswith("80 subdomain") and "(+30 more)" in f.detail
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    from esuls.probe import subdomains as S
-    delays = []
-
-    async def fake(d):
-        delays.append(d)
-    monkeypatch.setattr(S, "_backoff", fake)
-    return delays
-
-
-async def test_crtsh_retries_502_then_succeeds(no_sleep):
-    calls = {"n": 0}
-
-    def h(req):
-        calls["n"] += 1
-        if calls["n"] <= 2:
-            return httpx.Response(502, text="bad gateway")
-        return httpx.Response(200, text=json.dumps(CT))
-    client = httpx.AsyncClient(transport=httpx.MockTransport(h))
-    rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}))
-    assert calls["n"] == 3 and no_sleep == [1.5, 3.0]
-    assert "5 subdomain(s) in Certificate Transparency logs" in by_title(rep) and "CT lookup failed" not in by_title(rep)
-
-
-async def test_crtsh_retries_transport_errors_but_not_4xx_or_200(no_sleep):
-    n = {"i": 0}
-
-    def flaky(req):
-        n["i"] += 1
-        if n["i"] == 1:
-            raise httpx.ReadTimeout("slow")
-        return httpx.Response(200, text=json.dumps(CT))
-    rep = await check_subdomains("example.it", client=httpx.AsyncClient(transport=httpx.MockTransport(flaky)),
-                                 resolver=FakeResolver({}))
-    assert n["i"] == 2 and "CT lookup failed" not in by_title(rep)
-    n["i"] = 0
-
-    def forbidden(req):
-        n["i"] += 1
-        return httpx.Response(429, text="slow down")
-    rep = await check_subdomains("example.it", client=httpx.AsyncClient(transport=httpx.MockTransport(forbidden)),
-                                 resolver=FakeResolver({}))
-    assert n["i"] == 1 and "CT lookup failed" in by_title(rep)      # 4xx: single attempt
-
-
-async def test_crtsh_persistent_502_is_graceful_and_bounded(no_sleep):
-    n = {"i": 0}
-
-    def h(req):
-        n["i"] += 1
-        return httpx.Response(502)
-    rep = await check_subdomains("example.it", client=httpx.AsyncClient(transport=httpx.MockTransport(h)),
-                                 resolver=FakeResolver({}))
-    f = by_title(rep)["CT lookup failed"]
-    assert n["i"] == 3 and "3 attempt(s)" in f.detail and not rep.errors and rep.exit_code == 0
-
-
-async def test_crtsh_failure_is_info_not_error(no_sleep):
-    for kw in ({"ct_status": 502}, {"ct_body": "<html>bad gateway"}):
-        client, _ = ct_client(**kw)
-        rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}))
-        assert rep.findings[0].title == "CT lookup failed" and not rep.errors and rep.exit_code == 0
-
-
-async def test_takeover_nxdomain_and_fingerprint_and_clean():
-    res = FakeResolver({
-        ("old.example.it", "CNAME"): ["gone.herokuapp.com."],        # target NXDOMAIN
-        ("blog.example.it", "CNAME"): ["acme.github.io."],           # exists, unclaimed page
-        ("blog.example.it", "A"): [], ("acme.github.io", "A"): ["185.199.108.153"],
-        ("app.example.it", "CNAME"): ["live.github.io."], ("live.github.io", "A"): ["185.199.108.153"],
-    })
-
-    def pages(req):
-        if req.url.host == "blog.example.it":
-            return httpx.Response(404, text="<p>There isn't a GitHub Pages site here.</p>")
-        return httpx.Response(200, text="my real site")
-    client, seen = ct_client(pages)
-    rep = await check_subdomains("example.it", client=client, resolver=res)
-    hits = {f.url: f for f in rep.findings if f.title == "Possible subdomain takeover"}
-    assert set(hits) == {"https://old.example.it", "https://blog.example.it"}
-    assert all(f.severity == "high" for f in hits.values())
-    assert "NXDOMAIN" in hits["https://old.example.it"].detail and "GitHub Pages" in hits["https://blog.example.it"].detail
-    assert rep.exit_code == 1
-
-
-async def test_subdomains_never_forward_user_headers_and_skip_ip():
-    client, seen = ct_client()
-    await check_subdomains("example.it", ProbeOptions(headers={"Authorization": "secret"}, cookie="sid=1"),
-                           client=client, resolver=FakeResolver({}))
-    assert all("authorization" not in r.headers and "cookie" not in r.headers for r in seen)
-    rep = await check_subdomains("127.0.0.1")
-    assert rep.findings[0].title == "Subdomain check skipped"
-
-
-def test_cli_dns_and_subdomains_help():
+def test_cli_dns_help():
     r = CliRunner()
-    assert "crt.sh" in r.invoke(app, ["subdomains", "--help"]).output
     assert r.invoke(app, ["dns", "--help"]).exit_code == 0
 
 
@@ -436,5 +302,5 @@ async def test_full_wiring_runs_new_checks_and_skips_domain_checks_on_loopback()
                                options=ProbeOptions(timeout=1))
     assert "methods" in rep.stats
     skipped = {f.check for f in rep.findings if "skipped" in f.title}
-    assert {"dns", "subdomains", "email"} <= skipped
+    assert {"dns", "email"} <= skipped
     assert not any(f.check == "email" and "relay" in f.title.lower() for f in rep.findings)

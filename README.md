@@ -302,22 +302,18 @@ More checks (all read-only unless stated):
 
 ```bash
 esuls-probe dns        example.com          # open resolver, AXFR, DNSSEC per authoritative NS
-esuls-probe subdomains example.com          # crt.sh (CT logs) enumeration + dangling-CNAME takeover
 esuls-probe email      example.com --check-open-relay   # opt-in: EHLO/MAIL/RCPT to the MX, never DATA
 esuls-probe methods    https://example.com  # OPTIONS Allow + TRACE
 ```
 
 `dns` sends one recursive query for an external name and one AXFR attempt to each
-authoritative nameserver (answered/allowed is high). `subdomains` asks crt.sh, not your
-target, for names, then flags CNAMEs to a non-existent name or to a known "unclaimed"
-page (GitHub Pages, S3, Heroku, Azure, ...) as possible takeovers; your `-H`/`--cookie`
-are never sent to crt.sh or third parties. `email` also lists the SPF `include:`/`ip4:`/
+authoritative nameserver (answered/allowed is high). `email` lists the SPF `include:`/`ip4:`/
 `ip6:` mechanisms so a stale sender is easy to spot; `--check-open-relay` (more invasive,
 never in `full`) tries `RCPT TO` an external address and stops before `DATA`. `methods`
 reports advertised `PUT/DELETE/CONNECT/PATCH/TRACE` (advertised, not confirmed; no write
 request is sent) and a TRACE echo. `paths` flags autoindex pages as "directory listing
-enabled" and `exposed` notes a `security.txt`. `full` runs `dns`, `subdomains` and
-`methods` too (domain checks skip IP/loopback targets).
+enabled" and `exposed` notes a `security.txt`. `full` runs `dns` and `methods`
+too (domain checks skip IP/loopback targets).
 
 Shared options: `-c/--concurrency` (10), `--timeout` (10s), `--delay`, `-H 'Name: value'`,
 `--cookie`, `--user-agent`, `--insecure`, `--json`, `-o FILE`. Exit codes:

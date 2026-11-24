@@ -7,7 +7,7 @@ import click
 
 from . import (
     ProbeOptions, check_auth, check_cors, check_dns, check_email, check_exposed, check_headers,
-    check_methods, check_paths, check_ports, check_ratelimit, check_subdomains, check_tls, run_full_probe,
+    check_methods, check_paths, check_ports, check_ratelimit, check_tls, run_full_probe,
 )
 from .full import ALL_CHECKS
 from .ports import parse_ports
@@ -267,14 +267,6 @@ async def auth_cmd(target, options, auth_path, auth_method, auth_user_field, aut
 @shared_options
 async def dns_cmd(target, options):
     return await check_dns(target, options)
-
-
-@app.command("subdomains", help="Enumerate subdomains from Certificate Transparency logs (queries crt.sh, NOT the "
-             "target) and flag dangling-CNAME takeovers (NXDOMAIN target or a known 'unclaimed' page; one GET "
-             "per candidate). Your -H/--cookie are not sent to crt.sh. DOMAIN or URL. " + EXIT_HELP)
-@shared_options
-async def subdomains_cmd(target, options):
-    return await check_subdomains(target, options)
 
 
 @app.command("methods", help="Advertised HTTP methods (OPTIONS Allow / Access-Control-Allow-Methods) and one TRACE "
