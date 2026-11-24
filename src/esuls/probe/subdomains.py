@@ -6,6 +6,7 @@ whose "unclaimed" page matches, flag a possible takeover (one GET to the subdoma
 Your own headers/cookie are never forwarded to crt.sh or to third-party hosts."""
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import time
@@ -41,6 +42,28 @@ FINGERPRINTS = [
     (("myshopify.com",), "Sorry, this shop is currently unavailable", "Shopify"),
     (("fastly.net",), "Fastly error: unknown domain", "Fastly"),
 ]
+
+
+CT_ATTEMPTS = 3
+CT_BACKOFF = 1.5            # seconds before attempt 2; doubles before attempt 3
+RETRY_STATUSES = (502, 503, 504)
+
+
+async def _backoff(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+async def _fetch_ct(s: Session, url: str) -> tuple[Optional[Resp], int]:
+    """crt.sh is flaky (502s, timeouts): retry those, never a 200 or a 4xx.
+    Bounded: CT_ATTEMPTS tries, each limited by the user's --timeout."""
+    r: Optional[Resp] = None
+    for attempt in range(1, CT_ATTEMPTS + 1):
+        r = await s.fetch(url, max_bytes=8_000_000)
+        if r is not None and r.status not in RETRY_STATUSES:
+            return r, attempt
+        if attempt < CT_ATTEMPTS:
+            await _backoff(CT_BACKOFF * 2 ** (attempt - 1))
+    return r, CT_ATTEMPTS
 
 
 def parse_ct(body: str, domain: str) -> list[str]:
@@ -104,12 +127,12 @@ async def check_subdomains(
     # third-party requests: never forward the user's headers/cookie
     clean = dataclasses.replace(options, headers={}, cookie=None)
     async with Session("https://crt.sh", clean, client) as s:
-        r = await s.fetch(CRT_URL.format(domain=quote(domain)), max_bytes=8_000_000)
+        r, attempts = await _fetch_ct(s, CRT_URL.format(domain=quote(domain)))
         names: list[str] = []
         if r is None or r.status != 200:
             report.add(CHECK, "info", "https://crt.sh", "CT lookup failed",
-                       f"crt.sh answered {r.status if r else 'no response'}; subdomains could not be enumerated "
-                       "(crt.sh is often slow or rate-limited, retry later).")
+                       f"crt.sh answered {r.status if r else 'no response'} after {attempts} attempt(s); subdomains could "
+                       "not be enumerated (crt.sh is often slow or rate-limited, retry later).")
         else:
             try:
                 names = parse_ct(r.text, domain)

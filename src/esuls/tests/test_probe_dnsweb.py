@@ -174,7 +174,65 @@ async def test_subdomain_list_is_capped():
     assert f.title.startswith("80 subdomain") and "(+30 more)" in f.detail
 
 
-async def test_crtsh_failure_is_info_not_error():
+@pytest.fixture
+def no_sleep(monkeypatch):
+    from esuls.probe import subdomains as S
+    delays = []
+
+    async def fake(d):
+        delays.append(d)
+    monkeypatch.setattr(S, "_backoff", fake)
+    return delays
+
+
+async def test_crtsh_retries_502_then_succeeds(no_sleep):
+    calls = {"n": 0}
+
+    def h(req):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return httpx.Response(502, text="bad gateway")
+        return httpx.Response(200, text=json.dumps(CT))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(h))
+    rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}))
+    assert calls["n"] == 3 and no_sleep == [1.5, 3.0]
+    assert "5 subdomain(s) in Certificate Transparency logs" in by_title(rep) and "CT lookup failed" not in by_title(rep)
+
+
+async def test_crtsh_retries_transport_errors_but_not_4xx_or_200(no_sleep):
+    n = {"i": 0}
+
+    def flaky(req):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise httpx.ReadTimeout("slow")
+        return httpx.Response(200, text=json.dumps(CT))
+    rep = await check_subdomains("example.it", client=httpx.AsyncClient(transport=httpx.MockTransport(flaky)),
+                                 resolver=FakeResolver({}))
+    assert n["i"] == 2 and "CT lookup failed" not in by_title(rep)
+    n["i"] = 0
+
+    def forbidden(req):
+        n["i"] += 1
+        return httpx.Response(429, text="slow down")
+    rep = await check_subdomains("example.it", client=httpx.AsyncClient(transport=httpx.MockTransport(forbidden)),
+                                 resolver=FakeResolver({}))
+    assert n["i"] == 1 and "CT lookup failed" in by_title(rep)      # 4xx: single attempt
+
+
+async def test_crtsh_persistent_502_is_graceful_and_bounded(no_sleep):
+    n = {"i": 0}
+
+    def h(req):
+        n["i"] += 1
+        return httpx.Response(502)
+    rep = await check_subdomains("example.it", client=httpx.AsyncClient(transport=httpx.MockTransport(h)),
+                                 resolver=FakeResolver({}))
+    f = by_title(rep)["CT lookup failed"]
+    assert n["i"] == 3 and "3 attempt(s)" in f.detail and not rep.errors and rep.exit_code == 0
+
+
+async def test_crtsh_failure_is_info_not_error(no_sleep):
     for kw in ({"ct_status": 502}, {"ct_body": "<html>bad gateway"}):
         client, _ = ct_client(**kw)
         rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}))
