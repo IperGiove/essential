@@ -163,6 +163,10 @@ async def test_non_protocol_service_records_raw_banner_and_silent_port_does_not_
     rep = await check_ports("127.0.0.1", ProbeOptions(timeout=10), ports=[silent.port],
                             service_map={silent.port: "smtp"})
     assert time.monotonic() - t0 < 6 and rep.exit_code == 0     # read cap, not the 10s timeout
+    # A silent port is reported as "no banner", not as an unexpected protocol.
+    titles = by_title(rep)
+    assert "No SMTP banner within the timeout" in titles
+    assert not any("did not speak" in t for t in titles)
 
 
 async def test_no_banner_is_bare_connect(fake):

@@ -108,8 +108,16 @@ async def fingerprint(host: str, port: int, service: str, timeout: float, plaint
 
 def _raw_banner(res: BannerResult, svc: str, lines: list[str]) -> None:
     res.banner = _clip(" | ".join(lines))
-    res.findings.append(("info", f"{svc} did not speak the expected protocol",
-                         f"raw banner: {res.banner or '(none within timeout)'}"))
+    if res.banner:
+        res.findings.append(("info", f"{svc} did not speak the expected protocol",
+                             f"raw banner: {res.banner}"))
+    else:
+        # Nothing arrived at all: the port accepts a connection but sends no
+        # greeting in time. Most often the service is filtered upstream (e.g. an
+        # ISP blocking outbound 25) or greet-delayed, not a wrong protocol.
+        res.findings.append(("info", f"No {svc} banner within the timeout",
+                             "port connects but sent no greeting — likely filtered "
+                             "upstream or greet-delayed; raise --timeout to retry"))
 
 
 async def _ftp(c: _Conn, res: BannerResult, port: int, pa: bool) -> None:
