@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 — 2026-11-24
 
 ### Page boxes, text positions, and `esuls-pdf compare`
 
