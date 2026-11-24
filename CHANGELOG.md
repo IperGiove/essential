@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 — 2026-11-24
 
 ### `esuls-probe`: dns, subdomains, open relay, HTTP methods
 
