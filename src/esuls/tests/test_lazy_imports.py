@@ -37,7 +37,7 @@ def test_import_esuls_does_not_pull_the_heavy_stack():
         assert esuls.run_parallel is not None
 
         leaked = [m for m in ("playwright", "playwright_stealth", "curl_cffi", "pypdf",
-                              "pyhanko")
+                              "pyhanko", "click")
                   if m in sys.modules]
         assert not leaked, f"import esuls eagerly pulled optional deps: {leaked}"
         print("OK")

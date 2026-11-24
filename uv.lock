@@ -356,8 +356,17 @@ wheels = [
 ]
 
 [[package]]
+name = "dnspython"
+version = "2.9.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/49/900383b471c645a3c397f47b3211d1fcecb3a540c98f683494cdf86b33de/dnspython-2.9.2.tar.gz", hash = "sha256:8d4d39a513e649d634004ce4d39ade2352efcea472a0247535a5c2d18a9d7ba9", size = 455484, upload-time = "2026-11-03T23:56:53.601Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/0c/5346358b3a20275d256978c35203ddc2c8617f78c1b23795b79ba22ced6d/dnspython-2.9.2-py3-none-any.whl", hash = "sha256:af15f7d385a6ae2fb35a796fde2138004c8c42c7389090e2addc83e3b3340fd8", size = 360455, upload-time = "2026-11-03T23:56:52.088Z" },
+]
+
+[[package]]
 name = "esuls"
-version = "0.12.1"
+version = "0.14.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -369,6 +378,7 @@ dependencies = [
 all = [
     { name = "click" },
     { name = "curl-cffi" },
+    { name = "dnspython" },
     { name = "fake-useragent" },
     { name = "httpx", extra = ["http2"] },
     { name = "omegaconf" },
@@ -399,6 +409,11 @@ pdf-sign = [
     { name = "pyhanko" },
     { name = "pypdf" },
 ]
+probe = [
+    { name = "click" },
+    { name = "dnspython" },
+    { name = "httpx", extra = ["http2"] },
+]
 scraping = [
     { name = "curl-cffi" },
     { name = "fake-useragent" },
@@ -418,9 +433,12 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = "==0.22.1" },
     { name = "click", marker = "extra == 'pdf'", specifier = ">=8.1" },
+    { name = "click", marker = "extra == 'probe'", specifier = ">=8.1" },
     { name = "curl-cffi", marker = "extra == 'scraping'", specifier = ">=0.13.0" },
-    { name = "esuls", extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons"], marker = "extra == 'all'" },
+    { name = "dnspython", marker = "extra == 'probe'", specifier = ">=2.6" },
+    { name = "esuls", extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons", "probe"], marker = "extra == 'all'" },
     { name = "esuls", extras = ["http"], marker = "extra == 'icons'" },
+    { name = "esuls", extras = ["http"], marker = "extra == 'probe'" },
     { name = "esuls", extras = ["http"], marker = "extra == 'scraping'" },
     { name = "esuls", extras = ["pdf"], marker = "extra == 'pdf-sign'" },
     { name = "fake-useragent", marker = "extra == 'scraping'", specifier = ">=2.2.0" },
@@ -435,7 +453,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
     { name = "tf-playwright-stealth", marker = "extra == 'scraping'", specifier = ">=1.2.0" },
 ]
-provides-extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons", "all"]
+provides-extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons", "probe", "all"]
 
 [package.metadata.requires-dev]
 dev = [

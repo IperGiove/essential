@@ -248,6 +248,67 @@ async def fetch_protected_page():
 asyncio.run(fetch_protected_page())
 ```
 
+## Probe (`esuls-probe`)
+
+A self-assessment web probe: point it at **your own** sites to see what is
+exposed and which defenses never trigger (a mini dirsearch plus basic security
+checks). Only scan systems you own or are authorised to test.
+
+```bash
+pip install 'esuls[probe]'
+
+esuls-probe headers   https://example.com             # security headers, cookie flags, http->https
+esuls-probe exposed   https://example.com             # .git, .env, dumps, backups ... (content-validated)
+esuls-probe paths     https://example.com -e php,bak --recursive --depth 2
+esuls-probe paths     https://example.com -w my-words.txt
+esuls-probe cors      https://example.com             # reflected Origin, null, wildcard + credentials
+esuls-probe ratelimit https://example.com/login --path /login --method POST --data 'u=a&p=b' -n 100
+esuls-probe full      https://example.com --json -o report.json
+```
+
+Outside-view checks for a VM or domain (HOST or URL accepted):
+
+```bash
+esuls-probe ports example.com --ports 22,80,443,8000-8010   # TCP connect scan (default ~40 ports)
+esuls-probe tls   example.com                               # cert expiry/SAN/trust, TLS 1.0/1.1
+esuls-probe email example.com --selector default            # SPF / DMARC / DKIM / MX (dnspython)
+esuls-probe auth  https://example.com --auth-path /login --max-attempts 25
+```
+
+`ports` flags dangerous exposures (databases, Caddy admin :2019, RabbitMQ, VNC,
+Prometheus) as medium and a Redis that answers `PING` without AUTH as high; it
+sends nothing else. `auth` sends wrong credentials until the first defense
+(429/503/403/lockout message) fires and then stops; if the cap is reached it
+reports no lockout. **It triggers real bans (fail2ban, WAF) and can lock your
+own IP: only run it on systems you own**; skip it in `full` with `--skip auth`.
+Like `ratelimit`, loopback targets are reported as info unless you pass
+`-H 'X-Forwarded-For: 203.0.113.7'`. `full` runs every HTTP check under its own simulated client IP (`X-Forwarded-For`
+from 203.0.113.0/24, one per check) so the checks do not share a rate-limit bucket and a
+ban from `paths` cannot make `ratelimit`/`auth` look locked at request #1. A user-supplied
+`-H 'X-Forwarded-For: A.B.C.D'` is used as-is for the first HTTP check and the others vary
+inside its /24. `full` also runs `ports`, `tls`, `email`
+and `auth`; `tls` is skipped on plain `http://` targets and `email` on IPs.
+
+Shared options: `-c/--concurrency` (10), `--timeout` (10s), `--delay`, `-H 'Name: value'`,
+`--cookie`, `--user-agent`, `--insecure`, `--json`, `-o FILE`. Exit codes:
+`0` nothing above info, `1` findings low or higher, `3` error.
+`ratelimit` caveats: many frameworks exempt loopback clients from rate limiting
+on purpose (hlweb's `Limiter` does), so probing `http://127.0.0.1:PORT` without
+a forwarding header only yields an info note; add `-H 'X-Forwarded-For: 203.0.113.7'`
+to simulate a remote client. A burst where every answer is an error (403, 422, ...)
+is reported as "could not be assessed" (check `--data`, `--method`, headers).
+Path discovery drops soft-404s (a random-path baseline), and sensitive files are
+only reported when their content validates; secrets are never echoed in evidence.
+
+```python
+import asyncio
+from esuls.probe import ProbeOptions, run_full_probe
+
+report = asyncio.run(run_full_probe("https://example.com", ProbeOptions(concurrency=5)))
+print(report.render_text())      # or report.to_dict()
+raise SystemExit(report.exit_code)
+```
+
 ## Development
 
 ### Project Structure

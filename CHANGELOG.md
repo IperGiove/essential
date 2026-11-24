@@ -58,6 +58,36 @@ looks like one that splits lines.
 placeholders match: they are listed as `unverifiable` with their glyph counts,
 are not used as offset anchors, and right-edge alignment checks skip lines
 without real widths. Tests: `test_pdf_type0.py`.
+## 0.14.0 — 2026-11-24
+
+### `esuls-probe`: ports, auth, tls and email checks (outside view of a VM)
+
+Four new checks (and `full` runs them): `ports` (stdlib TCP connect scan of a
+curated ~40-port set or `--ports 22,80,8000-8010`; dangerous exposures such as
+databases, Caddy admin, RabbitMQ, VNC are medium, Redis answering `PING`
+without AUTH is high), `auth` (wrong-credential logins until the first
+lockout/429/503/403 fires, then stop; medium if nothing defends within
+`--max-attempts`; loopback targets downgraded like `ratelimit`), `tls`
+(certificate expiry, SAN match, trust, negotiated protocol, TLS 1.0/1.1
+acceptance) and `email` (MX, SPF, DMARC, DKIM per `--selector`). The `probe`
+extra now also installs `dnspython>=2.6` (imported lazily by `email` only).
+`full` gains `--skip CHECK`, and runs each HTTP check under its own simulated
+client IP (from `203.0.113.0/24`, or a user-supplied `X-Forwarded-For` as the
+base) so a per-IP rate limit on one check no longer poisons the next.
+
+## 0.13.0 — 2026-11-24
+
+### `esuls-probe`: self-assessment web probe (new `probe` extra)
+
+`pip install 'esuls[probe]'` adds a console script and the `esuls.probe`
+package for scanning your own sites: `paths` (wordlist discovery with a
+mandatory soft-404 baseline, `%EXT%` expansion, `--recursive`), `exposed`
+(`.git`, `.env`, `.DS_Store`, dumps, backups, phpinfo, actuator ... each with a
+content validator so catch-all 200s are not reported; secrets are redacted),
+`headers` (security headers, cookie flags, http->https redirect), `ratelimit`,
+`cors`, and `full` (one merged report; a failing check is recorded as an error
+and the rest still run). Uses `httpx` directly: no redirects, no retries, exact
+headers. `--json`, `-o FILE`; exit 0 = nothing above info, 1 = low+, 3 = error.
 
 ## 0.12.1 — 2026-11-03
 
