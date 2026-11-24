@@ -232,3 +232,29 @@ async def test_full_survives_a_failing_check(monkeypatch):
     assert any(e.startswith("cors: RuntimeError") for e in rep.errors)
     assert {"headers", "exposed", "paths", "ratelimit"} <= set(rep.stats)
     assert rep.exit_code == 3
+
+
+# ── ratelimit: 403/503 only count after a normal answer ───────────────────
+
+@pytest.mark.parametrize("status", [403, 503])
+async def test_ratelimit_always_blocked_is_not_limited(status):
+    rep = await check_ratelimit(T, client=client_for(lambda r: httpx.Response(status)), requests=20)
+    (f,) = rep.findings
+    assert f.severity == "info" and "could not be assessed" in f.title
+    assert "kicked in" not in f.title and "No rate limiting" not in f.title
+
+
+async def test_ratelimit_200_then_403_counts_as_limited():
+    n = {"i": 0}
+
+    def h(req):
+        n["i"] += 1
+        return httpx.Response(403) if n["i"] > 8 else httpx.Response(200)
+    rep = await check_ratelimit(T, ProbeOptions(concurrency=1), client=client_for(h), requests=20)
+    (f,) = rep.findings
+    assert "#9 (403)" in f.title
+
+
+async def test_ratelimit_429_always_counts_even_first():
+    rep = await check_ratelimit(T, client=client_for(lambda r: httpx.Response(429)), requests=5)
+    assert "kicked in at request #1 (429)" in rep.findings[0].title
