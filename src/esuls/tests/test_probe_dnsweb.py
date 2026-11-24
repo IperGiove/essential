@@ -132,3 +132,86 @@ def test_real_recursion_probe_against_a_local_udp_dns_server():
             sock.close()
     # nothing listening: reported, never raised
     assert axfr_probe("127.0.0.1", "example.it", 0.5, port=1)[0] in ("error", "refused")
+
+
+# ── subdomains ────────────────────────────────────────────────────────────
+
+import json
+
+from esuls.probe import check_subdomains
+
+CT = [{"name_value": "example.it\nwww.example.it"}, {"name_value": "*.example.it\napp.example.it"},
+      {"name_value": "old.example.it"}, {"name_value": "blog.example.it"}, {"name_value": "evil.other.com"}]
+
+
+def ct_client(handler_extra=None, ct_status=200, ct_body=None):
+    seen = []
+
+    def h(req):
+        seen.append(req)
+        if req.url.host == "crt.sh":
+            assert "%25.example.it" in str(req.url) or "%.example.it" in req.url.params["q"]
+            return httpx.Response(ct_status, text=json.dumps(CT) if ct_body is None else ct_body)
+        if handler_extra:
+            return handler_extra(req)
+        return httpx.Response(404)
+    return httpx.AsyncClient(transport=httpx.MockTransport(h)), seen
+
+
+async def test_subdomain_enumeration_dedupes_and_scopes():
+    client, seen = ct_client()
+    rep = await check_subdomains("https://www.example.it", client=client, resolver=FakeResolver({}))
+    f = by_title(rep)["5 subdomain(s) in Certificate Transparency logs"]
+    assert f.severity == "info" and "app.example.it" in f.detail and "other.com" not in f.detail
+    assert [r.url.host for r in seen] == ["crt.sh"]            # the target itself is never queried
+
+
+async def test_subdomain_list_is_capped():
+    big = [{"name_value": f"s{i}.example.it"} for i in range(80)]
+    client, _ = ct_client(ct_body=json.dumps(big))
+    rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}), list_cap=50)
+    f = rep.findings[0]
+    assert f.title.startswith("80 subdomain") and "(+30 more)" in f.detail
+
+
+async def test_crtsh_failure_is_info_not_error():
+    for kw in ({"ct_status": 502}, {"ct_body": "<html>bad gateway"}):
+        client, _ = ct_client(**kw)
+        rep = await check_subdomains("example.it", client=client, resolver=FakeResolver({}))
+        assert rep.findings[0].title == "CT lookup failed" and not rep.errors and rep.exit_code == 0
+
+
+async def test_takeover_nxdomain_and_fingerprint_and_clean():
+    res = FakeResolver({
+        ("old.example.it", "CNAME"): ["gone.herokuapp.com."],        # target NXDOMAIN
+        ("blog.example.it", "CNAME"): ["acme.github.io."],           # exists, unclaimed page
+        ("blog.example.it", "A"): [], ("acme.github.io", "A"): ["185.199.108.153"],
+        ("app.example.it", "CNAME"): ["live.github.io."], ("live.github.io", "A"): ["185.199.108.153"],
+    })
+
+    def pages(req):
+        if req.url.host == "blog.example.it":
+            return httpx.Response(404, text="<p>There isn't a GitHub Pages site here.</p>")
+        return httpx.Response(200, text="my real site")
+    client, seen = ct_client(pages)
+    rep = await check_subdomains("example.it", client=client, resolver=res)
+    hits = {f.url: f for f in rep.findings if f.title == "Possible subdomain takeover"}
+    assert set(hits) == {"https://old.example.it", "https://blog.example.it"}
+    assert all(f.severity == "high" for f in hits.values())
+    assert "NXDOMAIN" in hits["https://old.example.it"].detail and "GitHub Pages" in hits["https://blog.example.it"].detail
+    assert rep.exit_code == 1
+
+
+async def test_subdomains_never_forward_user_headers_and_skip_ip():
+    client, seen = ct_client()
+    await check_subdomains("example.it", ProbeOptions(headers={"Authorization": "secret"}, cookie="sid=1"),
+                           client=client, resolver=FakeResolver({}))
+    assert all("authorization" not in r.headers and "cookie" not in r.headers for r in seen)
+    rep = await check_subdomains("127.0.0.1")
+    assert rep.findings[0].title == "Subdomain check skipped"
+
+
+def test_cli_dns_and_subdomains_help():
+    r = CliRunner()
+    assert "crt.sh" in r.invoke(app, ["subdomains", "--help"]).output
+    assert r.invoke(app, ["dns", "--help"]).exit_code == 0
