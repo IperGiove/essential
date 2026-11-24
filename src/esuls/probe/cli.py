@@ -6,7 +6,7 @@ from functools import wraps
 import click
 
 from . import (
-    ProbeOptions, check_auth, check_cors, check_email, check_exposed, check_headers,
+    ProbeOptions, check_auth, check_cors, check_dns, check_email, check_exposed, check_headers,
     check_paths, check_ports, check_ratelimit, check_tls, run_full_probe,
 )
 from .full import ALL_CHECKS
@@ -253,3 +253,11 @@ async def auth_cmd(target, options, auth_path, auth_method, auth_user_field, aut
                             user_field=auth_user_field, pass_field=auth_pass_field,
                             username=auth_username, content_type=auth_content_type,
                             max_attempts=auth_max_attempts)
+
+
+@app.command("dns", help="Authoritative DNS posture: open resolver (recursive query for an external name), "
+             "zone transfer (AXFR) attempt per nameserver, DNSSEC presence. One query per NS; read-only. "
+             "DOMAIN or URL. " + EXIT_HELP)
+@shared_options
+async def dns_cmd(target, options):
+    return await check_dns(target, options)
