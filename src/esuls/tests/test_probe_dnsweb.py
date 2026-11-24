@@ -215,3 +215,75 @@ def test_cli_dns_and_subdomains_help():
     r = CliRunner()
     assert "crt.sh" in r.invoke(app, ["subdomains", "--help"]).output
     assert r.invoke(app, ["dns", "--help"]).exit_code == 0
+
+
+# ── email: SPF mechanisms + open relay ────────────────────────────────────
+
+from esuls.probe import check_email
+from esuls.tests.test_probe_banner import Fake
+from esuls.tests.test_probe_fleet import FakeResolver as MailResolver, _Mx, _Txt
+
+
+@pytest.fixture
+def smtp():
+    made = []
+
+    def make(replies):
+        base = {"EHLO": b"250-mx.example.it\r\n250 SIZE 100\r\n", "MAIL FROM": b"250 sender ok\r\n", "RSET": b"250 ok\r\n"}
+        s = Fake(b"220 mx.example.it ESMTP\r\n", {**base, **replies})
+        made.append(s)
+        return s
+    yield make
+    for s in made:
+        s.close()
+
+
+def mail_records(mx_host="127.0.0.1"):
+    return MailResolver({("example.it", "MX"): [_Mx(10, mx_host)],
+                         ("example.it", "TXT"): [_Txt("v=spf1 include:_spf.arubabusiness.it ip4:192.0.2.0/24 ip6:2001:db8::/32 -all")]})
+
+
+async def test_email_lists_spf_mechanisms():
+    rep = await check_email("example.it", resolver=mail_records())
+    f = by_title(rep)["SPF authorised senders"]
+    assert f.severity == "info" and "include: _spf.arubabusiness.it" in f.detail
+    assert "ip4: 192.0.2.0/24" in f.detail and "ip6: 2001:db8::/32" in f.detail
+
+
+async def test_open_relay_accepts_is_high_and_never_sends_data(smtp):
+    srv = smtp({"RCPT TO": b"250 recipient ok\r\n"})
+    rep = await check_email("example.it", resolver=mail_records(), check_open_relay=True, mx_port=srv.port,
+                            options=ProbeOptions(timeout=3))
+    f = by_title(rep)["Open mail relay"]
+    assert f.severity == "high" and rep.exit_code == 1 and "no mail was sent" in f.detail
+    srv.wait_connections(1)
+    got = b"".join(srv.received).decode()
+    assert not any(ln.upper().startswith("DATA") for ln in got.splitlines())
+    assert got.splitlines() == ["EHLO probe.invalid", "MAIL FROM:<probe@invalid.example>",
+                                "RCPT TO:<relay-test@example.com>", "RSET", "QUIT"]
+
+
+async def test_open_relay_rejecting_server_is_not_high(smtp):
+    srv = smtp({"RCPT TO": b"554 5.7.1 Relay access denied\r\n"})
+    rep = await check_email("example.it", resolver=mail_records(), check_open_relay=True, mx_port=srv.port,
+                            options=ProbeOptions(timeout=3))
+    assert by_title(rep)["Mail relay refused"].severity == "info"
+    assert not any(f.severity == "high" for f in rep.findings)
+
+
+async def test_open_relay_is_opt_in_and_unreachable_25_is_info(smtp):
+    srv = smtp({"RCPT TO": b"250 ok\r\n"})
+    rep = await check_email("example.it", resolver=mail_records())
+    assert not any("relay" in f.title.lower() for f in rep.findings) and srv.received == []
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); dead = s.getsockname()[1]; s.close()
+    rep = await check_email("example.it", resolver=mail_records(), check_open_relay=True, mx_port=dead,
+                            options=ProbeOptions(timeout=2))
+    f = [f for f in rep.findings if "unreachable from here" in f.title]
+    assert f and f[0].severity == "info" and not rep.errors
+
+
+def test_cli_email_relay_flags():
+    out = CliRunner().invoke(app, ["email", "--help"]).output
+    assert "--check-open-relay" in out and "--mx-port" in out and "never" in out.lower()
+    assert "--check-open-relay" not in CliRunner().invoke(app, ["full", "--help"]).output

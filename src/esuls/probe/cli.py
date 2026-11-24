@@ -236,8 +236,14 @@ async def tls_cmd(target, options, port):
 @app.command("email", help="SPF / DMARC / DKIM / MX DNS records of the domain (DNS reads only). " + EXIT_HELP)
 @shared_options
 @_selector_option
-async def email_cmd(target, options, selectors):
-    return await check_email(target, options, selectors=selectors)
+@click.option("--check-open-relay", is_flag=True,
+              help="MORE INVASIVE, off by default: open SMTP sessions to the MX hosts and try RCPT TO an "
+                   "external address (EHLO, MAIL FROM, RCPT TO, RSET, QUIT). Never sends DATA; never in 'full'.")
+@click.option("--mx-port", type=click.IntRange(1, 65535), default=25, show_default=True,
+              help="SMTP port of the MX hosts for the relay test (587 is also tried when this is 25).")
+async def email_cmd(target, options, selectors, check_open_relay, mx_port):
+    return await check_email(target, options, selectors=selectors, check_open_relay=check_open_relay,
+                             mx_port=mx_port)
 
 
 @app.command("auth", help="Send wrong-credential logins until the lockout/rate limit fires, then STOP. "
