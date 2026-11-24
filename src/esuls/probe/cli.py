@@ -7,7 +7,7 @@ import click
 
 from . import (
     ProbeOptions, check_auth, check_cors, check_dns, check_email, check_exposed, check_headers,
-    check_paths, check_ports, check_ratelimit, check_subdomains, check_tls, run_full_probe,
+    check_methods, check_paths, check_ports, check_ratelimit, check_subdomains, check_tls, run_full_probe,
 )
 from .full import ALL_CHECKS
 from .ports import parse_ports
@@ -275,3 +275,11 @@ async def dns_cmd(target, options):
 @shared_options
 async def subdomains_cmd(target, options):
     return await check_subdomains(target, options)
+
+
+@app.command("methods", help="Advertised HTTP methods (OPTIONS Allow / Access-Control-Allow-Methods) and one TRACE "
+             "request. PUT/DELETE/CONNECT/PATCH/TRACE advertised is a medium (advertised, not confirmed writable); "
+             "no write method is ever sent. " + EXIT_HELP)
+@shared_options
+async def methods_cmd(target, options):
+    return await check_methods(target, options)

@@ -17,15 +17,16 @@ from .cors import check_cors
 from .dnscheck import check_dns
 from .exposed import check_exposed
 from .headers import check_headers
+from .methods import check_methods
 from .paths import check_paths
 from .ratelimit import check_ratelimit
 from .report import ProbeReport
 
 # auth goes last: it deliberately triggers lockouts/bans against the source IP.
-ALL_CHECKS = ("headers", "exposed", "cors", "paths", "ratelimit", "ports", "tls", "email", "dns", "subdomains", "auth")
+ALL_CHECKS = ("headers", "exposed", "cors", "methods", "paths", "ratelimit", "ports", "tls", "email", "dns", "subdomains", "auth")
 
 
-HTTP_CHECKS = ("headers", "exposed", "cors", "paths", "ratelimit", "auth")
+HTTP_CHECKS = ("headers", "exposed", "cors", "methods", "paths", "ratelimit", "auth")
 _XFF_BASE = "203.0.113"          # TEST-NET-3 documentation range
 _XFF_FIRST_HOST = 11
 
@@ -97,6 +98,7 @@ async def run_full_probe(
         "headers": lambda o: check_headers(target, o, client=client),
         "exposed": lambda o: check_exposed(target, o, client=client),
         "cors": lambda o: check_cors(target, o, client=client),
+        "methods": lambda o: check_methods(target, o, client=client),
         "paths": lambda o: check_paths(target, o, client=client, wordlist=wordlist,
                                      extensions=extensions, recursive=recursive, depth=depth),
         "ratelimit": lambda o: check_ratelimit(target, o, client=client, path=ratelimit_path,

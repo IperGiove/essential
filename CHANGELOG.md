@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### `esuls-probe`: dns, subdomains, open relay, HTTP methods
+
+- **`dns`**: open resolver (recursive query for an external name, high),
+  AXFR attempt per authoritative nameserver (high), DNSSEC presence.
+- **`subdomains`**: Certificate Transparency enumeration through crt.sh (the
+  target is not queried) and dangling-CNAME takeover detection (NXDOMAIN target
+  or a known "unclaimed" page; high).
+- **`email`**: lists the SPF `include:`/`ip4:`/`ip6:` mechanisms; opt-in
+  `--check-open-relay` / `--mx-port` tries `RCPT TO` an external address on the
+  MX hosts and stops before `DATA` (never part of `full`).
+- **`methods`**: advertised `PUT/DELETE/CONNECT/PATCH/TRACE` (medium) and TRACE
+  echo (XST); never sends a write method.
+- **`paths`** flags autoindex pages (low); **`exposed`** notes `security.txt`.
+- `full` runs `dns`, `subdomains` and `methods`; domain checks skip IPs/loopback.
+
 ## 0.16.0 — 2026-11-24
 
 ### `esuls-probe ports`: service banner and TLS-capability fingerprint

@@ -287,3 +287,96 @@ def test_cli_email_relay_flags():
     out = CliRunner().invoke(app, ["email", "--help"]).output
     assert "--check-open-relay" in out and "--mx-port" in out and "never" in out.lower()
     assert "--check-open-relay" not in CliRunner().invoke(app, ["full", "--help"]).output
+
+
+# ── methods / directory listing / security.txt ────────────────────────────
+
+from esuls.probe import check_exposed, check_methods, check_paths
+
+
+def mclient(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_methods_dangerous_advertised_is_medium_and_no_write_sent():
+    methods = []
+
+    def h(req):
+        methods.append(req.method)
+        if req.method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, HEAD, PUT, DELETE, OPTIONS",
+                                                "Access-Control-Allow-Methods": "GET, PATCH"})
+        return httpx.Response(405)
+    rep = await check_methods("https://site.test", client=mclient(h))
+    t = by_title(rep)
+    assert t["Dangerous HTTP method advertised: PUT"].severity == "medium"
+    assert "Dangerous HTTP method advertised: PATCH" in t and "Dangerous HTTP method advertised: DELETE" in t
+    assert "not confirmed writable" in t["Dangerous HTTP method advertised: PUT"].detail
+    assert set(methods) == {"OPTIONS", "TRACE"} and rep.exit_code == 1       # no PUT/DELETE/PATCH ever sent
+
+
+async def test_methods_safe_allow_and_trace_echo():
+    safe = await check_methods("https://site.test", client=mclient(
+        lambda r: httpx.Response(200, headers={"Allow": "GET, HEAD, OPTIONS"}) if r.method == "OPTIONS" else httpx.Response(405)))
+    assert not any(f.severity != "info" for f in safe.findings) and safe.exit_code == 0
+
+    def echo(req):
+        if req.method == "TRACE":
+            return httpx.Response(200, text="TRACE / HTTP/1.1\r\n" + "\r\n".join(f"{k}: {v}" for k, v in req.headers.items()))
+        return httpx.Response(200)
+    rep = await check_methods("https://site.test", client=mclient(echo))
+    assert by_title(rep)["TRACE enabled (XST)"].severity == "medium"
+    notecho = await check_methods("https://site.test", client=mclient(lambda r: httpx.Response(200, text="hello")))
+    assert "TRACE enabled (XST)" not in by_title(notecho)
+
+
+async def test_paths_directory_listing_is_low():
+    def h(req):
+        if req.url.path == "/backup/":
+            return httpx.Response(200, text="<html><head><title>Index of /backup/</title></head><body><h1>Index of /backup/</h1>" + "x" * 300)
+        if req.url.path == "/admin":
+            return httpx.Response(200, text="<html>login form " + "y" * 300)
+        return httpx.Response(404, text="nf")
+    rep = await check_paths("https://site.test", client=mclient(h), wordlist=["backup/", "admin"])
+    t = by_title(rep)
+    assert t["Directory listing enabled at /backup/"].severity == "low"
+    assert "Directory listing enabled at /admin" not in t and rep.exit_code == 1
+
+
+async def test_paths_autoindex_catch_all_is_still_dropped_by_baseline():
+    h = lambda r: httpx.Response(200, text="<title>Index of /</title>" + "z" * 100)
+    rep = await check_paths("https://site.test", client=mclient(h), wordlist=["backup/"])
+    assert rep.findings == []
+
+
+def test_autoindex_signatures():
+    from esuls.probe.paths import is_autoindex
+    assert is_autoindex(b"<html><head><title>Index of /x</title>")
+    assert is_autoindex(b"<title>Directory listing for /</title>")
+    assert is_autoindex(b'<a href="?sort=namedirfirst">Name</a>')
+    assert not is_autoindex(b"<html><title>My site</title>")
+
+
+async def test_security_txt_present_info_and_absent_silent():
+    def h(req):
+        if req.url.path == "/.well-known/security.txt":
+            return httpx.Response(200, text="Contact: mailto:security@example.it\nExpires: 2030-01-01T00:00:00Z\n")
+        return httpx.Response(404)
+    rep = await check_exposed("https://site.test", client=mclient(h))
+    f = by_title(rep)["security.txt present (good practice)"]
+    assert f.severity == "info" and rep.exit_code == 0
+    none = await check_exposed("https://site.test", client=mclient(lambda r: httpx.Response(404)))
+    assert none.findings == []
+    html = await check_exposed("https://site.test", client=mclient(lambda r: httpx.Response(200, text="<html>Contact: x</html>")))
+    assert html.findings == []
+
+
+async def test_full_wiring_runs_new_checks_and_skips_domain_checks_on_loopback():
+    from esuls.probe import run_full_probe
+    rep = await run_full_probe("http://127.0.0.1:9", client=mclient(lambda r: httpx.Response(404, text="nf")),
+                               wordlist=["a"], ratelimit_requests=2, auth_max_attempts=2, ports=[9],
+                               options=ProbeOptions(timeout=1))
+    assert "methods" in rep.stats
+    skipped = {f.check for f in rep.findings if "skipped" in f.title}
+    assert {"dns", "subdomains", "email"} <= skipped
+    assert not any(f.check == "email" and "relay" in f.title.lower() for f in rep.findings)

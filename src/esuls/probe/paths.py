@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from dataclasses import dataclass
 from importlib import resources
@@ -14,6 +15,16 @@ from ._http import ProbeOptions, Resp, Session
 from .report import ProbeReport
 
 CHECK = "paths"
+AUTOINDEX_RE = re.compile(
+    r"<title>\s*Index of /|<h1>\s*Index of /|<title>\s*Directory listing for /|\[To Parent Directory\]"
+    r"|href=\"\?sort=name|<title>\s*Directory Listing For", re.I)
+
+
+def is_autoindex(body: bytes) -> bool:
+    """Apache/nginx/lighttpd ('Index of /'), python http.server, IIS, Caddy browse."""
+    return AUTOINDEX_RE.search(body[:8192].decode("utf-8", "replace")) is not None
+
+
 EXISTS_STATUSES = {200, 201, 202, 204, 301, 302, 303, 307, 308, 401, 403}
 
 
@@ -110,6 +121,9 @@ async def check_paths(
                                f"status {resp.status}, {resp.size} bytes"
                                + (f", -> {resp.headers['location']}" if "location" in resp.headers else ""),
                                None)
+                    if resp.status == 200 and is_autoindex(resp.body):
+                        report.add(CHECK, "low", s.url(path), f"Directory listing enabled at /{path}",
+                                   "The server returns an auto-generated index of the directory's files.")
                     last = path.rstrip("/").rsplit("/", 1)[-1]
                     if recursive and "." not in last:
                         nxt.append(path.rstrip("/") + "/")

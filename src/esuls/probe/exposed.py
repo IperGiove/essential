@@ -132,6 +132,13 @@ def _v_aws(r: Resp) -> Optional[str]:
     return "AWS credentials keys (redacted)" if re.search(r"aws_access_key_id\s*=", r.text, re.I) else None
 
 
+def _v_security_txt(r: Resp) -> Optional[str]:
+    if _is_html(r) or r.size > 65536:
+        return None
+    m = re.search(r"^Contact:\s*(\S+)", r.text, re.M | re.I)
+    return "Contact field present" if m else None
+
+
 @dataclass(frozen=True)
 class Exposure:
     path: str
@@ -179,6 +186,8 @@ EXPOSURES: list[Exposure] = [
     Exposure("id_rsa", "Exposed SSH private key (id_rsa)", "high", _v_privkey),
     Exposure(".ssh/id_rsa", "Exposed SSH private key (.ssh/id_rsa)", "high", _v_privkey),
     Exposure("actuator/env", "Spring Boot actuator /env exposed", "high", _v_actuator_env),
+    Exposure(".well-known/security.txt", "security.txt present (good practice)", "info", _v_security_txt),
+    Exposure("security.txt", "security.txt present (good practice)", "info", _v_security_txt),
     Exposure(".vscode/sftp.json", "Exposed VS Code SFTP config", "high", _v_sftp),
 ]
 
