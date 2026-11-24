@@ -18,20 +18,38 @@ class Fake:
     def __init__(self, greeting: bytes, replies: dict, ctx: ssl.SSLContext | None = None, silent=False):
         self.greeting, self.replies, self.ctx, self.silent = greeting, replies, ctx, silent
         self.received: list[bytes] = []
+        # Bind + listen synchronously: the port is connectable the moment we return.
         self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(8)
         self.port = self.sock.getsockname()[1]
-        self._stop = False
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._stop = threading.Event()
+        self._cond = threading.Condition()
+        self._finished = 0
+        self._threads: list[threading.Thread] = [threading.Thread(target=self._loop, daemon=True)]
+        self._threads[0].start()
 
     def _loop(self):
-        while not self._stop:
+        self.sock.settimeout(0.05)      # close() cannot interrupt a blocking accept() on Linux
+        while not self._stop.is_set():
             try:
                 c, _ = self.sock.accept()
+            except TimeoutError:
+                continue
             except OSError:
                 return
-            threading.Thread(target=self._serve, args=(c,), daemon=True).start()
+            t = threading.Thread(target=self._serve, args=(c,), daemon=True)
+            self._threads.append(t)
+            t.start()
+
+    def wait_connections(self, n: int, timeout: float = 10.0) -> None:
+        """Block until n connections were accepted AND fully handled. The client
+        closes right after QUIT, so without this the handler thread may not have
+        recorded the last lines yet when the test asserts on `received`."""
+        with self._cond:
+            assert self._cond.wait_for(lambda: self._finished >= n, timeout), \
+                f"only {self._finished}/{n} connections finished"
 
     def _serve(self, c):
         try:
@@ -39,7 +57,7 @@ class Fake:
             if self.ctx:
                 c = self.ctx.wrap_socket(c, server_side=True)
             if self.silent:
-                threading.Event().wait(6)
+                self._stop.wait(6)
                 return
             c.sendall(self.greeting)
             f = c.makefile("rb")
@@ -65,10 +83,15 @@ class Fake:
                 c.close()
             except OSError:
                 pass
+            with self._cond:
+                self._finished += 1
+                self._cond.notify_all()
 
     def close(self):
-        self._stop = True
+        self._stop.set()
         self.sock.close()
+        for t in self._threads:
+            t.join(timeout=5)
 
 
 @pytest.fixture
@@ -88,7 +111,10 @@ def by_title(rep):
     return {f.title: f for f in rep.findings}
 
 
-def sent(srv):
+def sent(srv, conns=2):
+    """What the fake received. A banner scan opens 2 connections (bare connect +
+    fingerprint); pass conns=1 for --no-banner. Waits until they are all handled."""
+    srv.wait_connections(conns)
     return b"".join(srv.received).decode()
 
 
@@ -149,7 +175,7 @@ async def test_ssh_banner_only_sends_nothing(fake):
     srv = fake(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3\r\n", {})
     rep = await check_ports("127.0.0.1", OPTS, ports=[srv.port], service_map={srv.port: "ssh"})
     f = next(f for f in rep.findings if f.title.startswith("SSH version"))
-    assert f.severity == "info" and "OpenSSH_9.6p1" in f.title and srv.received == []
+    assert f.severity == "info" and "OpenSSH_9.6p1" in f.title and sent(srv) == ""
 
 
 async def test_non_protocol_service_records_raw_banner_and_silent_port_does_not_hang(fake):
@@ -173,7 +199,7 @@ async def test_no_banner_is_bare_connect(fake):
     srv = fake(FTP_BANNER, {"FEAT": FEAT_PLAIN})
     rep = await check_ports("127.0.0.1", OPTS, ports=[srv.port], service_map={srv.port: "ftp"}, banner=False)
     assert [f.severity for f in rep.findings] == ["info"] and len(rep.findings) == 1
-    assert srv.received == []
+    assert sent(srv, 1) == ""
     assert "banner" not in rep.findings[0].detail
 
 
