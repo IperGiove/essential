@@ -258,3 +258,30 @@ async def test_ratelimit_200_then_403_counts_as_limited():
 async def test_ratelimit_429_always_counts_even_first():
     rep = await check_ratelimit(T, client=client_for(lambda r: httpx.Response(429)), requests=5)
     assert "kicked in at request #1 (429)" in rep.findings[0].title
+
+
+async def test_ratelimit_all_422_is_unassessable_not_medium():
+    rep = await check_ratelimit(T, client=client_for(lambda r: httpx.Response(422)), requests=15,
+                                method="POST", data="x=1")
+    (f,) = rep.findings
+    assert f.severity == "info" and "422" in f.title and "could not be assessed" in f.title
+    assert "--data" in f.detail
+
+
+async def test_ratelimit_loopback_without_xff_is_downgraded_with_hint():
+    rep = await check_ratelimit("http://127.0.0.1:8000", client=client_for(lambda r: httpx.Response(200)), requests=10)
+    (f,) = rep.findings
+    assert f.severity == "info" and "loopback" in f.title
+    assert "X-Forwarded-For: 203.0.113.7" in f.detail and "exempt" in f.detail
+
+
+@pytest.mark.parametrize("host", ["http://localhost:8000", "http://[::1]:8000", "http://127.0.0.5"])
+async def test_ratelimit_other_loopback_forms(host):
+    rep = await check_ratelimit(host, client=client_for(lambda r: httpx.Response(200)), requests=5)
+    assert rep.findings[0].severity == "info"
+
+
+async def test_ratelimit_loopback_with_xff_still_medium():
+    rep = await check_ratelimit("http://127.0.0.1:8000", ProbeOptions(headers={"x-forwarded-for": "203.0.113.7"}),
+                                client=client_for(lambda r: httpx.Response(200)), requests=10)
+    assert [f.severity for f in rep.findings] == ["medium"]

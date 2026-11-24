@@ -124,7 +124,11 @@ async def headers_cmd(target, options):
     return await check_headers(target, options)
 
 
-@app.command("ratelimit", help="Burst requests and look for 429/403/503. " + EXIT_HELP)
+@app.command("ratelimit", help="Burst requests and look for 429/403/503. "
+             "Loopback targets (127.0.0.1, ::1, localhost) are often exempt from rate limiting by the "
+             "server itself (e.g. hlweb's Limiter); without an X-Forwarded-For/Forwarded/X-Real-IP header "
+             "'no limiting' is then only reported as info. Re-run with -H 'X-Forwarded-For: 203.0.113.7'. "
+             "A burst where every answer is an error (e.g. 422) cannot be assessed. " + EXIT_HELP)
 @shared_options
 @_ratelimit_options
 async def ratelimit_cmd(target, options, rl_path, rl_method, rl_data, rl_requests):

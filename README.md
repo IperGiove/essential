@@ -269,6 +269,11 @@ esuls-probe full      https://example.com --json -o report.json
 Shared options: `-c/--concurrency` (10), `--timeout` (10s), `--delay`, `-H 'Name: value'`,
 `--cookie`, `--user-agent`, `--insecure`, `--json`, `-o FILE`. Exit codes:
 `0` nothing above info, `1` findings low or higher, `3` error.
+`ratelimit` caveats: many frameworks exempt loopback clients from rate limiting
+on purpose (hlweb's `Limiter` does), so probing `http://127.0.0.1:PORT` without
+a forwarding header only yields an info note; add `-H 'X-Forwarded-For: 203.0.113.7'`
+to simulate a remote client. A burst where every answer is an error (403, 422, ...)
+is reported as "could not be assessed" (check `--data`, `--method`, headers).
 Path discovery drops soft-404s (a random-path baseline), and sensitive files are
 only reported when their content validates; secrets are never echoed in evidence.
 
