@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### `esuls-probe ports`: service banner and TLS-capability fingerprint
+
+Known service ports are now fingerprinted read-only: FTP (`FEAT`), SMTP
+(`EHLO`), POP3 (`CAPA`), IMAP (`CAPABILITY`) and SSH (banner only), each with
+the protocol's quit, never authenticating. A server not advertising
+`AUTH TLS` / `STARTTLS` / `STLS` is a medium plaintext finding; banner and
+server hostname are in the detail. Implicit-TLS ports 465/993/995 get a TLS
+connect and an info finding. Per-read cap of 3s. `--no-banner` falls back to a
+bare connect; the opt-in `--check-plaintext-auth` sends one non-credential
+login step (never a password) to see whether TLS is enforced first.
+
 ## 0.15.0 — 2026-11-24
 
 ### Page boxes, text positions, and `esuls-pdf compare`

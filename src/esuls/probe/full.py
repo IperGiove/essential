@@ -76,6 +76,7 @@ async def run_full_probe(
     ratelimit_data: Optional[str] = None,
     ratelimit_requests: int = 60,
     ports: Optional[Sequence[int]] = None,
+    banner: bool = True,
     tls_port: Optional[int] = None,
     selectors: Sequence[str] = (),
     auth_path: str = "/login",
@@ -99,7 +100,7 @@ async def run_full_probe(
         "ratelimit": lambda o: check_ratelimit(target, o, client=client, path=ratelimit_path,
                                              method=ratelimit_method, data=ratelimit_data,
                                              requests=ratelimit_requests),
-        "ports": lambda o: check_ports(target, o, ports=ports),
+        "ports": lambda o: check_ports(target, o, ports=ports, banner=banner),
         "tls": lambda o: (_skipped(target, "tls", "target is plain http://; no TLS to assess")
                         if target.strip().lower().startswith("http://") and not tls_port
                         else check_tls(target, o, port=tls_port)),

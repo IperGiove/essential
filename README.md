@@ -275,6 +275,15 @@ esuls-probe email example.com --selector default            # SPF / DMARC / DKIM
 esuls-probe auth  https://example.com --auth-path /login --max-attempts 25
 ```
 
+`ports` also fingerprints known service ports read-only (on by default, `--no-banner`
+disables): FTP 21, SMTP 25/587, POP3 110, IMAP 143 and SSH 22 get banner + one
+capability command (`FEAT`/`EHLO`/`CAPA`/`CAPABILITY`) + quit, no authentication; a
+server with no `AUTH TLS`/`STARTTLS`/`STLS` is a medium "plaintext" finding, the banner
+goes in the detail. Implicit-TLS ports 465/993/995 get a permissive TLS connect and an
+info finding. The opt-in `--check-plaintext-auth` (more invasive, not used by `full`)
+sends one non-credential login step to see whether TLS is enforced first; no password is
+ever sent.
+
 `ports` flags dangerous exposures (databases, Caddy admin :2019, RabbitMQ, VNC,
 Prometheus) as medium and a Redis that answers `PING` without AUTH as high; it
 sends nothing else. `auth` sends wrong credentials until the first defense

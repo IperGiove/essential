@@ -13,6 +13,7 @@ import time
 from typing import Optional, Sequence
 
 from ..utils import run_parallel
+from . import banner as _banner
 from ._http import ProbeOptions, record_stats, split_host_port
 from .report import ProbeReport
 
@@ -101,7 +102,12 @@ async def check_ports(
     *,
     ports: Optional[Sequence[int]] = None,
     redis_ports: Sequence[int] = (6379,),
+    banner: bool = True,
+    plaintext_auth: bool = False,
+    service_map: Optional[dict] = None,
 ) -> ProbeReport:
+    """banner: fingerprint known service ports (read-only). plaintext_auth: opt-in
+    extra step asking whether TLS is enforced before login (never sends credentials)."""
     options = options or ProbeOptions()
     host, url_port = split_host_port(target)
     report = ProbeReport(target=host or target)
@@ -119,6 +125,18 @@ async def check_ports(
     if len(errs) == len(plist):
         report.errors.append(f"{CHECK}: cannot resolve {host} ({errs[0][6:]})")
     open_ports = [p for p, v in states.items() if v == "open"]
+    smap = dict(_banner.SERVICES if service_map is None else service_map)
+    fps: dict = {}
+    if banner:
+        todo = [p for p in open_ports if p in smap or p in _banner.IMPLICIT_TLS]
+
+        async def fp(p):
+            if p in smap:
+                return await _banner.fingerprint(host, p, smap[p], options.timeout, plaintext_auth)
+            return await _banner.implicit_tls(host, p, _banner.IMPLICIT_TLS[p], options.timeout)
+        for p, r in zip(todo, await run_parallel(*[fp(p) for p in todo], limit=max(options.concurrency, 1))):
+            if isinstance(r, _banner.BannerResult):
+                fps[p] = r
     for p in open_ports:
         svc, dangerous = PORTS.get(p, ("unknown service", False))
         sev, title, detail = ("medium" if dangerous else "info"), f"Open port {p}/tcp ({svc})", ""
@@ -131,7 +149,12 @@ async def check_ports(
                 detail = "PING answered +PONG without authentication: anyone can read/write the datastore."
             elif state == "auth":
                 detail = "Redis demands AUTH (PING refused); still should not face the internet."
+        if p in fps and fps[p].banner:
+            detail = (detail + " " if detail else "") + f"banner: {fps[p].banner}"
         report.add(CHECK, sev, f"{host}:{p}", title, detail)
+        if p in fps:
+            for fsev, ftitle, fdetail in fps[p].findings:
+                report.add(CHECK, fsev, f"{host}:{p}", ftitle, fdetail)
     counts = {k: sum(1 for v in states.values() if v == k) for k in ("open", "closed", "filtered")}
     record_stats(report, CHECK, len(plist) + sum(1 for p in open_ports if p in redis_ports), 0, t0)
     report.stats[CHECK].update(counts, open_ports=open_ports)

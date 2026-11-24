@@ -130,6 +130,11 @@ def _selector_option(fn):
                         help="DKIM selector to look up (repeatable); none are guessed.")(fn)
 
 
+def _banner_option(fn):
+    return click.option("--no-banner", "no_banner", is_flag=True,
+                        help="Bare connect only: do not read service banners/capabilities.")(fn)
+
+
 @click.group()
 @click.version_option()
 def app():
@@ -187,19 +192,20 @@ async def cors_cmd(target, options):
 @_wordlist_options
 @_ratelimit_options
 @_ports_option
+@_banner_option
 @_selector_option
 @_auth_options
 @click.option("--skip", "skips", multiple=True, type=click.Choice(list(ALL_CHECKS)),
               help="Skip a check (repeatable). 'auth' fires real lockouts: skip it on shared IPs.")
 async def full_cmd(target, options, wordlist, extensions, recursive, depth,
-                   rl_path, rl_method, rl_data, rl_requests, ports_spec, selectors,
+                   rl_path, rl_method, rl_data, rl_requests, ports_spec, no_banner, selectors,
                    auth_path, auth_method, auth_user_field, auth_pass_field, auth_username,
                    auth_content_type, auth_max_attempts, skips):
     return await run_full_probe(
         target, options, wordlist=load_wordlist(wordlist) if wordlist else None,
         extensions=_exts(extensions), recursive=recursive, depth=depth,
         ratelimit_path=rl_path, ratelimit_method=rl_method, ratelimit_data=rl_data,
-        ratelimit_requests=rl_requests, ports=ports_spec, selectors=selectors,
+        ratelimit_requests=rl_requests, ports=ports_spec, banner=not no_banner, selectors=selectors,
         auth_path=auth_path, auth_method=auth_method, auth_user_field=auth_user_field,
         auth_pass_field=auth_pass_field, auth_username=auth_username,
         auth_content_type=auth_content_type, auth_max_attempts=auth_max_attempts,
@@ -207,11 +213,17 @@ async def full_cmd(target, options, wordlist, extensions, recursive, depth,
 
 
 @app.command("ports", help="TCP connect scan: which ports does the internet reach? Open datastores, admin "
-             "APIs etc. are flagged; Redis gets one PING to detect no-auth. HOST or URL. " + EXIT_HELP)
+             "APIs etc. are flagged; Redis gets one PING to detect no-auth. Known service ports (FTP, SMTP, POP3, IMAP, SSH) are fingerprinted read-only: banner + one capability command + quit, no authentication; implicit-TLS ports (465/993/995) get a TLS connect. HOST or URL. " + EXIT_HELP)
 @shared_options
 @_ports_option
-async def ports_cmd(target, options, ports_spec):
-    return await check_ports(target, options, ports=ports_spec)
+@_banner_option
+@click.option("--check-plaintext-auth", is_flag=True,
+              help="MORE INVASIVE, off by default: after TLS is seen advertised, send one non-credential "
+                   "login step (USER anonymous / AUTH LOGIN ...) to see whether TLS is enforced first. "
+                   "No password is ever sent.")
+async def ports_cmd(target, options, ports_spec, no_banner, check_plaintext_auth):
+    return await check_ports(target, options, ports=ports_spec, banner=not no_banner,
+                             plaintext_auth=check_plaintext_auth)
 
 
 @app.command("tls", help="Certificate (expiry, SAN, trust) and TLS 1.0/1.1 acceptance. HOST or URL. " + EXIT_HELP)
