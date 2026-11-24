@@ -5,7 +5,8 @@ Three layers:
 - `inspect`:  pure introspection (summary, revisions, dynamic content)
 - `checker`:  high-level legitimacy verdict (Finding, PdfReport, check_pdf)
 - `content`:  page fonts/images inventory and what each revision added
-- `layout`:   where images land on the page and which text they paint over
+- `layout`:   page boxes, text runs/lines with positions, image placements
+- `compare`:  two documents of the same issuer: fingerprint, layout, anomalies
 - `signatures`: cryptographic signature validation via pyHanko (the
   optional `pdf-sign` extra; imported lazily, so this package works without it)
 
@@ -28,7 +29,14 @@ from .content import (
     read_pdf_images,
     read_pdf_revision_content,
 )
-from .layout import read_pdf_image_placements
+from .compare import compare_pdfs, pdf_fingerprint
+from .layout import (
+    group_text_lines,
+    read_pdf_image_placements,
+    read_pdf_page_boxes,
+    read_pdf_text_lines,
+    read_pdf_text_runs,
+)
 from .inspect import (
     parse_pdf_date,
     read_pdf_dynamic,
@@ -73,6 +81,13 @@ __all__ = [
     "read_pdf_images",
     "read_pdf_revision_content",
     "read_pdf_image_placements",
+    "read_pdf_page_boxes",
+    "read_pdf_text_runs",
+    "read_pdf_text_lines",
+    "group_text_lines",
+    # compare
+    "compare_pdfs",
+    "pdf_fingerprint",
     # checker
     "Finding",
     "PdfReport",

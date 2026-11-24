@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+### Page boxes, text positions, and `esuls-pdf compare`
+
+**`read_pdf_page_boxes()`** — Media/Crop/Bleed/Trim/Art boxes *as written*
+(no defaulting: which boxes a producer writes is a fingerprint), size, rotation
+and the paper format (A4, Letter, …).
+
+**`read_pdf_text_runs()` / `read_pdf_text_lines()`** — every text run with
+baseline origin, estimated end, rendered size, font and paint order; runs
+merged into visual lines with their run count and the extent of the first and
+last gap-separated group (label, value). `inspect --full` prints both.
+
+**`compare_pdfs(suspect, reference)` / `esuls-pdf compare A B [--json]`** —
+for two documents that should come from the same issuer:
+
+- *fingerprint* differences: PDF version, /ID format, metadata, page size and
+  boxes written, font-subset naming (sequential `AAAAAA`-style vs random),
+  resource naming patterns, image encodings, runs per line;
+- *layout*: the offset between the pages (median over identical unique lines
+  and same-size images), labels in common, the fields that differ (token
+  diff), lines moved or present on one side, images paired with their pixel
+  size and encoding;
+- *anomalies*, the edit signals: a line that leaves a column edge the other
+  file keeps (`alignment_break` — e.g. an amount retyped from its old left
+  edge, poking out of a right-aligned column; equal-length text sharing an
+  edge is not taken as a column), a line split into runs differently while
+  the others match (`segmentation`), a line painted in two moments with other
+  text in between (`split_painting` — a value appended after the page was
+  built), a whole line out of order in the stream (`paint_order`), a changed
+  field in another font, size or baseline.
+
+Different values between two genuine documents are expected and are reported
+as information, not anomalies. Tests: `test_pdf_compare.py`, on a synthetic
+statement template with one variant per edit pattern.
+
+### Type0 text decoding, real glyph widths
+
+Text in Type0/Identity-H fonts — what browsers, Skia, Office and most
+libraries write for embedded TrueType — is now decoded directly: 2-byte
+codes, the ToUnicode CMap (`bfchar`, both `bfrange` forms, multi-character
+destinations such as the `fi` ligature) and the descendant's `/W` + `/DW`
+widths. Before, these runs often came out as `[n glyphs]`, and end positions
+used a half-em guess per glyph (lines could end past the page edge).
+
+Also fixed for simple fonts: glyph widths were looked up by character code
+while pypdf keys them by the mapped character, so a default width was used.
+
+Every run and line now says whether its text is real (`decoded`; unmapped
+glyphs show as `�`) and whether `x_end` uses real widths (`widths_known`). A
+"run" is now one text-showing operator: the pieces of a kerned `TJ` array
+count once (`pieces` keeps the raw count), so a generator that kerns no longer
+looks like one that splits lines.
+
+`compare_pdfs` no longer treats undecodable lines as identical because their
+placeholders match: they are listed as `unverifiable` with their glyph counts,
+are not used as offset anchors, and right-edge alignment checks skip lines
+without real widths. Tests: `test_pdf_type0.py`.
+
 ## 0.12.1 — 2026-11-03
 
 ### `inspect --full` no longer prints every logo as "0% of page"

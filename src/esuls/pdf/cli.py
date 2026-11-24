@@ -6,7 +6,8 @@ import click
 
 from .checker import PdfReport, check_pdf
 from .content import read_pdf_content, read_pdf_revision_content
-from .layout import read_pdf_image_placements
+from .compare import compare_pdfs
+from .layout import read_pdf_image_placements, read_pdf_page_boxes, read_pdf_text_lines
 from .inspect import read_pdf_dynamic, read_pdf_revisions, read_pdf_summary
 from .metadata import (
     _normalize_key,
@@ -93,6 +94,110 @@ def inspect_cmd(files, full):
     """Print metadata (Info dict + XMP), and optionally the full forensic surface."""
     for f in files:
         _render_inspect(f, full=full)
+
+
+# ───────────────────────────── compare ────────────────────────────────────
+
+@app.command("compare")
+@click.argument("suspect", type=click.Path(exists=True, dir_okay=False))
+@click.argument("reference", type=click.Path(exists=True, dir_okay=False))
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a report.")
+def compare_cmd(suspect, reference, as_json):
+    """Compare SUSPECT against REFERENCE (a genuine document of the same issuer).
+
+    Reports container differences (different generator or settings), the
+    layout match (offset, labels in common, fields that differ) and the
+    anomalies that point to an edit: broken alignments, lines split or
+    painted differently from the rest, fields in another font/size.
+    """
+    result = compare_pdfs(suspect, reference)
+    if as_json:
+        click.echo(json.dumps(result, indent=2, default=str))
+        return
+    _render_compare(result)
+
+
+def _render_compare(r: dict) -> None:
+    click.echo(f"\n📄 A (suspect):   {r['a']}\n📄 B (reference): {r['b']}")
+
+    _section("Fingerprint")
+    diffs = r["fingerprint"]["differences"]
+    if not diffs:
+        click.echo("  ✅ same container traits — consistent with the same generator")
+    for d in diffs:
+        click.echo(f"  ≠ {d['trait']}: A={d['a']!r}  B={d['b']!r}")
+
+    for pg in r["pages"]:
+        _section(f"Page {pg['page']}")
+        ba, bb = pg["boxes_a"] or {}, pg["boxes_b"] or {}
+        click.echo(f"  size: A {ba.get('width')}×{ba.get('height')} ({ba.get('paper') or '?'})"
+                   f" · B {bb.get('width')}×{bb.get('height')} ({bb.get('paper') or '?'})")
+        off = pg["offset"]
+        click.echo(f"  offset A→B: dx={off['dx']:+g} dy={off['dy']:+g} pt "
+                   f"({off['anchors']} anchors, spread {off['spread']})")
+        click.echo(f"  lines: A {pg['lines_a']} · B {pg['lines_b']} · "
+                   f"in common {pg['same']} · changed {len(pg['changed'])}"
+                   + (f" · unverifiable {len(pg['unverifiable'])}" if pg["unverifiable"] else ""))
+        if pg["unverifiable"]:
+            click.echo("  ⚠️  text not decodable on these lines — same/changed cannot be told:")
+            for u in pg["unverifiable"]:
+                ga, gb = u["glyphs_a"], u["glyphs_b"]
+                cnt = f"  glyphs A {ga} · B {gb}{'  ≠' if ga != gb else ''}" if ga or gb else ""
+                click.echo(f"    ? y={u['b']['y']:g}: A {u['a']['text']!r} · B {u['b']['text']!r}{cnt}")
+        if pg["changed"]:
+            click.echo("  fields that differ:")
+            for c in pg["changed"]:
+                diff = "; ".join(f"{d['a'] or '∅'} → {d['b'] or '∅'}" for d in c["diff"])
+                fl = f"  [{', '.join(c['flags'])}]" if c["flags"] else ""
+                click.echo(f"    · {diff}{fl}")
+        for m in pg["moved"]:
+            click.echo(f"  ↔ moved: {m['text']!r} by {m['delta']}")
+        for d in pg["displaced"]:
+            click.echo(f"  ↔ displaced: {d['text']!r} by {d['delta']} pt")
+        for ln in pg["only_a"]:
+            click.echo(f"  − only in A: {ln['text']!r} @ ({ln['x0']:g}, {ln['y']:g})")
+        for ln in pg["only_b"]:
+            click.echo(f"  + only in B: {ln['text']!r} @ ({ln['x0']:g}, {ln['y']:g})")
+        for im in pg["images"]:
+            px = "" if im["pixels_a"] == im["pixels_b"] else \
+                f"  pixels A {im['pixels_a'][0]}×{im['pixels_a'][1]} vs B {im['pixels_b'][0]}×{im['pixels_b'][1]}"
+            enc = "" if im["encoding_a"] == im["encoding_b"] else \
+                f"  encoding A {im['encoding_a']} vs B {im['encoding_b']}"
+            click.echo(f"  🖼  {im['a']} ↔ {im['b']} {im['on_page_size'][0]:g}×{im['on_page_size'][1]:g} pt{px}{enc}")
+        for n in pg["images_only_a"]:
+            click.echo(f"  🖼  only in A: {n}")
+        for n in pg["images_only_b"]:
+            click.echo(f"  🖼  only in B: {n}")
+        if pg["anomalies"]:
+            click.echo("  anomalies:")
+        for a in pg["anomalies"]:
+            click.echo(f"    🚩 {_anomaly_text(a)}")
+
+    s = r["summary"]
+    _section("Summary")
+    click.echo(f"  same generator: {'yes' if s['same_generator'] else 'NO'} · "
+               f"layout match {s['layout_match']} · labels in common {s['labels_in_common']} · "
+               f"fields that differ {s['changed_fields']} · anomalies {s['anomalies']}"
+               + (f" · unverifiable lines {s['unverifiable_lines']}" if s["unverifiable_lines"] else ""))
+
+
+def _anomaly_text(a: dict) -> str:
+    t = a["type"]
+    if t == "alignment_break":
+        return (f"{a['file'].upper()}: {a['line']!r} no longer {a['edge']}-aligned with "
+                f"{a['aligned_with']!r} (off by {a['gap_pt']} pt)")
+    if t == "segmentation":
+        return f"{a['a']!r} built from {a['runs_a']} run(s) in A vs {a['runs_b']} in B"
+    if t == "split_painting":
+        return (f"{a['file'].upper()}: {a['line']!r} painted in two moments "
+                f"({a['interleaved_runs']} other run(s) in between)")
+    if t == "paint_order":
+        return (f"{a['a']!r} painted at a different point of the stream "
+                f"(out of order with {a['out_of_order_with']} other lines)")
+    if t.startswith("changed_field_"):
+        what = t.removeprefix("changed_field_")
+        return f"field {a['a']!r} vs {a['b']!r}: different {what} (A {a['a_value']} · B {a['b_value']})"
+    return str(a)
 
 
 # ───────────────────────────── edit ───────────────────────────────────────
@@ -246,6 +351,19 @@ def _render_inspect(pdf: str, *, full: bool) -> None:
     if not full:
         return
 
+    _section("Page boxes")
+    try:
+        for b in read_pdf_page_boxes(pdf):
+            paper = f" ({b['paper']})" if b["paper"] else ""
+            rot = f" · rotate {b['rotate']}" if b["rotate"] else ""
+            click.echo(f"  p.{b['page']} {b['width']}×{b['height']} pt{paper}{rot}")
+            for key in ("mediabox", "cropbox", "bleedbox", "trimbox", "artbox"):
+                v = b[key]
+                click.echo(f"    {key[:-3].capitalize() + 'Box':9} "
+                           f"{'[' + ', '.join(f'{x:g}' for x in v) + ']' if v else '—'}")
+    except Exception as e:
+        click.echo(f"  ⚠️  error: {e}")
+
     _section("Revisions / integrity")
     try:
         rev = read_pdf_revisions(pdf)
@@ -319,6 +437,20 @@ def _render_inspect(pdf: str, *, full: bool) -> None:
                     click.echo(f"      🚨 covers earlier text: {p['covered_text']!r}")
                 if p["text_on_top"]:
                     click.echo(f"      text drawn over it: {p['text_on_top']!r}")
+
+        try:
+            lines = read_pdf_text_lines(pdf)
+        except Exception as e:
+            lines = []
+            click.echo(f"  ⚠️  text error: {e}")
+        if lines:
+            _section("Text lines (x0 → x1, baseline y, size, font, runs, paint order)")
+            for ln in lines:
+                click.echo(
+                    f"  p.{ln['page']} [{ln['x0']:7.2f} → {ln['x1']:7.2f}] y={ln['y']:7.2f} "
+                    f"{ln['size']:5.2f}pt {','.join(ln['fonts'])} ×{ln['runs']} #{ln['order']}  "
+                    f"{ln['text']!r}"
+                )
 
         if content_revs:
             _section("Added by later revisions")

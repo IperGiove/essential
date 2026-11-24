@@ -22,6 +22,8 @@ CENTRE lies inside the image box; good enough for "this amount is under a
 picture", not a layout engine.
 """
 
+import math
+import re
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -63,26 +65,160 @@ def _resolve(obj):
     return obj.get_object() if hasattr(obj, "get_object") else obj
 
 
+_HEX = re.compile(rb"<([0-9A-Fa-f\s]*)>")
+
+
+def _hex(tok: bytes) -> bytes:
+    h = re.sub(rb"\s", b"", tok)
+    if len(h) % 2:
+        h += b"0"
+    return bytes.fromhex(h.decode("ascii"))
+
+
+def _utf16(b: bytes) -> str:
+    try:
+        return b.decode("utf-16-be", "surrogatepass")
+    except Exception:
+        return ""
+
+
+def parse_tounicode(data: bytes) -> dict:
+    """Minimal ToUnicode CMap reader: `bfchar` and `bfrange` (both the
+    incrementing form and the array form) → {code bytes: unicode str}.
+    Destinations may be several characters (ligatures: one glyph → "fi")."""
+    out: dict = {}
+    for block in re.findall(rb"beginbfchar(.*?)endbfchar", data, re.S):
+        toks = _HEX.findall(block)
+        for src, dst in zip(toks[0::2], toks[1::2]):
+            out[_hex(src)] = _utf16(_hex(dst))
+    for block in re.findall(rb"beginbfrange(.*?)endbfrange", data, re.S):
+        for m in re.finditer(rb"<([0-9A-Fa-f\s]+)>\s*<([0-9A-Fa-f\s]+)>\s*(\[[^\]]*\]|<[0-9A-Fa-f\s]*>)", block):
+            lo, hi = _hex(m.group(1)), _hex(m.group(2))
+            width = len(lo)
+            a, b = int.from_bytes(lo, "big"), int.from_bytes(hi, "big")
+            if b < a or b - a > 0xFFFF:
+                continue
+            dst = m.group(3)
+            if dst.startswith(b"["):
+                for k, tok in enumerate(_HEX.findall(dst)):
+                    if a + k > b:
+                        break
+                    out[(a + k).to_bytes(width, "big")] = _utf16(_hex(tok))
+            else:
+                base = _hex(dst[1:-1])
+                if not base:
+                    continue
+                # Increment the LAST code unit of the destination.
+                head, last = base[:-2], int.from_bytes(base[-2:], "big")
+                for k in range(b - a + 1):
+                    out[(a + k).to_bytes(width, "big")] = _utf16(head + ((last + k) & 0xFFFF).to_bytes(2, "big"))
+    return out
+
+
+def parse_cid_widths(w_array) -> dict:
+    """CIDFont `/W`: `c [w1 w2 …]` and `c_first c_last w` → {cid: width}."""
+    out: dict = {}
+    items = list(_resolve(w_array) or [])
+    k = 0
+    while k < len(items):
+        try:
+            first = int(_resolve(items[k]))
+            nxt = _resolve(items[k + 1])
+            if isinstance(nxt, list):
+                for off, wv in enumerate(nxt):
+                    out[first + off] = float(_resolve(wv))
+                k += 2
+            else:
+                last, wv = int(nxt), float(_resolve(items[k + 2]))
+                if 0 <= last - first <= 0xFFFF:
+                    for cid in range(first, last + 1):
+                        out[cid] = wv
+                k += 3
+        except Exception:
+            break
+    return out
+
+
 class _FontInfo:
-    """Decoding + advance widths for one font resource (best effort)."""
+    """Decoding + advance widths for one font resource (best effort).
+
+    Type0 fonts with an Identity encoding (what browsers, Skia, Office and
+    most libraries emit for embedded TrueType) are read directly: 2-byte
+    codes, the ToUnicode CMap, and the descendant's `/W` + `/DW` widths.
+    Everything else goes through pypdf's font tables. `decode` reports
+    whether the text and the widths are real or placeholders.
+    """
 
     def __init__(self, font_dict):
-        self.font = None
+        self.font = None             # pypdf Font, for non-Identity fonts
         self.two_byte = False
+        self.base_font = None
+        self.to_unicode: Optional[dict] = None
+        self.cid_widths: Optional[dict] = None
+        self.dw = 1000.0
+        self.error: Optional[str] = None
+        if font_dict is None:
+            self.error = "font resource not found"
+            return
         try:
             fd = _resolve(font_dict)
+            self.base_font = str(fd.get("/BaseFont", "")).lstrip("/") or None
             self.two_byte = fd.get("/Subtype") == "/Type0"
+            enc = fd.get("/Encoding")
+            identity = self.two_byte and str(_resolve(enc) if enc is not None else "") in (
+                "/Identity-H", "/Identity-V")
+            if identity:
+                self._init_identity(fd)
+                return
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+        try:
             from pypdf._font import Font  # private: degrade gracefully if it moves
-            self.font = Font.from_font_resource(fd)
-        except Exception:
-            self.font = None
+            self.font = Font.from_font_resource(_resolve(font_dict))
+        except Exception as e:
+            self.error = self.error or f"{type(e).__name__}: {e}"
+
+    def _init_identity(self, fd) -> None:
+        tu = fd.get("/ToUnicode")
+        if tu is not None:
+            try:
+                self.to_unicode = parse_tounicode(_resolve(tu).get_data())
+            except Exception as e:
+                self.error = f"ToUnicode unreadable: {type(e).__name__}: {e}"
+        else:
+            self.error = "no /ToUnicode"
+        try:
+            desc = _resolve(_resolve(fd["/DescendantFonts"])[0])
+            # Per spec a missing /W means every glyph is /DW wide, and a
+            # missing /DW means 1000: either way the widths are defined.
+            self.cid_widths = parse_cid_widths(desc["/W"]) if desc.get("/W") is not None else {}
+            if desc.get("/DW") is not None:
+                self.dw = float(desc["/DW"])
+        except Exception as e:
+            self.error = self.error or f"widths unreadable: {type(e).__name__}: {e}"
 
     def decode(self, raw: bytes) -> tuple:
-        """-> (text, glyph_count, width_in_em)"""
+        """-> (text, glyph_count, width_in_em, text_decoded, widths_known)"""
+        if self.to_unicode is not None or self.cid_widths is not None:
+            codes = [raw[i:i + 2] for i in range(0, len(raw) - 1, 2)]
+            n = max(1, len(codes))
+            text, complete = "", False
+            if self.to_unicode is not None:
+                parts = [self.to_unicode.get(c) for c in codes]
+                complete = all(p is not None for p in parts)
+                # Unmapped codes stay visible as U+FFFD instead of vanishing.
+                text = "".join("\ufffd" if p is None else p for p in parts)
+            if self.cid_widths is not None:
+                w = sum(self.cid_widths.get(int.from_bytes(c, "big"), self.dw) for c in codes) / 1000.0
+                known = True
+            else:
+                w, known = 0.5 * n, False
+            return text, n, w, complete and bool(text.strip()), known
+
         n = max(1, len(raw) // 2) if self.two_byte else len(raw)
         f = self.font
         if f is None:
-            return "", n, 0.5 * n
+            return "", n, 0.5 * n, False, False
         try:
             enc = f.encoding
             if isinstance(enc, str):
@@ -95,11 +231,13 @@ class _FontInfo:
                 t = "".join(enc.get(b, chr(b)) for b in raw)
             widths = f.character_widths
             default = widths.get("default", 500) or 500
-            w = sum(widths.get(c, default) for c in t) / 1000.0
-            text = "".join(f.character_map.get(c, c) for c in t)
-            return text, n, (w if w > 0 else 0.5 * n)
+            mapped = [f.character_map.get(c, c) for c in t]
+            # pypdf keys widths by the MAPPED character, not the code.
+            w = sum(widths.get(u, widths.get(c, default)) for c, u in zip(t, mapped)) / 1000.0
+            text = "".join(mapped)
+            return text, n, (w if w > 0 else 0.5 * n), bool(text.strip()), w > 0
         except Exception:
-            return "", n, 0.5 * n
+            return "", n, 0.5 * n, False, False
 
 
 def _raw_bytes(s) -> bytes:
@@ -117,6 +255,7 @@ class _PageInterpreter:
         self.page_no = page_no
         self.seq = 0
         self.ops = 0
+        self.text_op = 0       # id of the current text-showing operator
         self.texts: list = []
         self.images: list = []
         self._fonts: dict = {}
@@ -149,7 +288,7 @@ class _PageInterpreter:
 
         def show(raw: bytes):
             nonlocal tm
-            text, n, w_em = font.decode(raw)
+            text, n, w_em, decoded, known = font.decode(raw)
             spaces = raw.count(b" ") if not font.two_byte else 0
             width = (w_em * fs + tc * n + tw * spaces) * th
             trm = _mult(tm, ctm)
@@ -158,18 +297,27 @@ class _PageInterpreter:
                 # Undecodable (no ToUnicode, unknown font): still text on the
                 # page, so it still counts as covered — just unquotable.
                 text = f"[{n} glyph{'s' if n != 1 else ''}]"
-            if tr not in _INVISIBLE_MODES and text.strip():
+            if text.strip():
                 x0, y0 = _apply(trm, 0.0, ts)
+                x1, _ = _apply(trm, width, ts)
                 self.seq += 1
                 self.texts.append({
                     "seq": self.seq, "text": text, "center": (cx, cy),
-                    "origin": (x0, y0),
-                    "size": abs(fs * (trm[3] if trm[3] else 1.0)),
+                    "origin": (x0, y0), "end_x": x1,
+                    # rendered size: font size × vertical scale of Tm·CTM
+                    "size": abs(fs) * math.hypot(trm[2], trm[3]),
+                    "font": font.base_font,
+                    "visible": tr not in _INVISIBLE_MODES,
+                    "decoded": decoded,
+                    "widths_known": known,
+                    "op": self.text_op,
                 })
             tm = _mult([1, 0, 0, 1, width, 0], tm)
 
         for operands, op in stream.operations:
             self.ops += 1
+            if op in (b"Tj", b"TJ", b"'", b'"'):
+                self.text_op += 1
             if self.ops > _MAX_OPERATIONS:
                 return
             if op == b"q":
@@ -286,6 +434,204 @@ def _join(texts: list) -> str:
     return s if len(s) <= _SNIPPET else s[:_SNIPPET] + "…"
 
 
+def _interpret(reader: PdfReader):
+    """Yield (page_no, page, interpreter) for every page that could be run."""
+    from .content import _page_resources  # shared inheritance walk
+
+    for page_no, page in enumerate(reader.pages, start=1):
+        interp = _PageInterpreter(reader, page_no)
+        try:
+            interp.run_page(page, _page_resources(page) or {})
+        except Exception:
+            continue
+        yield page_no, page, interp
+
+
+# ─── page boxes ───────────────────────────────────────────────────────────
+
+_BOXES = ("/MediaBox", "/CropBox", "/BleedBox", "/TrimBox", "/ArtBox")
+_INHERITABLE = {"/MediaBox", "/CropBox"}
+
+# (name, short side, long side) in points; ±2pt tolerance.
+_PAPER = (
+    ("A3", 841.89, 1190.55), ("A4", 595.28, 841.89), ("A5", 419.53, 595.28),
+    ("Letter", 612.0, 792.0), ("Legal", 612.0, 1008.0), ("Tabloid", 792.0, 1224.0),
+)
+
+
+def _paper_name(w: float, h: float) -> Optional[str]:
+    short, long_ = sorted((abs(w), abs(h)))
+    for name, s_, l_ in _PAPER:
+        if abs(short - s_) <= 2 and abs(long_ - l_) <= 2:
+            return name + (" landscape" if abs(w) > abs(h) else "")
+    return None
+
+
+def _box(page, key: str) -> Optional[list]:
+    node, hops = page, 0
+    while node is not None and hops < 64:
+        if key in node:
+            try:
+                return [round(float(v), 2) for v in _resolve(node[key])][:4]
+            except Exception:
+                return None
+        if key not in _INHERITABLE:
+            return None
+        parent = node.get("/Parent")
+        node = _resolve(parent) if parent is not None else None
+        hops += 1
+    return None
+
+
+def read_pdf_page_boxes(pdf_path: Union[str, Path]) -> List[dict]:
+    """
+    Page boxes as WRITTEN in the file, one dict per page: `mediabox`,
+    `cropbox`, `bleedbox`, `trimbox`, `artbox` ([x0, y0, x1, y1] in points,
+    None when absent — no defaulting, since which boxes a producer writes is
+    itself a fingerprint: print/design tools add Bleed/Trim boxes, office and
+    report generators usually write only a MediaBox), plus `rotate`,
+    `width`/`height` of the MediaBox and `paper` (A4, Letter, …) when it
+    matches a standard size.
+    """
+    out: List[dict] = []
+    for page_no, page in enumerate(PdfReader(str(pdf_path)).pages, start=1):
+        rec = {"page": page_no}
+        for key in _BOXES:
+            rec[key[1:].lower()] = _box(page, key)
+        mb = rec["mediabox"]
+        if mb:
+            rec["width"] = round(mb[2] - mb[0], 2)
+            rec["height"] = round(mb[3] - mb[1], 2)
+            rec["paper"] = _paper_name(rec["width"], rec["height"])
+        else:
+            rec["width"] = rec["height"] = rec["paper"] = None
+        try:
+            rec["rotate"] = int(page.get("/Rotate", 0) or 0)
+        except Exception:
+            rec["rotate"] = 0
+        out.append(rec)
+    return out
+
+
+# ─── text ─────────────────────────────────────────────────────────────────
+
+def _public_run(page_no: int, t: dict) -> dict:
+    return {
+        "page": page_no,
+        "order": t["seq"],
+        "text": t["text"],
+        "x": round(t["origin"][0], 2),
+        "y": round(t["origin"][1], 2),
+        "x_end": round(t["end_x"], 2),
+        "size": round(t["size"], 2),
+        "font": t["font"],
+        "visible": t["visible"],
+        "decoded": t["decoded"],
+        "widths_known": t["widths_known"],
+        "op": t["op"],
+    }
+
+
+def read_pdf_text_runs(pdf_path: Union[str, Path]) -> List[dict]:
+    """
+    Every shown string on every page, in paint order: `text` (decoded; `�`
+    for glyphs the font cannot map, `[n glyphs]` when nothing decodes),
+    baseline origin `x`/`y` and end `x_end` in points, rendered `size`, `font`
+    (BaseFont), `order` (paint sequence shared with images on that page),
+    `op` (the text operator it belongs to: the pieces of one kerned TJ share
+    it), `visible` (False for render modes 3/7, e.g. OCR layers), `decoded`
+    (the text is real) and `widths_known` (`x_end` uses the font's glyph
+    widths rather than a half-em guess).
+
+    How a producer splits text into operators (whole lines, words, single
+    glyphs) is characteristic of it.
+    """
+    return [
+        _public_run(page_no, t)
+        for page_no, _page, interp in _interpret(PdfReader(str(pdf_path)))
+        for t in interp.texts
+    ]
+
+
+def group_text_lines(runs: List[dict]) -> List[dict]:
+    """
+    Merge visible runs into visual lines: same page, baselines within 30% of
+    the font size, ordered left to right; a gap wider than 20% of the size
+    becomes a space. Each line: `page`, `text`, `x0`, `x1`, `y`, `size`
+    (largest) and `sizes` (all), `fonts`, `runs` (text operators that built
+    it) and `pieces` (shown strings, counting kerned TJ parts),
+    `decoded` / `widths_known` (all its runs),
+    `first_segment` / `last_segment` (extent of the leftmost / rightmost
+    gap-separated group, e.g. label and value), `order` (paint order of its
+    first run) and `orders` (all of them).
+
+    Producers split text differently; lines are what a reader sees, so
+    comparisons between files from different generators work on lines.
+    """
+    lines: List[dict] = []
+    by_page: dict = {}
+    for r in runs:
+        if r["visible"] and r["text"].strip():
+            by_page.setdefault(r["page"], []).append(r)
+    for page_no in sorted(by_page):
+        rows: List[list] = []
+        for r in sorted(by_page[page_no], key=lambda r: (-r["y"], r["x"])):
+            tol = max(1.0, 0.3 * (r["size"] or 1.0))
+            for row in rows:
+                if abs(row[0]["y"] - r["y"]) <= tol:
+                    row.append(r)
+                    break
+            else:
+                rows.append([r])
+        for row in rows:
+            row.sort(key=lambda r: r["x"])
+            text, prev = "", None
+            segments: List[list] = []        # [x0, x1] of gap-separated groups
+            for r in row:
+                piece = r["text"]
+                if prev is not None:
+                    gap = r["x"] - prev["x_end"]
+                    wide = gap > 0.2 * max(r["size"], prev["size"], 1.0)
+                    if wide and not text.endswith(" ") and not piece.startswith(" "):
+                        text += " "
+                    if wide:
+                        segments.append([r["x"], r["x_end"]])
+                    else:
+                        segments[-1][1] = max(segments[-1][1], r["x_end"])
+                else:
+                    segments.append([r["x"], r["x_end"]])
+                text += piece
+                prev = r
+            lines.append({
+                "page": page_no,
+                "text": " ".join(text.split()),
+                "x0": row[0]["x"],
+                "x1": max(r["x_end"] for r in row),
+                "y": round(sum(r["y"] for r in row) / len(row), 2),
+                "size": max(r["size"] for r in row),
+                "sizes": sorted({r["size"] for r in row}),
+                "fonts": sorted({r["font"] or "?" for r in row}),
+                # Leftmost / rightmost gap-separated group (label, value…):
+                # which group sits on a column edge.
+                "first_segment": [round(v, 2) for v in segments[0]],
+                "last_segment": [round(v, 2) for v in segments[-1]],
+                # A run is one text-showing operator: the pieces of a kerned
+                # TJ array count once, so kerning isn't mistaken for splitting.
+                "runs": len({r["op"] for r in row}),
+                "pieces": len(row),
+                "decoded": all(r["decoded"] for r in row),
+                "widths_known": all(r["widths_known"] for r in row),
+                "order": min(r["order"] for r in row),
+                "orders": [r["order"] for r in row],
+            })
+    return lines
+
+
+def read_pdf_text_lines(pdf_path: Union[str, Path]) -> List[dict]:
+    """`group_text_lines(read_pdf_text_runs(pdf_path))`."""
+    return group_text_lines(read_pdf_text_runs(pdf_path))
+
+
 def read_pdf_image_placements(pdf_path: Union[str, Path]) -> List[dict]:
     """
     Every image painted by page content, in paint order, with:
@@ -303,16 +649,8 @@ def read_pdf_image_placements(pdf_path: Union[str, Path]) -> List[dict]:
     Inline images (`BI … EI`) are included with name "(inline)". Invisible
     text (render mode 3, e.g. OCR layers) and clip-only text are ignored.
     """
-    reader = PdfReader(str(pdf_path))
     out: List[dict] = []
-    from .content import _page_resources  # shared inheritance walk
-
-    for page_no, page in enumerate(reader.pages, start=1):
-        interp = _PageInterpreter(reader, page_no)
-        try:
-            interp.run_page(page, _page_resources(page) or {})
-        except Exception:
-            continue
+    for page_no, page, interp in _interpret(PdfReader(str(pdf_path))):
         try:
             mb = [float(v) for v in page.mediabox]
             page_area = abs((mb[2] - mb[0]) * (mb[3] - mb[1])) or None
@@ -321,9 +659,10 @@ def read_pdf_image_placements(pdf_path: Union[str, Path]) -> List[dict]:
         for img in interp.images:
             bbox = img["bbox"]
             area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            under = [t for t in interp.texts
+            visible = [t for t in interp.texts if t["visible"]]
+            under = [t for t in visible
                      if t["seq"] < img["seq"] and _inside(t["center"], bbox)]
-            over = [t for t in interp.texts
+            over = [t for t in visible
                     if t["seq"] > img["seq"] and _inside(t["center"], bbox)]
             out.append({
                 **{k: v for k, v in img.items() if k != "seq"},
