@@ -15,6 +15,7 @@ consumer installs only the features it uses::
     pip install 'esuls[pdf]'       # + PDF metadata/inspection + esuls-pdf CLI
     pip install 'esuls[pdf-sign]'  # + cryptographic PDF signature validation
     pip install 'esuls[icons]'     # + download_icon
+    pip install 'esuls[probe]'     # + esuls-probe self-assessment web probe
     pip install 'esuls[all]'       # everything (the pre-0.4 default)
 
 Accessing a feature whose extra isn't installed raises a clear ImportError that
@@ -72,6 +73,16 @@ _LAZY = {
     "SignatureCheck":              ("pdf", "pdf"),
     "verify_pdf_signatures":       ("pdf", "pdf"),
     "async_verify_pdf_signatures": ("pdf", "pdf"),
+    # Self-assessment web probe (esuls-probe)
+    "ProbeOptions": ("probe", "probe"),
+    "ProbeFinding": ("probe", "probe"),
+    "ProbeReport": ("probe", "probe"),
+    "check_paths": ("probe", "probe"),
+    "check_exposed": ("probe", "probe"),
+    "check_headers": ("probe", "probe"),
+    "check_ratelimit": ("probe", "probe"),
+    "check_cors": ("probe", "probe"),
+    "run_full_probe": ("probe", "probe"),
 }
 
 
@@ -116,4 +127,6 @@ __all__ = [
     'find_non_standard_metadata', 'STANDARD_METADATA_KEYS', 'edit_pdf_metadata',
     'update_pdf_metadata', 'replace_pdf_metadata', 'remove_pdf_metadata',
     'SignatureCheck', 'verify_pdf_signatures', 'async_verify_pdf_signatures',
+    # probe (lazy)
+    'ProbeOptions', 'ProbeFinding', 'ProbeReport', 'check_paths', 'check_exposed', 'check_headers', 'check_ratelimit', 'check_cors', 'run_full_probe',
 ]

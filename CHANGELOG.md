@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### `esuls-probe`: self-assessment web probe (new `probe` extra)
+
+`pip install 'esuls[probe]'` adds a console script and the `esuls.probe`
+package for scanning your own sites: `paths` (wordlist discovery with a
+mandatory soft-404 baseline, `%EXT%` expansion, `--recursive`), `exposed`
+(`.git`, `.env`, `.DS_Store`, dumps, backups, phpinfo, actuator ... each with a
+content validator so catch-all 200s are not reported; secrets are redacted),
+`headers` (security headers, cookie flags, http->https redirect), `ratelimit`,
+`cors`, and `full` (one merged report; a failing check is recorded as an error
+and the rest still run). Uses `httpx` directly: no redirects, no retries, exact
+headers. `--json`, `-o FILE`; exit 0 = nothing above info, 1 = low+, 3 = error.
+
 ## 0.12.1 — 2026-11-03
 
 ### `inspect --full` no longer prints every logo as "0% of page"

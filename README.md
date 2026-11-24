@@ -248,6 +248,39 @@ async def fetch_protected_page():
 asyncio.run(fetch_protected_page())
 ```
 
+## Probe (`esuls-probe`)
+
+A self-assessment web probe: point it at **your own** sites to see what is
+exposed and which defenses never trigger (a mini dirsearch plus basic security
+checks). Only scan systems you own or are authorised to test.
+
+```bash
+pip install 'esuls[probe]'
+
+esuls-probe headers   https://example.com             # security headers, cookie flags, http->https
+esuls-probe exposed   https://example.com             # .git, .env, dumps, backups ... (content-validated)
+esuls-probe paths     https://example.com -e php,bak --recursive --depth 2
+esuls-probe paths     https://example.com -w my-words.txt
+esuls-probe cors      https://example.com             # reflected Origin, null, wildcard + credentials
+esuls-probe ratelimit https://example.com/login --path /login --method POST --data 'u=a&p=b' -n 100
+esuls-probe full      https://example.com --json -o report.json
+```
+
+Shared options: `-c/--concurrency` (10), `--timeout` (10s), `--delay`, `-H 'Name: value'`,
+`--cookie`, `--user-agent`, `--insecure`, `--json`, `-o FILE`. Exit codes:
+`0` nothing above info, `1` findings low or higher, `3` error.
+Path discovery drops soft-404s (a random-path baseline), and sensitive files are
+only reported when their content validates; secrets are never echoed in evidence.
+
+```python
+import asyncio
+from esuls.probe import ProbeOptions, run_full_probe
+
+report = asyncio.run(run_full_probe("https://example.com", ProbeOptions(concurrency=5)))
+print(report.render_text())      # or report.to_dict()
+raise SystemExit(report.exit_code)
+```
+
 ## Development
 
 ### Project Structure

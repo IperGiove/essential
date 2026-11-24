@@ -399,6 +399,10 @@ pdf-sign = [
     { name = "pyhanko" },
     { name = "pypdf" },
 ]
+probe = [
+    { name = "click" },
+    { name = "httpx", extra = ["http2"] },
+]
 scraping = [
     { name = "curl-cffi" },
     { name = "fake-useragent" },
@@ -418,9 +422,11 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = "==0.22.1" },
     { name = "click", marker = "extra == 'pdf'", specifier = ">=8.1" },
+    { name = "click", marker = "extra == 'probe'", specifier = ">=8.1" },
     { name = "curl-cffi", marker = "extra == 'scraping'", specifier = ">=0.13.0" },
-    { name = "esuls", extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons"], marker = "extra == 'all'" },
+    { name = "esuls", extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons", "probe"], marker = "extra == 'all'" },
     { name = "esuls", extras = ["http"], marker = "extra == 'icons'" },
+    { name = "esuls", extras = ["http"], marker = "extra == 'probe'" },
     { name = "esuls", extras = ["http"], marker = "extra == 'scraping'" },
     { name = "esuls", extras = ["pdf"], marker = "extra == 'pdf-sign'" },
     { name = "fake-useragent", marker = "extra == 'scraping'", specifier = ">=2.2.0" },
@@ -435,7 +441,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
     { name = "tf-playwright-stealth", marker = "extra == 'scraping'", specifier = ">=1.2.0" },
 ]
-provides-extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons", "all"]
+provides-extras = ["config", "http", "scraping", "pdf", "pdf-sign", "icons", "probe", "all"]
 
 [package.metadata.requires-dev]
 dev = [
