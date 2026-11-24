@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.0 — 2026-11-24
 
 ### `esuls-probe`: ports, auth, tls and email checks (outside view of a VM)
 
@@ -13,7 +13,9 @@ lockout/429/503/403 fires, then stop; medium if nothing defends within
 (certificate expiry, SAN match, trust, negotiated protocol, TLS 1.0/1.1
 acceptance) and `email` (MX, SPF, DMARC, DKIM per `--selector`). The `probe`
 extra now also installs `dnspython>=2.6` (imported lazily by `email` only).
-`full` gains `--skip CHECK`.
+`full` gains `--skip CHECK`, and runs each HTTP check under its own simulated
+client IP (from `203.0.113.0/24`, or a user-supplied `X-Forwarded-For` as the
+base) so a per-IP rate limit on one check no longer poisons the next.
 
 ## 0.13.0 — 2026-11-24
 
