@@ -282,7 +282,11 @@ sends nothing else. `auth` sends wrong credentials until the first defense
 reports no lockout. **It triggers real bans (fail2ban, WAF) and can lock your
 own IP: only run it on systems you own**; skip it in `full` with `--skip auth`.
 Like `ratelimit`, loopback targets are reported as info unless you pass
-`-H 'X-Forwarded-For: 203.0.113.7'`. `full` also runs `ports`, `tls`, `email`
+`-H 'X-Forwarded-For: 203.0.113.7'`. `full` runs every HTTP check under its own simulated client IP (`X-Forwarded-For`
+from 203.0.113.0/24, one per check) so the checks do not share a rate-limit bucket and a
+ban from `paths` cannot make `ratelimit`/`auth` look locked at request #1. A user-supplied
+`-H 'X-Forwarded-For: A.B.C.D'` is used as-is for the first HTTP check and the others vary
+inside its /24. `full` also runs `ports`, `tls`, `email`
 and `auth`; `tls` is skipped on plain `http://` targets and `email` on IPs.
 
 Shared options: `-c/--concurrency` (10), `--timeout` (10s), `--delay`, `-H 'Name: value'`,

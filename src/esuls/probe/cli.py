@@ -179,7 +179,10 @@ async def cors_cmd(target, options):
     return await check_cors(target, options)
 
 
-@app.command("full", help="Run every check, one merged report. " + EXIT_HELP)
+@app.command("full", help="Run every check, one merged report. Each HTTP check runs under its own "
+             "simulated client IP (X-Forwarded-For from 203.0.113.0/24) so the checks do not share a "
+             "rate-limit bucket; your own -H 'X-Forwarded-For: A.B.C.D' is used as-is for the first HTTP "
+             "check and the others vary inside its /24. " + EXIT_HELP)
 @shared_options
 @_wordlist_options
 @_ratelimit_options

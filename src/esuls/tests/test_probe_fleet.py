@@ -389,3 +389,45 @@ def test_cli_ports_json_exit_codes():
     port = free_port()
     res = CliRunner().invoke(app, ["ports", "127.0.0.1", "--ports", str(port), "--json"])
     assert res.exit_code == 0 and json.loads(res.output)["stats"]["ports"]["closed"] == 1
+
+
+# ── full: one simulated client IP per check ───────────────────────────────
+
+def _bucket_app(limit=40):
+    """Per-XFF request budget: a shared client identity gets banned (429) quickly."""
+    seen, by_ip = [], {}
+
+    def h(req):
+        ip = req.headers.get("x-forwarded-for", "-")
+        by_ip[ip] = by_ip.get(ip, 0) + 1
+        seen.append((req.url.path, ip))
+        if by_ip[ip] > limit:
+            return httpx.Response(429)
+        return httpx.Response(200, text="ok") if req.url.path in ("/", "/login") else httpx.Response(404, text="nf")
+    return h, seen
+
+
+async def test_full_runs_each_check_under_a_distinct_xff_and_no_false_lockout():
+    h, seen = _bucket_app(limit=40)
+    rep = await run_full_probe("http://127.0.0.1:%d" % free_port(), client=client_for(h),
+                               wordlist=[f"w{i}" for i in range(80)], ratelimit_requests=20,
+                               auth_max_attempts=5, ports=[free_port()],
+                               options=ProbeOptions(timeout=2),
+                               checks=("headers", "exposed", "paths", "ratelimit", "auth"))
+    ips = {ip for _, ip in seen}
+    assert len(ips) >= 5 and all(ip.startswith("203.0.113.") for ip in ips)
+    # paths burned its own bucket; ratelimit/auth must not inherit that ban
+    titles = [f.title for f in rep.findings]
+    assert not any("kicked in at request #1 " in t or "attempt #1 " in t for t in titles), titles
+
+
+async def test_full_user_xff_is_base_for_first_check_only():
+    h, seen = _bucket_app(limit=1000)
+    await run_full_probe("http://127.0.0.1:1", client=client_for(h), wordlist=["a"], ratelimit_requests=2,
+                         auth_max_attempts=2, options=ProbeOptions(timeout=2, headers={"x-forwarded-for": "198.51.100.7", "X-Keep": "1"}),
+                         checks=("headers", "cors", "ratelimit"))
+    order = []
+    for _, ip in seen:
+        if ip not in order:
+            order.append(ip)
+    assert order[0] == "198.51.100.7" and all(ip.startswith("198.51.100.") for ip in order) and len(order) == 3
