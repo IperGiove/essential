@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 — 2026-11-24
 
 ### `esuls-probe`: self-assessment web probe (new `probe` extra)
 
