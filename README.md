@@ -266,6 +266,25 @@ esuls-probe ratelimit https://example.com/login --path /login --method POST --da
 esuls-probe full      https://example.com --json -o report.json
 ```
 
+Outside-view checks for a VM or domain (HOST or URL accepted):
+
+```bash
+esuls-probe ports example.com --ports 22,80,443,8000-8010   # TCP connect scan (default ~40 ports)
+esuls-probe tls   example.com                               # cert expiry/SAN/trust, TLS 1.0/1.1
+esuls-probe email example.com --selector default            # SPF / DMARC / DKIM / MX (dnspython)
+esuls-probe auth  https://example.com --auth-path /login --max-attempts 25
+```
+
+`ports` flags dangerous exposures (databases, Caddy admin :2019, RabbitMQ, VNC,
+Prometheus) as medium and a Redis that answers `PING` without AUTH as high; it
+sends nothing else. `auth` sends wrong credentials until the first defense
+(429/503/403/lockout message) fires and then stops; if the cap is reached it
+reports no lockout. **It triggers real bans (fail2ban, WAF) and can lock your
+own IP: only run it on systems you own**; skip it in `full` with `--skip auth`.
+Like `ratelimit`, loopback targets are reported as info unless you pass
+`-H 'X-Forwarded-For: 203.0.113.7'`. `full` also runs `ports`, `tls`, `email`
+and `auth`; `tls` is skipped on plain `http://` targets and `email` on IPs.
+
 Shared options: `-c/--concurrency` (10), `--timeout` (10s), `--delay`, `-H 'Name: value'`,
 `--cookie`, `--user-agent`, `--insecure`, `--json`, `-o FILE`. Exit codes:
 `0` nothing above info, `1` findings low or higher, `3` error.

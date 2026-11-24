@@ -139,3 +139,42 @@ class Session:
 
 def host_of(url: str) -> str:
     return urlsplit(url).hostname or ""
+
+
+def split_host_port(target: str, default_port: Optional[int] = None) -> tuple[str, Optional[int]]:
+    """Host and port from a URL ('https://h:8443/x') or a bare host ('h', 'h:22')."""
+    t = target.strip()
+    parts = urlsplit(t if "://" in t else "//" + t)
+    return parts.hostname or "", parts.port or default_port
+
+
+def is_ip_or_local(host: str) -> bool:
+    """True for IP literals and localhost: names with no registrable domain."""
+    import ipaddress
+    h = host.lower().strip("[]")
+    if h == "localhost" or h.endswith(".localhost") or "." not in h and ":" not in h:
+        return True
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return False
+
+
+_MULTI_SUFFIX = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz",
+                 "co.jp", "com.br", "co.za", "com.mx", "co.in", "com.tr", "com.ar"}
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort registrable domain (no public-suffix list: last two labels,
+    three for a few well-known multi-part suffixes)."""
+    labels = host.lower().strip(".").split(".")
+    if len(labels) <= 2:
+        return ".".join(labels)
+    n = 3 if ".".join(labels[-2:]) in _MULTI_SUFFIX else 2
+    return ".".join(labels[-n:])
+
+
+def record_stats(report, check: str, requests: int, failures: int, t0: float) -> None:
+    report.stats[check] = {"requests": requests, "failures": failures,
+                           "duration_s": round(time.monotonic() - t0, 3)}

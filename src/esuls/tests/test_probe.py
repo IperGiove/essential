@@ -228,7 +228,8 @@ async def test_full_survives_a_failing_check(monkeypatch):
         raise RuntimeError("kaput")
     monkeypatch.setattr(full, "check_cors", boom)
     rep = await run_full_probe(T, client=client_for(lambda r: httpx.Response(404, text="nf")),
-                               wordlist=["a"], ratelimit_requests=5)
+                               wordlist=["a"], ratelimit_requests=5,
+                               checks=("headers", "exposed", "cors", "paths", "ratelimit"))
     assert any(e.startswith("cors: RuntimeError") for e in rep.errors)
     assert {"headers", "exposed", "paths", "ratelimit"} <= set(rep.stats)
     assert rep.exit_code == 3

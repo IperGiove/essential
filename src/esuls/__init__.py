@@ -83,6 +83,10 @@ _LAZY = {
     "check_ratelimit": ("probe", "probe"),
     "check_cors": ("probe", "probe"),
     "run_full_probe": ("probe", "probe"),
+    "check_ports": ("probe", "probe"),
+    "check_auth": ("probe", "probe"),
+    "check_tls": ("probe", "probe"),
+    "check_email": ("probe", "probe"),
 }
 
 
@@ -129,4 +133,5 @@ __all__ = [
     'SignatureCheck', 'verify_pdf_signatures', 'async_verify_pdf_signatures',
     # probe (lazy)
     'ProbeOptions', 'ProbeFinding', 'ProbeReport', 'check_paths', 'check_exposed', 'check_headers', 'check_ratelimit', 'check_cors', 'run_full_probe',
+    'check_ports', 'check_auth', 'check_tls', 'check_email',
 ]

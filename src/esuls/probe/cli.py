@@ -6,9 +6,11 @@ from functools import wraps
 import click
 
 from . import (
-    ProbeOptions, check_cors, check_exposed, check_headers, check_paths,
-    check_ratelimit, run_full_probe,
+    ProbeOptions, check_auth, check_cors, check_email, check_exposed, check_headers,
+    check_paths, check_ports, check_ratelimit, check_tls, run_full_probe,
 )
+from .full import ALL_CHECKS
+from .ports import parse_ports
 from .paths import load_wordlist
 
 EXIT_HELP = "Exit codes: 0 = nothing above info, 1 = findings low or higher, 3 = error."
@@ -93,6 +95,41 @@ def _ratelimit_options(fn):
     return fn
 
 
+def _auth_options(fn):
+    for o in reversed([
+        click.option("--auth-path", default="/login", show_default=True, help="Login endpoint."),
+        click.option("--auth-method", default="POST", show_default=True),
+        click.option("--user-field", "auth_user_field", default="username", show_default=True),
+        click.option("--pass-field", "auth_pass_field", default="password", show_default=True),
+        click.option("--username", "auth_username", default="esuls-probe@invalid.example", show_default=True),
+        click.option("--content-type", "auth_content_type", type=click.Choice(["form", "json"]),
+                     default="form", show_default=True),
+        click.option("--max-attempts", "auth_max_attempts", default=25, show_default=True,
+                     type=click.IntRange(min=1)),
+    ]):
+        fn = o(fn)
+    return fn
+
+
+def _ports_option(fn):
+    return click.option("--ports", "ports_spec", default=None, callback=_parse_ports_cb,
+                        help="Comma list and N-M ranges, e.g. 22,80,8000-8010 (default: ~40 common ports).")(fn)
+
+
+def _parse_ports_cb(ctx, param, value):
+    if value is None:
+        return None
+    try:
+        return parse_ports(value)
+    except ValueError as e:
+        raise click.BadParameter(str(e))
+
+
+def _selector_option(fn):
+    return click.option("--selector", "selectors", multiple=True,
+                        help="DKIM selector to look up (repeatable); none are guessed.")(fn)
+
+
 @click.group()
 @click.version_option()
 def app():
@@ -146,10 +183,58 @@ async def cors_cmd(target, options):
 @shared_options
 @_wordlist_options
 @_ratelimit_options
+@_ports_option
+@_selector_option
+@_auth_options
+@click.option("--skip", "skips", multiple=True, type=click.Choice(list(ALL_CHECKS)),
+              help="Skip a check (repeatable). 'auth' fires real lockouts: skip it on shared IPs.")
 async def full_cmd(target, options, wordlist, extensions, recursive, depth,
-                   rl_path, rl_method, rl_data, rl_requests):
+                   rl_path, rl_method, rl_data, rl_requests, ports_spec, selectors,
+                   auth_path, auth_method, auth_user_field, auth_pass_field, auth_username,
+                   auth_content_type, auth_max_attempts, skips):
     return await run_full_probe(
         target, options, wordlist=load_wordlist(wordlist) if wordlist else None,
         extensions=_exts(extensions), recursive=recursive, depth=depth,
         ratelimit_path=rl_path, ratelimit_method=rl_method, ratelimit_data=rl_data,
-        ratelimit_requests=rl_requests)
+        ratelimit_requests=rl_requests, ports=ports_spec, selectors=selectors,
+        auth_path=auth_path, auth_method=auth_method, auth_user_field=auth_user_field,
+        auth_pass_field=auth_pass_field, auth_username=auth_username,
+        auth_content_type=auth_content_type, auth_max_attempts=auth_max_attempts,
+        checks=[c for c in ALL_CHECKS if c not in skips])
+
+
+@app.command("ports", help="TCP connect scan: which ports does the internet reach? Open datastores, admin "
+             "APIs etc. are flagged; Redis gets one PING to detect no-auth. HOST or URL. " + EXIT_HELP)
+@shared_options
+@_ports_option
+async def ports_cmd(target, options, ports_spec):
+    return await check_ports(target, options, ports=ports_spec)
+
+
+@app.command("tls", help="Certificate (expiry, SAN, trust) and TLS 1.0/1.1 acceptance. HOST or URL. " + EXIT_HELP)
+@shared_options
+@click.option("--port", type=click.IntRange(1, 65535), default=None, help="Default 443 (or the URL's port).")
+async def tls_cmd(target, options, port):
+    return await check_tls(target, options, port=port)
+
+
+@app.command("email", help="SPF / DMARC / DKIM / MX DNS records of the domain (DNS reads only). " + EXIT_HELP)
+@shared_options
+@_selector_option
+async def email_cmd(target, options, selectors):
+    return await check_email(target, options, selectors=selectors)
+
+
+@app.command("auth", help="Send wrong-credential logins until the lockout/rate limit fires, then STOP. "
+             "WARNING: this triggers real defenses (fail2ban, WAF bans) and may lock YOUR source IP; "
+             "only run it against systems you own. It stops as soon as a defense responds (cap: "
+             "--max-attempts). Loopback targets are often exempt from rate limiting: without an "
+             "X-Forwarded-For header a local target is reported as info only. " + EXIT_HELP)
+@shared_options
+@_auth_options
+async def auth_cmd(target, options, auth_path, auth_method, auth_user_field, auth_pass_field,
+                   auth_username, auth_content_type, auth_max_attempts):
+    return await check_auth(target, options, path=auth_path, method=auth_method,
+                            user_field=auth_user_field, pass_field=auth_pass_field,
+                            username=auth_username, content_type=auth_content_type,
+                            max_attempts=auth_max_attempts)

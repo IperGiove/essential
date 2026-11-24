@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### `esuls-probe`: ports, auth, tls and email checks (outside view of a VM)
+
+Four new checks (and `full` runs them): `ports` (stdlib TCP connect scan of a
+curated ~40-port set or `--ports 22,80,8000-8010`; dangerous exposures such as
+databases, Caddy admin, RabbitMQ, VNC are medium, Redis answering `PING`
+without AUTH is high), `auth` (wrong-credential logins until the first
+lockout/429/503/403 fires, then stop; medium if nothing defends within
+`--max-attempts`; loopback targets downgraded like `ratelimit`), `tls`
+(certificate expiry, SAN match, trust, negotiated protocol, TLS 1.0/1.1
+acceptance) and `email` (MX, SPF, DMARC, DKIM per `--selector`). The `probe`
+extra now also installs `dnspython>=2.6` (imported lazily by `email` only).
+`full` gains `--skip CHECK`.
+
 ## 0.13.0 — 2026-11-24
 
 ### `esuls-probe`: self-assessment web probe (new `probe` extra)
