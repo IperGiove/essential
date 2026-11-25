@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 — 2026-11-25
 
 ### `esuls-probe`: drop the `subdomains` check
 
